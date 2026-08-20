@@ -711,6 +711,7 @@ export function validateRun(value) {
   const lastSeq = boundedInteger(cursor.lastSeq, "run lastSeq", { maximum: 10_000_000_000 });
   const prunedThroughSeq = boundedInteger(cursor.prunedThroughSeq, "run prunedThroughSeq", { maximum: 10_000_000_000 });
   if (!DIGEST.test(cursor.lastHash) || firstSeq > lastSeq + 1 || prunedThroughSeq >= firstSeq) invalid("run event cursor is inconsistent");
+  if (firstSeq !== 1 || prunedThroughSeq !== 0) invalid("run event cursor v1 does not support pruned ledgers");
   let error = null;
   if (run.error !== null) {
     const item = exact(run.error, ["code", "message"], "run error");

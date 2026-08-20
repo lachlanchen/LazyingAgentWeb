@@ -203,6 +203,16 @@ test("public responses and artifacts reject private state, active content, URLs,
     thread: publicThread(),
     rawSession: { cwd: "/home/private" },
   }), /unsupported field/u);
+  assert.equal(validateAgentResponse(AGINTI_RPC_PATHS.runsStatus, {
+    schemaVersion: "1",
+    run: publicRun(),
+  }).run.eventCursor.firstSeq, 1);
+  assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.runsStatus, {
+    schemaVersion: "1",
+    run: publicRun({
+      eventCursor: { firstSeq: 2, lastSeq: 2, lastHash: "a".repeat(64), prunedThroughSeq: 1 },
+    }),
+  }), /does not support pruned ledgers/u);
   assert.equal(validateArtifact(artifact()).kind, "plot");
   for (const candidate of [
     { id: ARTIFACT_ID, title: "Unsafe", kind: "html", spec: { html: "<script>" } },

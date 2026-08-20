@@ -21,6 +21,7 @@ import {
 const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
 const TOKEN_ONE = 'local-token-one-0000000000000001';
 const TOKEN_TWO = 'local-token-two-0000000000000002';
+const AGINTI_TOKEN = 'aginti-token-one-0000000000000001';
 
 function configValue(root, overrides = {}) {
   const value = {
@@ -47,9 +48,14 @@ function configValue(root, overrides = {}) {
       allowedModelAliases: ['localllm-test'],
       defaultModelAlias: 'localllm-test'
     },
+    aginti: {
+      enabled: true,
+      baseUrl: 'http://127.0.0.1:18009'
+    },
     credentials: {
       passwordHash: 'login-password-hash',
-      localLlmToken: 'localllm-token'
+      localLlmToken: 'localllm-token',
+      agintiToken: 'aginti-token'
     }
   };
   return { ...value, ...overrides };
@@ -62,6 +68,7 @@ function fixture(t, overrides = {}) {
   mkdirSync(credentialsDirectory, { mode: 0o700 });
   writeFileSync(join(credentialsDirectory, 'login-password-hash'), `${PASSWORD_RECORD}\n`, { mode: 0o600 });
   writeFileSync(join(credentialsDirectory, 'localllm-token'), TOKEN_ONE, { mode: 0o400 });
+  writeFileSync(join(credentialsDirectory, 'aginti-token'), AGINTI_TOKEN, { mode: 0o400 });
   writeFileSync(configPath, JSON.stringify(configValue(root, overrides)), { mode: 0o600 });
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return { root, credentialsDirectory, configPath };
@@ -78,8 +85,11 @@ test('loads only owner-private config and rotating LoadCredential-style files', 
   assert.notEqual(loaded.config.state.cloudIndexDatabase, loaded.config.state.directChatDatabase);
   assert.equal(loaded.readCredential('passwordHash'), PASSWORD_RECORD);
   assert.equal(loaded.readCredential('localLlmToken'), TOKEN_ONE);
+  assert.equal(loaded.readCredential('agintiToken'), AGINTI_TOKEN);
   const provider = loaded.createCredentialProvider('localLlmToken');
+  const agentProvider = loaded.createCredentialProvider('agintiToken');
   assert.equal(await provider(), TOKEN_ONE);
+  assert.equal(await agentProvider(), AGINTI_TOKEN);
 
   chmodSync(join(state.credentialsDirectory, 'localllm-token'), 0o600);
   writeFileSync(join(state.credentialsDirectory, 'localllm-token'), TOKEN_TWO);
@@ -90,6 +100,7 @@ test('loads only owner-private config and rotating LoadCredential-style files', 
   assert.equal(serialized.includes(PASSWORD_RECORD), false);
   assert.equal(serialized.includes(TOKEN_ONE), false);
   assert.equal(serialized.includes(TOKEN_TWO), false);
+  assert.equal(serialized.includes(AGINTI_TOKEN), false);
   assert.equal(serialized.includes('password"'), false);
 });
 
@@ -115,6 +126,17 @@ test('rejects permissive modes, symlinks, and hard-linked credential inputs', (t
   assert.throws(() => loaded.readCredential('localLlmToken'), /without links/u);
 });
 
+test('supports an explicitly disabled Agent without an AgInTi endpoint or credential', (t) => {
+  const state = fixture(t, {
+    aginti: { enabled: false },
+    credentials: { passwordHash: 'login-password-hash', localLlmToken: 'localllm-token' }
+  });
+  const loaded = loadServiceConfig(state);
+  assert.deepEqual(loaded.config.aginti, { enabled: false });
+  assert.throws(() => loaded.readCredential('agintiToken'), /not configured/u);
+  assert.throws(() => loaded.createCredentialProvider('agintiToken'), /not configured/u);
+});
+
 test('rejects public binds, non-private LocalLLM, shared databases, and secret config fields', (t) => {
   const cases = [
     (root) => configValue(root, { listen: { host: '0.0.0.0', port: 18_543 } }),
@@ -131,7 +153,15 @@ test('rejects public binds, non-private LocalLLM, shared databases, and secret c
     },
     (root) => ({ ...configValue(root), password: 'must-not-be-in-config' }),
     (root) => configValue(root, {
-      credentials: { passwordHash: '../password', localLlmToken: 'localllm-token' }
+      credentials: { passwordHash: '../password', localLlmToken: 'localllm-token', agintiToken: 'aginti-token' }
+    }),
+    (root) => configValue(root, { aginti: { enabled: true, baseUrl: 'http://192.168.1.2:18009' } }),
+    (root) => configValue(root, {
+      aginti: { enabled: false },
+      credentials: { passwordHash: 'login-password-hash', localLlmToken: 'localllm-token', agintiToken: 'aginti-token' }
+    }),
+    (root) => configValue(root, {
+      credentials: { passwordHash: 'login-password-hash', localLlmToken: 'localllm-token' }
     })
   ];
 

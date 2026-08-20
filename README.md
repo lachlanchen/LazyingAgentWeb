@@ -41,10 +41,12 @@ boundary, and replaceable-node contract are specified in
   exact authenticated `127.0.0.1` OpenAI-compatible `/v1` endpoint. It validates
   models and SSE frames, bounds input/output, rejects redirects and partial
   redispatch, and has no hosted-provider fallback.
-- A fail-closed AgInTi BFF transport. The browser can call only the frozen
-  public protocol; the server derives identity/session context, validates exact
-  requests and responses, and delegates through an injected stateless AgInTi
-  adapter. Agent state and decisions never move into this package.
+- A fail-closed AgInTi BFF transport and cloud-owned stateless adapter. The
+  browser can call only the frozen public protocol; the server derives
+  identity/session context, validates exact requests and responses, and sends
+  only `x-aginti-principal-id`, `x-aginti-browser-session-id`, and standard
+  `Idempotency-Key` authority to AgInTi. LazyEdge remains an opaque transport;
+  Agent state and decisions never move into this package.
 
 ## Component boundaries
 
@@ -94,6 +96,7 @@ import {
   CloudIndexStore,
   DirectChatContextCoordinator,
   DirectChatStore,
+  createAgintiAgentAdapter,
   createCloudServer,
   createLocalLlmConnector,
   createStandaloneAssetMap,
@@ -106,6 +109,55 @@ The three runtime stores/coordinators are intentionally injected into
 also receives its transport credential through a server-side provider; neither
 that credential nor an AgInTi/LazyEdge credential is sent to the browser or
 stored in this repository.
+
+## Standalone service configuration
+
+`lazying-agent-web serve` reads one owner-only JSON configuration and separate
+owner-only `LoadCredential` files. A secret-free shape is:
+
+```json
+{
+  "schema": "lazying-agent-service/v1",
+  "listen": { "host": "127.0.0.1", "port": 18543 },
+  "publicOrigin": "https://llm.lazying.art",
+  "account": {
+    "username": "lachlanchen",
+    "principalId": "principal_account_one",
+    "displayName": "Lachlan"
+  },
+  "state": {
+    "cloudIndexDatabase": "/var/lib/lazying-agent-web/cloud/index.sqlite",
+    "directChatDatabase": "/var/lib/lazying-agent-web/chat/chat.sqlite"
+  },
+  "pwa": {
+    "versionLabel": "release",
+    "title": "LazyingArt Agent",
+    "name": "LazyingArt Agent",
+    "shortName": "Lazying Agent"
+  },
+  "localLlm": {
+    "baseUrl": "http://127.0.0.1:18008/v1",
+    "allowedModelAliases": ["localllm-deep"],
+    "defaultModelAlias": "localllm-deep"
+  },
+  "aginti": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:18009"
+  },
+  "credentials": {
+    "passwordHash": "login-password-hash",
+    "localLlmToken": "localllm-token",
+    "agintiToken": "aginti-token"
+  }
+}
+```
+
+The filenames identify distinct credential files; raw password verifiers and
+bearer values never appear in the JSON. Set `aginti` to `{ "enabled": false }`
+and omit `credentials.agintiToken` when the Agent transport is intentionally
+absent. Configuring the transport does not claim Agent readiness: capability
+discovery stays fail-closed until AgInTi itself proves its native API, policy,
+sandbox, and current resource admission.
 
 A minimal storage-only probe is:
 

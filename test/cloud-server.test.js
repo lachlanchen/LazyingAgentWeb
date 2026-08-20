@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer as createProbeServer, request as httpRequest } from 'node:http';
 import { connect as connectTcp } from 'node:net';
@@ -8,11 +9,11 @@ import test from 'node:test';
 
 import { DirectChatStore } from '../src/chat-store.js';
 import { DirectChatContextCoordinator } from '../src/chat-context.js';
+import { createAgintiAgentAdapter } from '../src/aginti-adapter.js';
 import { createCloudServer, resolveTrustedClientAddress } from '../src/cloud-server.js';
 import { CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
 import { CloudIndexStore } from '../src/store.js';
-import { createAgintiAgentAdapter } from '../../LazyEdge/src/aginti-agent-adapter.js';
-import { appendLedgerEvent } from '../../LazyEdge/src/agent-worker-contract.js';
+import { canonicalJson } from '../src/web/aginti-protocol.js';
 import { createStandaloneAssetMap } from '../src/web/asset-map.js';
 
 const TEST_BOOTSTRAP = `
@@ -34,6 +35,30 @@ const USERNAME = 'lachlanchen';
 const PASSWORD = 'correct horse battery staple';
 const PRINCIPAL_ID = 'principal_account_one';
 const IDEMPOTENCY = 'browser-action-00000001';
+
+function appendLedgerEvent(ledger, type, payload, createdAt) {
+  const seq = ledger.lastEventSeq + 1;
+  const previousHash = ledger.lastEventHash || '0'.repeat(64);
+  const envelope = {
+    schemaVersion: '1',
+    id: `${ledger.id}.${seq}`,
+    seq,
+    type,
+    threadId: ledger.threadId,
+    runId: ledger.id,
+    createdAt,
+    payload,
+    previousHash
+  };
+  const event = Object.freeze({
+    ...envelope,
+    hash: createHash('sha256').update(canonicalJson(envelope), 'utf8').digest('hex')
+  });
+  ledger.events.push(event);
+  ledger.lastEventSeq = event.seq;
+  ledger.lastEventHash = event.hash;
+  return event;
+}
 
 async function reserveLoopbackPort() {
   const probe = createProbeServer();
@@ -595,7 +620,7 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
   assert.equal(bypass.status, 503);
 });
 
-test('is directly compatible with LazyEdge createAgintiAgentAdapter rpc identity and capability contracts', async (t) => {
+test('uses its own AgInTi adapter contract over application-neutral LazyEdge transport', async (t) => {
   const upstreamRequests = [];
   const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
   const threadId = 'thr_12345678-1234-4123-8123-123456789abc';
@@ -617,7 +642,7 @@ test('is directly compatible with LazyEdge createAgintiAgentAdapter rpc identity
   );
   const adapter = createAgintiAgentAdapter({
     upstream: 'http://127.0.0.1:9009',
-    token: 'aginti-native-internal-token-0123456789abcdef',
+    credentialProvider: async () => 'aginti-native-internal-token-0123456789abcdef',
     fetchImpl: async (url, init) => {
       upstreamRequests.push({ url, headers: new Headers(init.headers) });
       if (url.endsWith('/agent/v1/runs/events')) {
@@ -625,6 +650,9 @@ test('is directly compatible with LazyEdge createAgintiAgentAdapter rpc identity
           `id: ${streamedEvent.id}\nevent: ${streamedEvent.type}\ndata: ${JSON.stringify(streamedEvent)}\n\n`,
           { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } }
         );
+      }
+      if (url.endsWith('/agent/v1/threads/create')) {
+        return new Response('', { status: 503 });
       }
       return new Response(JSON.stringify({
         schemaVersion: '1',
@@ -648,9 +676,10 @@ test('is directly compatible with LazyEdge createAgintiAgentAdapter rpc identity
   assert.equal((await capabilities.json()).enabled, false);
   assert.equal(upstreamRequests.length, 1);
   assert.equal(upstreamRequests[0].url, 'http://127.0.0.1:9009/agent/v1/capabilities');
-  assert.equal(upstreamRequests[0].headers.get('x-lazyedge-principal-id'), PRINCIPAL_ID);
-  assert.match(upstreamRequests[0].headers.get('x-lazyedge-browser-session'), /^[a-f0-9]{64}$/u);
-  assert.equal(upstreamRequests[0].headers.get('x-lazyedge-idempotency-key'), null);
+  assert.equal(upstreamRequests[0].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
+  assert.match(upstreamRequests[0].headers.get('x-aginti-browser-session-id'), /^[a-f0-9]{64}$/u);
+  assert.equal(upstreamRequests[0].headers.get('idempotency-key'), null);
+  assert.equal(upstreamRequests[0].headers.get('x-lazyedge-principal-id'), null);
   const events = await post(baseUrl, '/api/transport/agent/v1/runs/events', {
     runId,
     afterSeq: 0
@@ -660,8 +689,18 @@ test('is directly compatible with LazyEdge createAgintiAgentAdapter rpc identity
   assert.match(eventText, new RegExp(`id: ${runId}\\.1`, 'u'));
   assert.match(eventText, /event: run\.status/u);
   assert.equal(upstreamRequests.length, 2);
-  assert.equal(upstreamRequests[1].headers.get('x-lazyedge-principal-id'), PRINCIPAL_ID);
-  assert.equal(upstreamRequests[1].headers.get('x-lazyedge-idempotency-key'), null);
+  assert.equal(upstreamRequests[1].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
+  assert.equal(upstreamRequests[1].headers.get('idempotency-key'), null);
+
+  await assert.rejects(adapter.rpc('/agent/v1/threads/create', { title: 'Header probe' }, {
+    principalId: PRINCIPAL_ID,
+    browserSession: 'a'.repeat(64),
+    idempotencyKey: IDEMPOTENCY
+  }));
+  assert.equal(upstreamRequests.length, 3);
+  assert.equal(upstreamRequests[2].headers.get('idempotency-key'), IDEMPOTENCY);
+  assert.equal(upstreamRequests[2].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
+  assert.equal(upstreamRequests[2].headers.get('x-lazyedge-idempotency-key'), null);
 });
 
 test('logout revokes only its browser session and reports native Agent cancellation as a release gate', async (t) => {

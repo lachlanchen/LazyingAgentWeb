@@ -23,6 +23,8 @@ const FORBIDDEN_BROWSER_HEADERS = new Set([
   "cookie",
   "proxy-authorization",
   "x-api-key",
+  "x-aginti-browser-session-id",
+  "x-aginti-principal-id",
   "x-lazyedge-browser-session",
   "x-lazyedge-principal-id",
   "x-lazyedge-idempotency-key",
@@ -134,7 +136,7 @@ function requestHeaders({ accept, csrf, mutationKey }) {
     }
     headers.set(csrf.header, csrfValue);
   }
-  if (mutationKey !== undefined) headers.set("x-idempotency-key", mutationKey);
+  if (mutationKey !== undefined) headers.set("idempotency-key", mutationKey);
   for (const name of headers.keys()) {
     if (FORBIDDEN_BROWSER_HEADERS.has(name)) throw new TypeError(`browser request may not set ${name}`);
   }

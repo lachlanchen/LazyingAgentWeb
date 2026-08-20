@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
 
+import {
+  createAgintiAgentAdapter,
+  validateAgintiTransportCredential
+} from './aginti-adapter.js';
 import { DirectChatContextCoordinator } from './chat-context.js';
 import { DirectChatStore } from './chat-store.js';
 import { createCloudServer } from './cloud-server.js';
@@ -30,10 +34,10 @@ function sha256(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function validateLocalLlmCredential(value) {
+function validateTransportCredential(value, label) {
   if (typeof value !== 'string' || value.length < 16 || value.length > 4_096
       || /[\s\u0000-\u001f\u007f]/u.test(value)) {
-    throw new TypeError('LocalLLM transport credential is invalid');
+    throw new TypeError(`${label} transport credential is invalid`);
   }
   return true;
 }
@@ -67,16 +71,27 @@ async function materializeInputs(loadedConfig, { createVerifier = true } = {}) {
   }
   let localLlmCredential = loaded.readCredential('localLlmToken');
   try {
-    validateLocalLlmCredential(localLlmCredential);
+    validateTransportCredential(localLlmCredential, 'LocalLLM');
   } finally {
     localLlmCredential = null;
+  }
+  if (loaded.config.aginti.enabled) {
+    let agintiCredential = loaded.readCredential('agintiToken');
+    try {
+      validateAgintiTransportCredential(agintiCredential);
+    } finally {
+      agintiCredential = null;
+    }
   }
   const assetMap = await buildAssetMap(loaded.config);
   return Object.freeze({
     loaded,
     passwordVerifier,
     assetMap,
-    credentialProvider: loaded.createCredentialProvider('localLlmToken')
+    localLlmCredentialProvider: loaded.createCredentialProvider('localLlmToken'),
+    ...(loaded.config.aginti.enabled
+      ? { agintiCredentialProvider: loaded.createCredentialProvider('agintiToken') }
+      : {})
   });
 }
 
@@ -111,6 +126,7 @@ function safeReport(config, assetMap) {
     releaseId: assetMap.releaseVersion,
     serviceWorkerRoute: assetMap.serviceWorkerRoute,
     agentEnabled: false,
+    agentConfigured: config.aginti.enabled,
     directChatEnabled: true
   });
 }
@@ -172,9 +188,16 @@ export async function createStandaloneService({
     const directChatConnector = createLocalLlmConnector({
       baseUrl: config.localLlm.baseUrl,
       allowedModelAliases: config.localLlm.allowedModelAliases,
-      credentialProvider: materialized.credentialProvider,
+      credentialProvider: materialized.localLlmCredentialProvider,
       ...(fetchImpl === undefined ? {} : { fetchImpl })
     });
+    const agintiAdapter = config.aginti.enabled
+      ? createAgintiAgentAdapter({
+          upstream: config.aginti.baseUrl,
+          credentialProvider: materialized.agintiCredentialProvider,
+          ...(fetchImpl === undefined ? {} : { fetchImpl })
+        })
+      : null;
     server = serverFactory({
       releaseId: materialized.assetMap.releaseVersion,
       assetMap: materialized.assetMap,
@@ -190,7 +213,7 @@ export async function createStandaloneService({
       directChatContext,
       directChatSummarizer,
       directChatConnector,
-      agintiAdapter: null,
+      agintiAdapter,
       ...(clock === undefined ? {} : { clock })
     });
     if (!server || typeof server.listen !== 'function' || typeof server.shutdown !== 'function'
@@ -260,6 +283,7 @@ export async function createStandaloneService({
       directChatContext,
       directChatSummarizer,
       directChatConnector,
+      agintiAdapter,
       start,
       shutdown
     });

@@ -233,10 +233,18 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   assert.equal(calls[1].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsCreate}`);
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.credentials, "same-origin");
-  assert.equal(calls[0].options.headers.get("x-idempotency-key"), null);
-  assert.equal(calls[1].options.headers.get("x-idempotency-key"), "mutation-key-1234567890");
+  assert.equal(calls[0].options.headers.get("idempotency-key"), null);
+  assert.equal(calls[1].options.headers.get("idempotency-key"), "mutation-key-1234567890");
   assert.equal(calls[1].options.headers.get("x-csrf-token"), "csrf-token-value-long-enough");
-  for (const name of ["authorization", "x-lazyedge-principal-id", "x-lazyedge-browser-session", "x-lazyedge-idempotency-key"]) {
+  for (const name of [
+    "authorization",
+    "x-aginti-principal-id",
+    "x-aginti-browser-session-id",
+    "x-idempotency-key",
+    "x-lazyedge-principal-id",
+    "x-lazyedge-browser-session",
+    "x-lazyedge-idempotency-key",
+  ]) {
     assert.equal(calls[1].options.headers.get(name), null);
   }
   assert.equal(calls[1].options.body.includes("model"), false);

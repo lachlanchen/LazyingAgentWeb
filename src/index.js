@@ -46,6 +46,12 @@ export {
 export { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from './direct-chat-contract.js';
 export { createDeterministicContextSummarizer } from './deterministic-context-summarizer.js';
 export {
+  AGINTI_INTERNAL_HEADERS,
+  AgintiAdapterError,
+  createAgintiAgentAdapter,
+  validateAgintiTransportCredential
+} from './aginti-adapter.js';
+export {
   LocalLlmConnectorError,
   createLocalLlmConnector
 } from './localllm-connector.js';

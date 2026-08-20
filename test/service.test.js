@@ -22,6 +22,7 @@ import { verifyStandaloneAssetMap } from '../src/web/asset-map.js';
 
 const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
 const LOCAL_TOKEN = 'service-local-token-0000000000001';
+const AGINTI_TOKEN = 'service-aginti-token-0000000000001';
 
 function serviceFixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-service-test-'));
@@ -32,6 +33,7 @@ function serviceFixture(t) {
   mkdirSync(credentialsDirectory, { mode: 0o700 });
   writeFileSync(join(credentialsDirectory, 'login-password-hash'), PASSWORD_RECORD, { mode: 0o400 });
   writeFileSync(join(credentialsDirectory, 'localllm-token'), LOCAL_TOKEN, { mode: 0o400 });
+  writeFileSync(join(credentialsDirectory, 'aginti-token'), AGINTI_TOKEN, { mode: 0o400 });
   const config = {
     schema: 'lazying-agent-service/v1',
     listen: { host: '127.0.0.1', port: 18_544 },
@@ -53,9 +55,14 @@ function serviceFixture(t) {
       allowedModelAliases: ['localllm-test'],
       defaultModelAlias: 'localllm-test'
     },
+    aginti: {
+      enabled: true,
+      baseUrl: 'http://127.0.0.1:18009'
+    },
     credentials: {
       passwordHash: 'login-password-hash',
-      localLlmToken: 'localllm-token'
+      localLlmToken: 'localllm-token',
+      agintiToken: 'aginti-token'
     }
   };
   writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
@@ -111,6 +118,17 @@ function serviceHarness(config) {
   };
   const fetchImpl = async (url, init) => {
     captured.requests.push({ url, init });
+    if (url === 'http://127.0.0.1:18009/agent/v1/capabilities') {
+      return new Response(JSON.stringify({
+        schemaVersion: '1',
+        enabled: false,
+        agent: { kind: 'aginti', label: 'AgInTi Agent' },
+        model: { label: 'LocalLLM' },
+        actions: { cancel: false, resume: false, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ['plot', 'table', 'markdown'], schemaVersion: '1' }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     return new Response(JSON.stringify({
       object: 'list',
       data: [{ id: 'localllm-test', object: 'model', created: 1, owned_by: 'local' }]
@@ -131,10 +149,12 @@ test('configuration check validates credentials and branded PWA without creating
   assert.equal(report.serviceWorkerRoute, '/sw.js');
   assert.match(report.releaseId, /^service-test-[a-f0-9]{64}$/u);
   assert.equal(report.agentEnabled, false);
+  assert.equal(report.agentConfigured, true);
   assert.equal(existsSync(join(state.root, 'state')), false);
   const output = JSON.stringify(report);
   assert.equal(output.includes(PASSWORD_RECORD), false);
   assert.equal(output.includes(LOCAL_TOKEN), false);
+  assert.equal(output.includes(AGINTI_TOKEN), false);
 });
 
 test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback server', async (t) => {
@@ -148,7 +168,8 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   t.after(async () => { await service.shutdown(); });
 
   const options = harness.captured.serverOptions;
-  assert.equal(options.agintiAdapter, null);
+  assert.equal(options.agintiAdapter, service.agintiAdapter);
+  assert.ok(service.agintiAdapter);
   assert.equal(options.directChatStore, service.directChatStore);
   assert.equal(options.directChatContext, service.directChatContext);
   assert.equal(options.directChatConnector, service.directChatConnector);
@@ -174,6 +195,16 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   assert.equal(harness.captured.requests.length, 1);
   assert.equal(harness.captured.requests[0].url, 'http://127.0.0.1:18008/v1/models');
   assert.equal(harness.captured.requests[0].init.headers.authorization, `Bearer ${LOCAL_TOKEN}`);
+
+  const agentCapabilities = await service.agintiAdapter.capabilities({
+    principalId: state.config.account.principalId,
+    browserSession: 'a'.repeat(64)
+  });
+  assert.equal(agentCapabilities.enabled, false);
+  assert.equal(harness.captured.requests.length, 2);
+  assert.equal(harness.captured.requests[1].init.headers.get('authorization'), `Bearer ${AGINTI_TOKEN}`);
+  assert.equal(harness.captured.requests[1].init.headers.get('x-aginti-principal-id'), state.config.account.principalId);
+  assert.equal(harness.captured.requests[1].init.headers.get('x-lazyedge-principal-id'), null);
 
   const first = await service.start();
   const second = await service.start();

@@ -235,6 +235,19 @@ function localLlmBaseUrl(value) {
   return value;
 }
 
+function agintiBaseUrl(value) {
+  if (typeof value !== 'string') throw new TypeError('aginti.baseUrl is invalid');
+  const url = new URL(value);
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1'
+      || !/^[1-9]\d{3,4}$/u.test(url.port) || Number(url.port) < 1_024
+      || Number(url.port) > 65_535 || url.pathname !== '/'
+      || url.username || url.password || url.search || url.hash
+      || url.origin !== value) {
+    throw new TypeError('aginti.baseUrl must be an exact private 127.0.0.1 HTTP origin');
+  }
+  return value;
+}
+
 function modelAliases(value) {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
       || value.length < 1 || value.length > 32) {
@@ -276,7 +289,7 @@ function deepFreeze(value) {
 function validateConfig(value) {
   const root = plainObject(
     value,
-    ['schema', 'listen', 'publicOrigin', 'account', 'state', 'pwa', 'localLlm', 'credentials'],
+    ['schema', 'listen', 'publicOrigin', 'account', 'state', 'pwa', 'localLlm', 'aginti', 'credentials'],
     [],
     'service config'
   );
@@ -334,15 +347,30 @@ function validateConfig(value) {
     throw new TypeError('localLlm.defaultModelAlias must be in allowedModelAliases');
   }
 
+  const aginti = plainObject(root.aginti, ['enabled'], ['baseUrl'], 'aginti');
+  if (typeof aginti.enabled !== 'boolean') throw new TypeError('aginti.enabled must be boolean');
+  if (aginti.enabled !== Object.hasOwn(aginti, 'baseUrl')) {
+    throw new TypeError('aginti.baseUrl is required exactly when AgInTi is enabled');
+  }
+
   const credentials = plainObject(
     root.credentials,
     ['passwordHash', 'localLlmToken'],
-    [],
+    ['agintiToken'],
     'credentials'
   );
   const passwordHash = credentialName(credentials.passwordHash, 'credentials.passwordHash');
   const localLlmToken = credentialName(credentials.localLlmToken, 'credentials.localLlmToken');
-  if (passwordHash === localLlmToken) throw new TypeError('credential purposes must use separate files');
+  const agintiToken = credentials.agintiToken === undefined
+    ? undefined
+    : credentialName(credentials.agintiToken, 'credentials.agintiToken');
+  if (aginti.enabled !== (agintiToken !== undefined)) {
+    throw new TypeError('credentials.agintiToken is required exactly when AgInTi is enabled');
+  }
+  if (new Set([passwordHash, localLlmToken, agintiToken].filter(Boolean)).size
+      !== [passwordHash, localLlmToken, agintiToken].filter(Boolean).length) {
+    throw new TypeError('credential purposes must use separate files');
+  }
 
   return deepFreeze({
     schema: SERVICE_SCHEMA,
@@ -368,7 +396,11 @@ function validateConfig(value) {
       allowedModelAliases: aliases,
       defaultModelAlias
     },
-    credentials: { passwordHash, localLlmToken }
+    aginti: {
+      enabled: aginti.enabled,
+      ...(aginti.enabled ? { baseUrl: agintiBaseUrl(aginti.baseUrl) } : {})
+    },
+    credentials: { passwordHash, localLlmToken, ...(agintiToken === undefined ? {} : { agintiToken }) }
   });
 }
 
@@ -383,9 +415,10 @@ class LoadedServiceConfig {
   }
 
   readCredential(purpose) {
-    if (purpose !== 'passwordHash' && purpose !== 'localLlmToken') {
+    if (purpose !== 'passwordHash' && purpose !== 'localLlmToken' && purpose !== 'agintiToken') {
       throw new TypeError('credential purpose is unsupported');
     }
+    if (!Object.hasOwn(this.config.credentials, purpose)) throw new TypeError('credential purpose is not configured');
     const name = this.config.credentials[purpose];
     const pathname = join(this.#credentialsDirectory, name);
     if (resolve(pathname) !== pathname) throw new TypeError('credential name escaped its directory');
@@ -399,9 +432,10 @@ class LoadedServiceConfig {
   }
 
   createCredentialProvider(purpose) {
-    if (purpose !== 'localLlmToken') {
-      throw new TypeError('only the LocalLLM token supports a rotating credential provider');
+    if (purpose !== 'localLlmToken' && purpose !== 'agintiToken') {
+      throw new TypeError('only transport tokens support rotating credential providers');
     }
+    if (!Object.hasOwn(this.config.credentials, purpose)) throw new TypeError('credential purpose is not configured');
     const provider = async () => this.readCredential(purpose);
     return Object.freeze(provider);
   }

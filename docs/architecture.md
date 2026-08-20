@@ -45,6 +45,13 @@ browser -> Caddy -> LazyingAgentWeb -> LazyEdge -> AgInTi native API
                                                    `-> rootless sandbox
 ```
 
+LazyingAgentWeb owns the stateless adapter at the application boundary. It
+derives `x-aginti-principal-id` and `x-aginti-browser-session-id` from the
+authenticated cloud session and uses standard `Idempotency-Key` only for
+mutations. LazyEdge treats these as opaque application headers while stripping
+its own reserved `x-lazyedge-*` namespace. AgInTi alone interprets the identity,
+idempotency, thread, run, context, tool, and artifact semantics.
+
 The browser never receives a relay, LocalLLM, AgInTi-integration, SSH or
 sandbox credential. Each arrow authenticates independently. Caddy exposes only
 reviewed exact web routes; every internal listener remains loopback-only.

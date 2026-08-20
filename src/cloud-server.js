@@ -1316,12 +1316,6 @@ export function createCloudRequestHandler({
       signal
     });
     if (nativePath === AGINTI_RPC_PATHS.runsEvents) {
-      writeHead(res, 200, dynamicHeaders({
-        'content-type': 'text/event-stream; charset=utf-8',
-        connection: 'keep-alive',
-        'x-accel-buffering': 'no'
-      }));
-      res.flushHeaders?.();
       const streamDeadline = deadlineSignal(requestSignal, limits.sseLifetimeMs, 'Agent event stream reached its reconnect boundary');
       try {
         const events = await valueWithAbort(
@@ -1331,6 +1325,12 @@ export function createCloudRequestHandler({
         if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
           throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid event stream.');
         }
+        writeHead(res, 200, dynamicHeaders({
+          'content-type': 'text/event-stream; charset=utf-8',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no'
+        }));
+        res.flushHeaders?.();
         for await (const rawEvent of abortableAsyncIterable(events, streamDeadline.signal)) {
           let event;
           try { event = validateEventEnvelope(rawEvent); }

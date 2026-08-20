@@ -644,8 +644,10 @@ test('uses its own AgInTi adapter contract over application-neutral LazyEdge tra
     upstream: 'http://127.0.0.1:9009',
     credentialProvider: async () => 'aginti-native-internal-token-0123456789abcdef',
     fetchImpl: async (url, init) => {
-      upstreamRequests.push({ url, headers: new Headers(init.headers) });
+      const body = JSON.parse(init.body);
+      upstreamRequests.push({ url, headers: new Headers(init.headers), body });
       if (url.endsWith('/agent/v1/runs/events')) {
+        if (body.afterSeq === 1) return new Response('', { status: 400 });
         return new Response(
           `id: ${streamedEvent.id}\nevent: ${streamedEvent.type}\ndata: ${JSON.stringify(streamedEvent)}\n\n`,
           { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } }
@@ -682,7 +684,8 @@ test('uses its own AgInTi adapter contract over application-neutral LazyEdge tra
   assert.equal(upstreamRequests[0].headers.get('x-lazyedge-principal-id'), null);
   const events = await post(baseUrl, '/api/transport/agent/v1/runs/events', {
     runId,
-    afterSeq: 0
+    afterSeq: 0,
+    afterHash: '0'.repeat(64)
   }, { cookie: auth.cookie, csrf: auth.csrf });
   assert.equal(events.status, 200);
   const eventText = await events.text();
@@ -691,16 +694,41 @@ test('uses its own AgInTi adapter contract over application-neutral LazyEdge tra
   assert.equal(upstreamRequests.length, 2);
   assert.equal(upstreamRequests[1].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
   assert.equal(upstreamRequests[1].headers.get('idempotency-key'), null);
+  assert.deepEqual(upstreamRequests[1].body, {
+    runId,
+    afterSeq: 0,
+    afterHash: '0'.repeat(64)
+  });
+
+  const missingHashCalls = upstreamRequests.length;
+  const missingHash = await post(baseUrl, '/api/transport/agent/v1/runs/events', {
+    runId,
+    afterSeq: 0
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(missingHash.status, 400);
+  assert.equal(upstreamRequests.length, missingHashCalls);
+
+  const rejectedCursor = await post(baseUrl, '/api/transport/agent/v1/runs/events', {
+    runId,
+    afterSeq: 1,
+    afterHash: streamedEvent.hash
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(rejectedCursor.status, 400);
+  assert.match(rejectedCursor.headers.get('content-type'), /^application\/json/u);
+  assert.deepEqual((await rejectedCursor.json()).error, {
+    code: 'agent_unavailable',
+    message: 'The Agent request was not accepted.'
+  });
 
   await assert.rejects(adapter.rpc('/agent/v1/threads/create', { title: 'Header probe' }, {
     principalId: PRINCIPAL_ID,
     browserSession: 'a'.repeat(64),
     idempotencyKey: IDEMPOTENCY
   }));
-  assert.equal(upstreamRequests.length, 3);
-  assert.equal(upstreamRequests[2].headers.get('idempotency-key'), IDEMPOTENCY);
-  assert.equal(upstreamRequests[2].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
-  assert.equal(upstreamRequests[2].headers.get('x-lazyedge-idempotency-key'), null);
+  assert.equal(upstreamRequests.length, 4);
+  assert.equal(upstreamRequests[3].headers.get('idempotency-key'), IDEMPOTENCY);
+  assert.equal(upstreamRequests[3].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
+  assert.equal(upstreamRequests[3].headers.get('x-lazyedge-idempotency-key'), null);
 });
 
 test('logout revokes only its browser session and reports native Agent cancellation as a release gate', async (t) => {

@@ -140,9 +140,29 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
       [field]: "browser-controlled",
     }), /unsupported field/u);
   }
+  assert.deepEqual(validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+    runId: RUN_ID,
+    afterSeq: 0,
+    afterHash: ZERO_HASH,
+  }), { runId: RUN_ID, afterSeq: 0, afterHash: ZERO_HASH });
   assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
     runId: RUN_ID,
     afterSeq: 0,
+  }), /afterHash is required/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+    runId: RUN_ID,
+    afterSeq: 0,
+    afterHash: "f".repeat(64),
+  }), /zero hash/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+    runId: RUN_ID,
+    afterSeq: 1,
+    afterHash: "F".repeat(64),
+  }), /lowercase SHA-256/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+    runId: RUN_ID,
+    afterSeq: 0,
+    afterHash: ZERO_HASH,
     lastEventHash: ZERO_HASH,
   }), /unsupported field/u);
 });
@@ -301,8 +321,8 @@ test("resumable POST SSE reconnects from the verified cursor without restarting 
   })) seen.push(item.event.type);
   assert.deepEqual(seen, ["output.delta", "run.completed"]);
   assert.deepEqual(requests.map((request) => request.body), [
-    { runId: RUN_ID, afterSeq: 0 },
-    { runId: RUN_ID, afterSeq: 1 },
+    { runId: RUN_ID, afterSeq: 0, afterHash: ZERO_HASH },
+    { runId: RUN_ID, afterSeq: 1, afterHash: first.hash },
   ]);
   assert.equal(requests.some((request) => request.url.endsWith("/runs/start")), false);
   assert.deepEqual(cursors.map((value) => value.seq), [1, 2]);

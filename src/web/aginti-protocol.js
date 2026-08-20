@@ -241,12 +241,18 @@ export function validateAgentRequest(pathname, value = {}) {
       return Object.freeze({ runId: validateRunId(object.runId) });
     }
     case AGINTI_RPC_PATHS.runsEvents: {
-      const object = exact(value, ["runId", "afterSeq"], "request", ["runId"]);
+      const object = exact(value, ["runId", "afterSeq", "afterHash"], "request");
+      const afterSeq = boundedInteger(object.afterSeq, "afterSeq", { maximum: 10_000_000_000 });
+      if (typeof object.afterHash !== "string" || !DIGEST.test(object.afterHash)) {
+        invalid("afterHash must be a lowercase SHA-256 digest");
+      }
+      if (afterSeq === 0 && object.afterHash !== ZERO_HASH) {
+        invalid("afterHash must be the zero hash when afterSeq is 0");
+      }
       return Object.freeze({
         runId: validateRunId(object.runId),
-        afterSeq: object.afterSeq === undefined
-          ? 0
-          : boundedInteger(object.afterSeq, "afterSeq", { maximum: 10_000_000_000 }),
+        afterSeq,
+        afterHash: object.afterHash,
       });
     }
     case AGINTI_RPC_PATHS.runsResume: {

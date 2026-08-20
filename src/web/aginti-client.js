@@ -443,7 +443,11 @@ export class AgintiBrowserClient {
       let response;
       const deadline = deadlineSignal(signal, this.streamWallMs);
       try {
-        const request = validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, { runId, afterSeq: delivery.seq });
+        const request = validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+          runId,
+          afterSeq: delivery.seq,
+          afterHash: delivery.hash,
+        });
         response = await this.fetch(endpoint, {
           method: "POST",
           credentials: "same-origin",

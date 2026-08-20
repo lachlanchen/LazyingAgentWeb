@@ -10,6 +10,7 @@ import {
 import { AGINTI_RPC_PATHS, canonicalJson } from "../src/web/aginti-protocol.js";
 
 const TOKEN = "aginti-adapter-test-token-00000000000001";
+const ZERO_HASH = "0".repeat(64);
 const CONTEXT = Object.freeze({
   principalId: "principal_account_one",
   browserSession: "a".repeat(64),
@@ -99,7 +100,7 @@ test("rejects ambient, remote, malformed, accessor, and confused request authori
 });
 
 test("validates a split-CRLF event stream and its contiguous hash chain", async () => {
-  const first = event({ seq: 1, previousHash: "0".repeat(64) });
+  const first = event({ seq: 1, previousHash: ZERO_HASH });
   const second = event({ seq: 2, previousHash: first.hash, type: "output.delta", payload: { text: "hello" } });
   const source = [first, second]
     .map((item) => `id: ${item.id}\r\nevent: ${item.type}\r\ndata: ${JSON.stringify(item)}\r\n\r\n`)
@@ -113,23 +114,32 @@ test("validates a split-CRLF event stream and its contiguous hash chain", async 
       controller.close();
     },
   });
+  let requestBody;
   const adapter = createAgintiAgentAdapter({
     upstream: "http://127.0.0.1:18009",
     credentialProvider: async () => TOKEN,
-    fetchImpl: async () => new Response(stream, {
-      status: 200,
-      headers: { "content-type": "text/event-stream; charset=utf-8" },
-    }),
+    fetchImpl: async (url, init) => {
+      requestBody = JSON.parse(init.body);
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      });
+    },
   });
-  const events = await adapter.rpc(AGINTI_RPC_PATHS.runsEvents, { runId: first.runId, afterSeq: 0 }, CONTEXT);
+  const events = await adapter.rpc(AGINTI_RPC_PATHS.runsEvents, {
+    runId: first.runId,
+    afterSeq: 0,
+    afterHash: ZERO_HASH,
+  }, CONTEXT);
   const received = [];
   for await (const item of events) received.push(item);
   assert.deepEqual(received, [first, second]);
+  assert.deepEqual(requestBody, { runId: first.runId, afterSeq: 0, afterHash: ZERO_HASH });
   assert.equal(received.every(Object.isFrozen), true);
 });
 
 test("fails closed on a corrupt ledger, an oversized JSON response, and credential failure", async () => {
-  const valid = event({ seq: 1, previousHash: "0".repeat(64) });
+  const valid = event({ seq: 1, previousHash: ZERO_HASH });
   const corrupt = { ...valid, hash: "f".repeat(64) };
   const adapter = createAgintiAgentAdapter({
     upstream: "http://127.0.0.1:18009",
@@ -139,8 +149,47 @@ test("fails closed on a corrupt ledger, an oversized JSON response, and credenti
       { status: 200, headers: { "content-type": "text/event-stream" } },
     ),
   });
-  const iterable = await adapter.rpc(AGINTI_RPC_PATHS.runsEvents, { runId: valid.runId, afterSeq: 0 }, CONTEXT);
+  const iterable = await adapter.rpc(AGINTI_RPC_PATHS.runsEvents, {
+    runId: valid.runId,
+    afterSeq: 0,
+    afterHash: ZERO_HASH,
+  }, CONTEXT);
   await assert.rejects(async () => { for await (const unused of iterable) void unused; }, /ledger verification/u);
+
+  const wrongPrevious = event({ seq: 2, previousHash: ZERO_HASH });
+  const resumed = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async () => new Response(
+      `id: ${wrongPrevious.id}\nevent: ${wrongPrevious.type}\ndata: ${JSON.stringify(wrongPrevious)}\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+  });
+  const resumedIterable = await resumed.rpc(AGINTI_RPC_PATHS.runsEvents, {
+    runId: valid.runId,
+    afterSeq: 1,
+    afterHash: valid.hash,
+  }, CONTEXT);
+  await assert.rejects(
+    async () => { for await (const unused of resumedIterable) void unused; },
+    /ledger verification/u,
+  );
+
+  let eagerCalls = 0;
+  const rejectedCursor = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async () => { eagerCalls += 1; return new Response("", { status: 400 }); },
+  });
+  await assert.rejects(
+    rejectedCursor.rpc(AGINTI_RPC_PATHS.runsEvents, {
+      runId: valid.runId,
+      afterSeq: 1,
+      afterHash: valid.hash,
+    }, CONTEXT),
+    (error) => error instanceof AgintiAdapterError && error.statusCode === 400,
+  );
+  assert.equal(eagerCalls, 1);
 
   let pulls = 0;
   let cancelled = false;

@@ -13,7 +13,6 @@ import {
 const JSON_LIMIT = 2 * 1024 * 1024;
 const STREAM_LIMIT = 8 * 1024 * 1024;
 const SSE_BLOCK_LIMIT = 64 * 1024;
-const ZERO_HASH = "0".repeat(64);
 const PRINCIPAL_ID = /^[A-Za-z0-9._~-]{16,128}$/u;
 const BROWSER_SESSION = /^[a-f0-9]{64}$/u;
 const TOKEN = /^[A-Za-z0-9._~+/=-]{32,4096}$/u;
@@ -292,33 +291,33 @@ export function createAgintiAgentAdapter({ upstream, credentialProvider, fetchIm
     const endpoint = `${origin}${pathname}`;
 
     if (pathname === AGINTI_RPC_PATHS.runsEvents) {
+      let response;
+      try {
+        response = await fetchImpl(endpoint, {
+          method: "POST",
+          cache: "no-store",
+          redirect: "error",
+          headers: requestHeaders(token, safeContext, false, "text/event-stream"),
+          body: JSON.stringify(input),
+          signal: safeContext.signal,
+        });
+      } catch (error) { throw responseFailure(error); }
+      if (!response.ok) throw upstreamError(response);
+      assertUnencoded(response);
+      if (mediaType(response) !== "text/event-stream") {
+        await response.body?.cancel?.().catch(() => {});
+        fail("AgInTi event stream content type was invalid", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
+      }
       return (async function* events() {
-        let response;
-        try {
-          response = await fetchImpl(endpoint, {
-            method: "POST",
-            cache: "no-store",
-            redirect: "error",
-            headers: requestHeaders(token, safeContext, false, "text/event-stream"),
-            body: JSON.stringify(input),
-            signal: safeContext.signal,
-          });
-        } catch (error) { throw responseFailure(error); }
-        if (!response.ok) throw upstreamError(response);
-        assertUnencoded(response);
-        if (mediaType(response) !== "text/event-stream") {
-          await response.body?.cancel?.().catch(() => {});
-          fail("AgInTi event stream content type was invalid", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
-        }
         let sequence = input.afterSeq;
-        let previousHash = input.afterSeq === 0 ? ZERO_HASH : null;
+        let previousHash = input.afterHash;
         for await (const block of sseBlocks(response)) {
           const parsed = parseSseBlock(block);
           let event;
           try { event = validateEventEnvelope(parsed.value); }
           catch { fail("AgInTi event envelope was invalid", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false }); }
           if (parsed.id !== event.id || parsed.type !== event.type || event.runId !== input.runId
-              || event.seq !== sequence + 1 || (previousHash !== null && event.previousHash !== previousHash)
+              || event.seq !== sequence + 1 || event.previousHash !== previousHash
               || eventHash(event) !== event.hash) {
             fail("AgInTi event ledger verification failed", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
           }

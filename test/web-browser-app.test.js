@@ -1,0 +1,616 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+import { createBrowserApp } from "../src/web/browser-app.js";
+import { canonicalJson, verifyAgentEvent } from "../src/web/aginti-protocol.js";
+
+const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
+const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
+const NOW = "2026-08-20T08:00:00.000Z";
+const ZERO_HASH = "0".repeat(64);
+const CHAT_THREAD_ID = "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx";
+const CHAT_GENERATION_ID = "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx";
+const CHAT_HASH_A = "a".repeat(64);
+const CHAT_HASH_B = "b".repeat(64);
+
+function chatThread(overrides = {}) {
+  return {
+    threadId: CHAT_THREAD_ID,
+    title: "Durable chat",
+    modelAlias: "local-default",
+    revision: 0,
+    ledgerHash: null,
+    messageCount: 0,
+    ledgerBytes: 0,
+    currentGenerationId: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  };
+}
+
+function chatMessage(revision, role, content, overrides = {}) {
+  return {
+    threadId: CHAT_THREAD_ID,
+    messageId: `message_${String(revision).padStart(4, "0")}_xxxxxxxxxxxxxxxxxxxxxxxx`,
+    revision,
+    role,
+    content,
+    contentBytes: new TextEncoder().encode(content).byteLength,
+    previousHash: revision === 1 ? null : CHAT_HASH_A,
+    messageHash: revision === 1 ? CHAT_HASH_A : CHAT_HASH_B,
+    generationId: role === "assistant" ? CHAT_GENERATION_ID : null,
+    createdAt: NOW,
+    ...overrides,
+  };
+}
+
+function chatGeneration(overrides = {}) {
+  return {
+    threadId: CHAT_THREAD_ID,
+    generationId: CHAT_GENERATION_ID,
+    status: "in_progress",
+    terminal: false,
+    ...overrides,
+  };
+}
+
+class Node {
+  constructor(tagName = "div", text = "") {
+    this.tagName = tagName;
+    this.nodeValue = text;
+    this.children = [];
+    this.listeners = new Map();
+    this.attributes = new Map();
+    this.dataset = {};
+    this.className = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.checked = false;
+    this.value = "";
+    this.type = "";
+  }
+  appendChild(child) {
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+  replaceChildren(...children) { this.children = []; children.forEach((child) => this.appendChild(child)); }
+  addEventListener(name, listener) {
+    const current = this.listeners.get(name) ?? [];
+    current.push(listener);
+    this.listeners.set(name, current);
+  }
+  dispatch(name, event = {}) { for (const listener of this.listeners.get(name) ?? []) listener(event); }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  get textContent() { return this.tagName === "#text" ? this.nodeValue : this.children.map((child) => child.textContent).join(""); }
+  set textContent(value) { this.children = [new Node("#text", String(value))]; }
+}
+
+const IDS = [
+  "login-view", "app-view", "login-form", "login-error", "username", "password", "remember-session",
+  "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
+  "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
+  "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
+  "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
+  "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
+  "stop-run", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+];
+
+class Document {
+  constructor() {
+    this.documentElement = new Node("html");
+    this.ids = new Map(IDS.map((id) => [id, new Node(id === "composer" || id === "login-form" ? "form" : "div")]));
+    this.ids.get("app-view").hidden = true;
+    this.ids.get("mode-switch").hidden = true;
+    this.ids.get("remember-session").checked = true;
+  }
+  getElementById(id) { return this.ids.get(id) ?? null; }
+  createElement(name) { return new Node(name); }
+  createTextNode(value) { return new Node("#text", String(value)); }
+}
+
+function capabilities(overrides = {}) {
+  return {
+    schemaVersion: "1",
+    enabled: false,
+    agent: { kind: "aginti", label: "AgInTi Agent" },
+    model: { label: "LocalLLM" },
+    actions: { cancel: false, resume: false, retry: false },
+    attachments: { enabled: false },
+    artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+    ...overrides,
+  };
+}
+
+function baseAgent(capability = capabilities()) {
+  return {
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async *streamRunEvents() {},
+  };
+}
+
+function baseChat(overrides = {}) {
+  return {
+    prepareThread() { throw new Error("unexpected Direct Chat mutation"); },
+    async createThread() { throw new Error("unexpected Direct Chat mutation"); },
+    async retryCreateThread() { throw new Error("unexpected Direct Chat mutation"); },
+    async listThreads() { return { threads: [] }; },
+    async getThread() { throw new Error("unexpected Direct Chat read"); },
+    async listMessages() { throw new Error("unexpected Direct Chat read"); },
+    prepareRun() { throw new Error("unexpected Direct Chat mutation"); },
+    async startRun() { throw new Error("unexpected Direct Chat mutation"); },
+    async retryRun() { throw new Error("unexpected Direct Chat mutation"); },
+    async getRunStatus() { throw new Error("unexpected Direct Chat read"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("unexpected Direct Chat mutation"); },
+    async cancelRun() { throw new Error("unexpected Direct Chat mutation"); },
+    ...overrides,
+  };
+}
+
+function harness({
+  restore = { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" },
+  login,
+  agent = baseAgent(),
+  chat,
+  credentialSaver = async () => false,
+  wait = async () => {},
+  maxStreamBackoffSteps = 5,
+} = {}) {
+  const document = new Document();
+  const windowListeners = new Map();
+  const window = {
+    location: { protocol: "http:", reload() {} },
+    setTimeout() {},
+    addEventListener(name, listener) {
+      const current = windowListeners.get(name) ?? [];
+      current.push(listener);
+      windowListeners.set(name, current);
+    },
+  };
+  const sessionClient = {
+    async restore() { return restore; },
+    async login(value) { return login ? await login(value) : restore; },
+    async logout() { return { signedOut: true, agentCancellationPending: false }; },
+  };
+  const directChat = chat ?? baseChat();
+  const app = createBrowserApp({
+    document,
+    window,
+    navigator: { onLine: true },
+    sessionClient,
+    createAgentClient: () => agent,
+    createChatClient: () => directChat,
+    renderer: {
+      renderMarkdown(target, value) { target.textContent = value; },
+      renderArtifact(target, value) { target.textContent = value.title; return true; },
+    },
+    credentialSaver,
+    wait,
+    maxStreamBackoffSteps,
+  });
+  return { app, document, sessionClient };
+}
+
+function digest(value) { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+async function verifiedEvent({ seq, type, payload, previousHash }) {
+  const envelope = {
+    schemaVersion: "1",
+    id: `${RUN_ID}.${seq}`,
+    seq,
+    type,
+    threadId: THREAD_ID,
+    runId: RUN_ID,
+    createdAt: NOW,
+    payload,
+    previousHash,
+  };
+  const value = { ...envelope, hash: digest(canonicalJson(envelope)) };
+  return await verifyAgentEvent(value, {
+    expectedRunId: RUN_ID,
+    expectedThreadId: THREAD_ID,
+    afterSeq: seq - 1,
+    previousHash,
+    digest: async (input) => digest(input),
+  });
+}
+
+function run(status = "running") {
+  return { id: RUN_ID, threadId: THREAD_ID, status, output: status === "completed" ? "Done" : "" };
+}
+
+test("browser UI defaults to Agent only after an exact enabled AgInTi capability", async () => {
+  const enabled = harness({
+    agent: baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+  });
+  await enabled.app.initialize();
+  assert.equal(enabled.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(enabled.document.getElementById("mode-switch").hidden, false);
+  assert.equal(enabled.document.getElementById("agent-mode").getAttribute("aria-pressed"), "true");
+
+  const malformed = harness({ agent: baseAgent({ ...capabilities({ enabled: true }), runtime: { model: "browser-choice" } }) });
+  await malformed.app.initialize();
+  assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+});
+
+test("startup restores the server-owned Direct Chat thread and message ledger", async () => {
+  const thread = chatThread({
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: 25,
+  });
+  const messages = [chatMessage(1, "user", "Remember this"), chatMessage(2, "assistant", "Restored answer")];
+  let threadReads = 0;
+  const browser = harness({
+    chat: baseChat({
+      async listThreads() { return { threads: [thread] }; },
+      async getThread(threadId) { threadReads += 1; assert.equal(threadId, CHAT_THREAD_ID); return { thread }; },
+      async listMessages({ threadId, afterRevision, limit }) {
+        assert.equal(threadId, CHAT_THREAD_ID);
+        return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+      },
+    }),
+  });
+  await browser.app.initialize();
+  assert.equal(threadReads, 2, "a stable ledger cursor is confirmed before rendering");
+  assert.equal(browser.document.getElementById("conversation-title").textContent, "Durable chat");
+  assert.equal(browser.document.getElementById("thread-list").children.length, 1);
+  assert.match(browser.document.getElementById("messages").textContent, /Remember thisRestored answer/u);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Direct Chat creates and starts with exact retry tickets, then reconnects SSE without duplicate dispatch", async () => {
+  let authoritativeThread = null;
+  let authoritativeMessages = [];
+  let authoritativeGeneration = null;
+  const createTickets = [];
+  const runTickets = [];
+  const streamCursors = [];
+  let streams = 0;
+  const waits = [];
+  const chat = baseChat({
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_xxxxxxxxxxxxxxxxx" });
+    },
+    async createThread(ticket) {
+      createTickets.push(ticket);
+      authoritativeThread = chatThread({ title: ticket.title });
+      throw Object.assign(new Error("response lost"), { retryable: true });
+    },
+    async retryCreateThread(ticket) {
+      createTickets.push(ticket);
+      return { request: ticket, thread: authoritativeThread };
+    },
+    async listThreads() { return { threads: authoritativeThread ? [authoritativeThread] : [] }; },
+    async getThread(threadId) { assert.equal(threadId, CHAT_THREAD_ID); return { thread: authoritativeThread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: authoritativeMessages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      assert.equal(request.expectedRevision, 0);
+      assert.equal(request.expectedHash, null);
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_xxxxxxxxxxxxxxxxxxxx" });
+    },
+    async startRun(ticket) {
+      runTickets.push(ticket);
+      authoritativeMessages = [chatMessage(1, "user", ticket.content)];
+      authoritativeThread = chatThread({
+        title: authoritativeThread.title,
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: ticket.content.length,
+        currentGenerationId: CHAT_GENERATION_ID,
+      });
+      authoritativeGeneration = chatGeneration();
+      throw Object.assign(new Error("accepted response lost"), { retryable: true });
+    },
+    async retryRun(ticket) {
+      runTickets.push(ticket);
+      return { request: ticket, generation: authoritativeGeneration };
+    },
+    async getRunStatus() { return { generation: authoritativeGeneration }; },
+    async *streamRunEvents(options) {
+      streamCursors.push(options.afterSequence);
+      streams += 1;
+      if (streams === 1) {
+        await options.onCursor({ afterSequence: 1 });
+        yield { type: "delta", delta: { content: "Hel" }, afterSequence: 1 };
+        throw Object.assign(new Error("rotated"), { retryable: true });
+      }
+      await options.onCursor({ afterSequence: 2 });
+      yield { type: "delta", delta: { content: "lo" }, afterSequence: 2 };
+      authoritativeMessages = [
+        authoritativeMessages[0],
+        chatMessage(2, "assistant", "Hello authoritative"),
+      ];
+      authoritativeThread = chatThread({
+        title: authoritativeThread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: 30,
+      });
+      authoritativeGeneration = chatGeneration({ status: "completed", terminal: true });
+      yield { type: "generation", generation: authoritativeGeneration, afterSequence: 2 };
+    },
+  });
+  const browser = harness({ chat, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Hello durable world";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(createTickets.length, 2);
+  assert.equal(createTickets[0], createTickets[1], "thread retry reuses the exact prepared ticket");
+  assert.equal(runTickets.length, 2);
+  assert.equal(runTickets[0], runTickets[1], "run retry reuses the exact prepared ticket");
+  assert.deepEqual(streamCursors, [0, 1]);
+  assert.deepEqual(waits, [250, 250, 250]);
+  assert.equal(streams, 2);
+  assert.match(browser.document.getElementById("messages").textContent, /Hello durable worldHello authoritative/u);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Resume preserves an ambiguous Direct Chat run ticket after both automatic dispatch attempts fail", async () => {
+  let thread = chatThread();
+  let messages = [];
+  let prepared;
+  const dispatched = [];
+  let retryCalls = 0;
+  const completed = chatGeneration({ status: "completed", terminal: true });
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      prepared = Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_resume_xxxxxxxxxxxxx" });
+      return prepared;
+    },
+    async startRun(ticket) {
+      dispatched.push(ticket);
+      messages = [chatMessage(1, "user", ticket.content), chatMessage(2, "assistant", "Already completed")];
+      thread = chatThread({
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: 32,
+      });
+      throw Object.assign(new Error("response lost"), { retryable: true });
+    },
+    async retryRun(ticket) {
+      dispatched.push(ticket);
+      retryCalls += 1;
+      if (retryCalls === 1) throw Object.assign(new Error("still offline"), { retryable: true });
+      return { request: ticket, generation: completed };
+    },
+  });
+  const browser = harness({ chat });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Ambiguous dispatch";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  await browser.app.resume();
+  assert.equal(dispatched.length, 3);
+  assert.equal(dispatched.every((ticket) => ticket === prepared), true);
+  assert.match(browser.document.getElementById("messages").textContent, /Already completed/u);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Stop uses the explicit durable cancellation mutation; detaching its SSE alone never cancels", async () => {
+  let thread = null;
+  let messages = [];
+  let generation = chatGeneration();
+  let streamReady;
+  const streamStarted = new Promise((resolve) => { streamReady = resolve; });
+  const cancellations = [];
+  const chat = baseChat({
+    prepareThread({ title }) { return Object.freeze({ threadId: CHAT_THREAD_ID, title }); },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) { return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID }); },
+    async startRun(ticket) {
+      messages = [chatMessage(1, "user", ticket.content)];
+      thread = chatThread({
+        title: thread.title,
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: ticket.content.length,
+        currentGenerationId: CHAT_GENERATION_ID,
+      });
+      return { request: ticket, generation };
+    },
+    async *streamRunEvents({ signal, onCursor }) {
+      await onCursor({ afterSequence: 1 });
+      yield { type: "delta", delta: { content: "partial" }, afterSequence: 1 };
+      streamReady();
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    },
+    prepareCancellation(request) { return Object.freeze({ ...request, idempotencyKey: "cancel_xxxxxxxxxxxxxxxxxxxxxxxx" }); },
+    async cancelRun(ticket) {
+      cancellations.push(ticket);
+      generation = chatGeneration({ status: "cancelled", terminal: true });
+      thread = chatThread({
+        title: thread.title,
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+      });
+      return { request: ticket, generation };
+    },
+  });
+  const browser = harness({ chat });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Cancel me";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await streamStarted;
+  assert.equal(cancellations.length, 0, "streaming or disconnect setup is not cancellation");
+  await browser.app.stop();
+  await submission;
+  assert.equal(cancellations.length, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "cancelled");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Cancelled");
+});
+
+test("clean nonterminal EOF status-probes and reconnects from the last verified cursor without restarting", async () => {
+  const first = await verifiedEvent({ seq: 1, type: "output.delta", payload: { text: "Working" }, previousHash: ZERO_HASH });
+  const second = await verifiedEvent({ seq: 2, type: "run.completed", payload: {}, previousHash: first.hash });
+  const streamCursors = [];
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Plot values" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async runStatus() { statuses += 1; return { run: run() }; },
+    async resumeRun() { resumes += 1; return { run: run() }; },
+    async *streamRunEvents(options) {
+      streamCursors.push(options.cursor);
+      streams += 1;
+      if (streams === 1) yield { event: first, cursor: { seq: 1, hash: first.hash } };
+      else yield { event: second, cursor: { seq: 2, hash: second.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Plot values";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(streams, 2);
+  assert.equal(statuses, 1);
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0);
+  assert.deepEqual(streamCursors.map((value) => value.seq), [0, 1]);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(browser.document.getElementById("messages").textContent, /Working/u);
+});
+
+test("bounded native stream rotations keep reconnecting until AgInTi is terminal", async () => {
+  const terminal = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  const waits = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Long calculation" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async runStatus() { statuses += 1; return { run: run() }; },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 8) yield { event: terminal, cursor: { seq: 1, hash: terminal.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    maxStreamBackoffSteps: 2,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Long calculation";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(streams, 8);
+  assert.equal(statuses, 7);
+  assert.equal(starts, 1);
+  assert.deepEqual(waits, [250, 500, 1_000, 1_000, 1_000, 1_000, 1_000]);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("retryable outage recovers through status probe and cursor replay without start/resume duplication", async () => {
+  const first = await verifiedEvent({ seq: 1, type: "output.delta", payload: { text: "Recovered" }, previousHash: ZERO_HASH });
+  const second = await verifiedEvent({ seq: 2, type: "run.completed", payload: {}, previousHash: first.hash });
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Recover" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async runStatus() { statuses += 1; return { run: run() }; },
+    async resumeRun() { resumes += 1; return { run: run() }; },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 1) throw Object.assign(new Error("offline"), { retryable: true });
+      yield { event: first, cursor: { seq: 1, hash: first.hash } };
+      yield { event: second, cursor: { seq: 2, hash: second.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Recover";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(streams, 2);
+  assert.equal(statuses, 1);
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0);
+  assert.match(browser.document.getElementById("messages").textContent, /Recovered/u);
+});
+
+test("login errors distinguish credentials from busy/unavailable without leaking details", async () => {
+  async function messageFor(error) {
+    const browser = harness({
+      restore: { authenticated: false },
+      login: async () => { throw error; },
+    });
+    await browser.app.initialize();
+    browser.document.getElementById("username").value = "account-user";
+    browser.document.getElementById("password").value = "not-retained";
+    await browser.app.login({ preventDefault() {} });
+    assert.equal(browser.document.getElementById("password").value, "");
+    return browser.document.getElementById("login-error").textContent;
+  }
+  const unauthorized = await messageFor({ status: 401, message: "account exists" });
+  const forbidden = await messageFor({ status: 403, message: "account missing" });
+  assert.equal(unauthorized, forbidden);
+  assert.doesNotMatch(unauthorized, /exists|missing|401|403/u);
+  assert.match(await messageFor({ status: 429, message: "rate limiter internals" }), /temporarily busy/u);
+  assert.match(await messageFor({ status: 503, message: "upstream address" }), /unavailable/u);
+  assert.match(await messageFor(new TypeError("network host secret")), /unavailable/u);
+});
+
+test("Credential Management save runs only for a successful remembered login", async () => {
+  async function attempt(remember) {
+    let saves = 0;
+    const browser = harness({
+      restore: { authenticated: false },
+      login: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+      credentialSaver: async () => { saves += 1; return true; },
+    });
+    await browser.app.initialize();
+    browser.document.getElementById("username").value = "account-user";
+    browser.document.getElementById("password").value = "password-not-stored";
+    browser.document.getElementById("remember-session").checked = remember;
+    await browser.app.login({ preventDefault() {} });
+    assert.equal(browser.document.getElementById("password").value, "");
+    return saves;
+  }
+  assert.equal(await attempt(true), 1);
+  assert.equal(await attempt(false), 0);
+});
+
+test("browser integration has no legacy direct endpoint or browser-owned chat persistence", async () => {
+  const source = await readFile(new URL("../src/web/browser-app.js", import.meta.url), "utf8");
+  assert.match(source, /DirectChatBrowserClient/u);
+  assert.match(source, /CloudSessionClient/u);
+  assert.doesNotMatch(source, /DirectLocalLlmClient|\/v1\/chat\/completions/u);
+  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/u);
+});

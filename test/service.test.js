@@ -1,0 +1,234 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+
+import { loadServiceConfig } from '../src/service-config.js';
+import {
+  checkStandaloneServiceConfiguration,
+  createStandaloneService
+} from '../src/service.js';
+import { verifyStandaloneAssetMap } from '../src/web/asset-map.js';
+
+const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
+const LOCAL_TOKEN = 'service-local-token-0000000000001';
+
+function serviceFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), 'lazying-service-test-'));
+  const credentialsDirectory = join(root, 'credentials');
+  const configPath = join(root, 'service.json');
+  const cloudIndexDatabase = join(root, 'state', 'cloud', 'index.sqlite');
+  const directChatDatabase = join(root, 'state', 'chat', 'chat.sqlite');
+  mkdirSync(credentialsDirectory, { mode: 0o700 });
+  writeFileSync(join(credentialsDirectory, 'login-password-hash'), PASSWORD_RECORD, { mode: 0o400 });
+  writeFileSync(join(credentialsDirectory, 'localllm-token'), LOCAL_TOKEN, { mode: 0o400 });
+  const config = {
+    schema: 'lazying-agent-service/v1',
+    listen: { host: '127.0.0.1', port: 18_544 },
+    publicOrigin: 'https://llm.test',
+    account: {
+      username: 'lachlanchen',
+      principalId: 'principal_account_one',
+      displayName: 'Lachlan'
+    },
+    state: { cloudIndexDatabase, directChatDatabase },
+    pwa: {
+      versionLabel: 'service-test',
+      title: 'LazyingArt Agent',
+      name: 'LazyingArt Agent',
+      shortName: 'Lazying Agent'
+    },
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-test'],
+      defaultModelAlias: 'localllm-test'
+    },
+    credentials: {
+      passwordHash: 'login-password-hash',
+      localLlmToken: 'localllm-token'
+    }
+  };
+  writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+  chmodSync(configPath, 0o600);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return {
+    root,
+    config,
+    configPath,
+    credentialsDirectory,
+    cloudIndexDatabase,
+    directChatDatabase,
+    loadedConfig: loadServiceConfig({ configPath, credentialsDirectory })
+  };
+}
+
+class FakeServer extends EventEmitter {
+  constructor(port) {
+    super();
+    this.port = port;
+    this.listening = false;
+    this.listenCalls = [];
+    this.shutdownCalls = 0;
+  }
+
+  listen(port, host, callback) {
+    this.listenCalls.push({ port, host });
+    this.port = port;
+    this.host = host;
+    this.listening = true;
+    queueMicrotask(callback);
+    return this;
+  }
+
+  address() {
+    return this.listening ? { address: this.host, family: 'IPv4', port: this.port } : null;
+  }
+
+  async shutdown() {
+    this.shutdownCalls += 1;
+    const wasListening = this.listening;
+    this.listening = false;
+    if (wasListening) this.emit('close');
+  }
+}
+
+function serviceHarness(config) {
+  const captured = { serverOptions: null, requests: [] };
+  const fakeServer = new FakeServer(config.listen.port);
+  const serverFactory = (options) => {
+    captured.serverOptions = options;
+    return fakeServer;
+  };
+  const fetchImpl = async (url, init) => {
+    captured.requests.push({ url, init });
+    return new Response(JSON.stringify({
+      object: 'list',
+      data: [{ id: 'localllm-test', object: 'model', created: 1, owned_by: 'local' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  return { captured, fakeServer, serverFactory, fetchImpl };
+}
+
+test('configuration check validates credentials and branded PWA without creating state', async (t) => {
+  const state = serviceFixture(t);
+  assert.equal(existsSync(join(state.root, 'state')), false);
+
+  const report = await checkStandaloneServiceConfiguration(state.loadedConfig);
+
+  assert.equal(report.valid, true);
+  assert.equal(report.listen.address, undefined);
+  assert.deepEqual(report.listen, { host: '127.0.0.1', port: state.config.listen.port });
+  assert.equal(report.serviceWorkerRoute, '/sw.js');
+  assert.match(report.releaseId, /^service-test-[a-f0-9]{64}$/u);
+  assert.equal(report.agentEnabled, false);
+  assert.equal(existsSync(join(state.root, 'state')), false);
+  const output = JSON.stringify(report);
+  assert.equal(output.includes(PASSWORD_RECORD), false);
+  assert.equal(output.includes(LOCAL_TOKEN), false);
+});
+
+test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback server', async (t) => {
+  const state = serviceFixture(t);
+  const harness = serviceHarness(state.config);
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: harness.fetchImpl,
+    serverFactory: harness.serverFactory
+  });
+  t.after(async () => { await service.shutdown(); });
+
+  const options = harness.captured.serverOptions;
+  assert.equal(options.agintiAdapter, null);
+  assert.equal(options.directChatStore, service.directChatStore);
+  assert.equal(options.directChatContext, service.directChatContext);
+  assert.equal(options.directChatConnector, service.directChatConnector);
+  assert.equal(service.directChatSummarizer.locality, 'local');
+  assert.equal(options.controlStore, service.controlStore);
+  assert.equal(options.sessionStore, service.controlStore);
+  assert.equal(options.releaseId, service.releaseId);
+  assert.equal(service.agentEnabled, false);
+  assert.equal(service.assetMap.serviceWorkerRoute, '/sw.js');
+  assert.equal(verifyStandaloneAssetMap(service.assetMap), service.assetMap);
+  assert.equal(service.releaseId.endsWith(`-${service.assetMap.contentDigest}`), true);
+  assert.equal(service.assetMap.get('/sw.js').cacheControl, 'no-store, no-cache, must-revalidate');
+  assert.notEqual(state.cloudIndexDatabase, state.directChatDatabase);
+  assert.equal(existsSync(state.cloudIndexDatabase), true);
+  assert.equal(existsSync(state.directChatDatabase), true);
+  assert.equal(lstatSync(state.cloudIndexDatabase).mode & 0o077, 0);
+  assert.equal(lstatSync(state.directChatDatabase).mode & 0o077, 0);
+  assert.equal(service.account.id, state.config.account.principalId);
+  assert.equal(service.controlStore.getAccount(state.config.account.principalId).subject, 'lachlanchen');
+
+  const readiness = await service.directChatConnector.readiness();
+  assert.deepEqual(readiness, { ready: true, availableModelAliases: ['localllm-test'] });
+  assert.equal(harness.captured.requests.length, 1);
+  assert.equal(harness.captured.requests[0].url, 'http://127.0.0.1:18008/v1/models');
+  assert.equal(harness.captured.requests[0].init.headers.authorization, `Bearer ${LOCAL_TOKEN}`);
+
+  const first = await service.start();
+  const second = await service.start();
+  assert.deepEqual(first, { address: '127.0.0.1', port: state.config.listen.port });
+  assert.deepEqual(second, first);
+  assert.deepEqual(harness.fakeServer.listenCalls, [
+    { host: '127.0.0.1', port: state.config.listen.port }
+  ]);
+  await service.shutdown();
+  await service.shutdown();
+  assert.equal(harness.fakeServer.shutdownCalls, 1);
+});
+
+test('restarts over the same private databases with idempotent account provisioning', async (t) => {
+  const state = serviceFixture(t);
+  const firstHarness = serviceHarness(state.config);
+  const first = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: firstHarness.fetchImpl,
+    serverFactory: firstHarness.serverFactory
+  });
+  const firstAccount = first.account;
+  await first.shutdown();
+
+  const reloaded = loadServiceConfig({
+    configPath: state.configPath,
+    credentialsDirectory: state.credentialsDirectory
+  });
+  const secondHarness = serviceHarness(state.config);
+  const second = await createStandaloneService({
+    loadedConfig: reloaded,
+    fetchImpl: secondHarness.fetchImpl,
+    serverFactory: secondHarness.serverFactory
+  });
+  try {
+    assert.deepEqual(second.account, firstAccount);
+    assert.equal(second.controlStore.getAccount(state.config.account.principalId).issuer, 'local-login');
+    assert.equal(second.controlStore.getAccount(state.config.account.principalId).subject, 'lachlanchen');
+  } finally {
+    await second.shutdown();
+  }
+});
+
+test('constructs the real cloud server inertly without opening a listener', async (t) => {
+  const state = serviceFixture(t);
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: async () => { throw new Error('inert construction must not probe LocalLLM'); }
+  });
+  try {
+    assert.equal(service.server.listening, false);
+    assert.equal(service.server.address(), null);
+    assert.equal(service.server.releaseId, undefined);
+    assert.equal(service.releaseId, service.assetMap.releaseVersion);
+  } finally {
+    await service.shutdown();
+  }
+});

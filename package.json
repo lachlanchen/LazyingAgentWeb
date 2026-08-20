@@ -1,0 +1,31 @@
+{
+  "name": "@lazyingart/agent-web",
+  "version": "0.1.0",
+  "description": "Cloud presentation and delivery-index foundation for the LazyingArt agent web application",
+  "type": "module",
+  "engines": {
+    "node": ">=22.21.0"
+  },
+  "bin": {
+    "lazying-agent-web": "./src/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node scripts/check-syntax.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "sideEffects": false,
+  "license": "MIT",
+  "dependencies": {
+    "es-module-lexer": "2.3.1",
+    "katex": "0.16.47"
+  }
+}

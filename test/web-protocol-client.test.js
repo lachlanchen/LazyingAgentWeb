@@ -161,6 +161,11 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
   }), /lowercase SHA-256/u);
   assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
     runId: RUN_ID,
+    afterSeq: 1,
+    afterHash: ZERO_HASH,
+  }), /must not be the zero hash/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsEvents, {
+    runId: RUN_ID,
     afterSeq: 0,
     afterHash: ZERO_HASH,
     lastEventHash: ZERO_HASH,

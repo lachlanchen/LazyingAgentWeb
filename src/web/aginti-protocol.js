@@ -249,6 +249,9 @@ export function validateAgentRequest(pathname, value = {}) {
       if (afterSeq === 0 && object.afterHash !== ZERO_HASH) {
         invalid("afterHash must be the zero hash when afterSeq is 0");
       }
+      if (afterSeq > 0 && object.afterHash === ZERO_HASH) {
+        invalid("afterHash must not be the zero hash when afterSeq is greater than 0");
+      }
       return Object.freeze({
         runId: validateRunId(object.runId),
         afterSeq,

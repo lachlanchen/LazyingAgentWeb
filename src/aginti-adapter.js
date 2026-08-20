@@ -114,13 +114,13 @@ function assertUnencoded(response) {
 
 async function readBoundedText(response, maximum) {
   const advertised = response.headers.get("content-length");
-  if (advertised !== null && (!/^\d+$/u.test(advertised) || Number(advertised) > maximum)) {
+  if (advertised !== null && (!/^\d+$/u.test(advertised) || Number(advertised) >= maximum)) {
     await response.body?.cancel?.().catch(() => {});
     fail("AgInTi response exceeded its public bound", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
   }
   if (!response.body || typeof response.body.getReader !== "function") {
     const value = await response.text();
-    if (Buffer.byteLength(value, "utf8") > maximum) {
+    if (Buffer.byteLength(value, "utf8") >= maximum) {
       fail("AgInTi response exceeded its public bound", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
     }
     return value;
@@ -138,7 +138,7 @@ async function readBoundedText(response, maximum) {
         fail("AgInTi response was not a byte stream", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
       }
       size += value.byteLength;
-      if (size > maximum) {
+      if (size >= maximum) {
         fail("AgInTi response exceeded its public bound", { code: "AGINTI_RESPONSE_INVALID", statusCode: 502, retryable: false });
       }
       output += decoder.decode(value, { stream: true });

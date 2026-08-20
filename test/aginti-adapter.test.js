@@ -206,6 +206,26 @@ test("fails closed on a corrupt ledger, an oversized JSON response, and credenti
   assert.equal(cancelled, true);
   assert.ok(pulls <= 34, `expected bounded pulls, received ${pulls}`);
 
+  let exactPulls = 0;
+  let exactCancelled = false;
+  const exactLimit = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async () => new Response(new ReadableStream({
+      pull(controller) { exactPulls += 1; controller.enqueue(new Uint8Array([0x7b])); },
+      cancel() { exactCancelled = true; },
+    }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(2 * 1024 * 1024),
+      },
+    }),
+  });
+  assert.equal((await exactLimit.capabilities(CONTEXT)).enabled, false);
+  assert.equal(exactCancelled, true);
+  assert.ok(exactPulls <= 1, `expected only the stream's construction prefetch, received ${exactPulls}`);
+
   const unavailable = createAgintiAgentAdapter({
     upstream: "http://127.0.0.1:18009",
     credentialProvider: async () => "invalid token with spaces",

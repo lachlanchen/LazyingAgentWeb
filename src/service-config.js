@@ -12,6 +12,7 @@ import { TextDecoder } from 'node:util';
 
 const SERVICE_SCHEMA = 'lazying-agent-service/v1';
 const CREDENTIAL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/u;
+const SYSTEMD_UNIT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MODEL_ALIAS_PATTERN = /^localllm-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const VERSION_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,23}$/u;
@@ -22,13 +23,62 @@ function currentUid() {
   return typeof process.getuid === 'function' ? process.getuid() : null;
 }
 
-function assertOwnerOnly(stat, label) {
-  const uid = currentUid();
-  if (uid !== null && stat.uid !== uid) throw new TypeError(`${label} must be owned by the service user`);
-  if ((stat.mode & 0o077) !== 0) throw new TypeError(`${label} must be owner-only`);
+export function isTrustedCredentialOwner(ownerUid, serviceUid = currentUid(), ownerGid = ownerUid) {
+  if (!Number.isSafeInteger(ownerUid) || ownerUid < 0
+      || !Number.isSafeInteger(ownerGid) || ownerGid < 0
+      || (serviceUid !== null && (!Number.isSafeInteger(serviceUid) || serviceUid < 0))) {
+    throw new TypeError('credential owner identifiers are invalid');
+  }
+  if (ownerUid === 0) return ownerGid === 0;
+  return serviceUid === null || ownerUid === serviceUid;
 }
 
-function secureDirectory(pathname, label) {
+export function isSystemdCredentialPath(pathname, { directory = false } = {}) {
+  if (typeof pathname !== 'string' || typeof directory !== 'boolean'
+      || !isAbsolute(pathname) || resolve(pathname) !== pathname) {
+    return false;
+  }
+  const prefix = '/run/credentials/';
+  if (!pathname.startsWith(prefix)) return false;
+  const parts = pathname.slice(prefix.length).split('/');
+  if ((directory && parts.length !== 1) || (!directory && parts.length !== 2)
+      || !SYSTEMD_UNIT_NAME_PATTERN.test(parts[0])) {
+    return false;
+  }
+  return directory || CREDENTIAL_NAME_PATTERN.test(parts[1]);
+}
+
+export function isTrustedCredentialMode(mode, { rootOwned = false, directory = false } = {}) {
+  if (!Number.isSafeInteger(mode) || mode < 0 || typeof rootOwned !== 'boolean'
+      || typeof directory !== 'boolean') {
+    throw new TypeError('credential mode metadata is invalid');
+  }
+  const permissions = mode & 0o777;
+  if (!rootOwned) return (permissions & 0o077) === 0;
+  if (directory) {
+    return (permissions & 0o500) === 0o500 && (permissions & 0o027) === 0;
+  }
+  return (permissions & 0o400) === 0o400 && (permissions & 0o137) === 0;
+}
+
+function assertOwnerOnly(stat, label, { allowRootCredentialOwner = false } = {}) {
+  const uid = currentUid();
+  const trustedOwner = allowRootCredentialOwner
+    ? isTrustedCredentialOwner(stat.uid, uid, stat.gid)
+    : uid === null || stat.uid === uid;
+  if (!trustedOwner) {
+    throw new TypeError(`${label} must be owned by the service user${allowRootCredentialOwner ? ' or root credential authority' : ''}`);
+  }
+  const rootCredential = allowRootCredentialOwner && stat.uid === 0;
+  if (!isTrustedCredentialMode(stat.mode, {
+    rootOwned: rootCredential,
+    directory: stat.isDirectory()
+  })) {
+    throw new TypeError(`${label} must be owner-only or a read-only root-owned systemd credential`);
+  }
+}
+
+function secureDirectory(pathname, label, options) {
   if (typeof pathname !== 'string' || !isAbsolute(pathname) || resolve(pathname) !== pathname) {
     throw new TypeError(`${label} must be an absolute normalized path`);
   }
@@ -36,11 +86,15 @@ function secureDirectory(pathname, label) {
   if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(pathname) !== pathname) {
     throw new TypeError(`${label} must be a real directory without symlink indirection`);
   }
-  assertOwnerOnly(stat, label);
+  if (options?.allowRootCredentialOwner && stat.uid === 0
+      && !isSystemdCredentialPath(pathname, { directory: true })) {
+    throw new TypeError(`${label} root-owned systemd credentials must be under /run/credentials/<unit>`);
+  }
+  assertOwnerOnly(stat, label, options);
   return pathname;
 }
 
-function secureRegularFile(pathname, label, maximumBytes) {
+function secureRegularFile(pathname, label, maximumBytes, options) {
   if (typeof pathname !== 'string' || !isAbsolute(pathname) || resolve(pathname) !== pathname) {
     throw new TypeError(`${label} must be an absolute normalized path`);
   }
@@ -49,7 +103,11 @@ function secureRegularFile(pathname, label, maximumBytes) {
       || before.size < 1 || before.size > maximumBytes || realpathSync(pathname) !== pathname) {
     throw new TypeError(`${label} must be one bounded regular file without links`);
   }
-  assertOwnerOnly(before, label);
+  if (options?.allowRootCredentialOwner && before.uid === 0
+      && !isSystemdCredentialPath(pathname)) {
+    throw new TypeError(`${label} root-owned systemd credentials must be under /run/credentials/<unit>`);
+  }
+  assertOwnerOnly(before, label, options);
   const descriptor = openSync(pathname, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const opened = fstatSync(descriptor);
@@ -57,7 +115,7 @@ function secureRegularFile(pathname, label, maximumBytes) {
         || opened.size !== before.size || opened.size > maximumBytes) {
       throw new TypeError(`${label} changed while it was being opened`);
     }
-    assertOwnerOnly(opened, label);
+    assertOwnerOnly(opened, label, options);
     const bytes = readFileSync(descriptor);
     const after = fstatSync(descriptor);
     if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size
@@ -423,7 +481,9 @@ class LoadedServiceConfig {
     const pathname = join(this.#credentialsDirectory, name);
     if (resolve(pathname) !== pathname) throw new TypeError('credential name escaped its directory');
     const maximum = purpose === 'passwordHash' ? 1_024 : 4_096;
-    const bytes = secureRegularFile(pathname, `${purpose} credential`, maximum + 1);
+    const bytes = secureRegularFile(pathname, `${purpose} credential`, maximum + 1, {
+      allowRootCredentialOwner: true
+    });
     try {
       return decodedText(bytes, `${purpose} credential`, { trailingNewline: true });
     } finally {
@@ -447,7 +507,9 @@ export function loadServiceConfig({ configPath, credentialsDirectory } = {}) {
   if (credentialsDirectory === undefined || credentialsDirectory === null || credentialsDirectory === '') {
     throw new TypeError('credentialsDirectory is required (normally CREDENTIALS_DIRECTORY)');
   }
-  const directory = secureDirectory(credentialsDirectory, 'credentialsDirectory');
+  const directory = secureDirectory(credentialsDirectory, 'credentialsDirectory', {
+    allowRootCredentialOwner: true
+  });
   const bytes = secureRegularFile(configPath, 'service config', 64 * 1024);
   let parsed;
   try {

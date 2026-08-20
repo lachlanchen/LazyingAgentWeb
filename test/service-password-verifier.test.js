@@ -9,6 +9,7 @@ import {
 
 const PASSWORD = 'correct horse battery staple';
 const RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
+const LEGACY_32_BYTE_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8Y';
 
 test('verifies only the frozen production scrypt format without exposing its credential', async () => {
   assert.equal(validateScryptPasswordHash(RECORD), true);
@@ -33,6 +34,20 @@ test('verifies only the frozen production scrypt format without exposing its cre
   await assert.rejects(verifier.verify(PASSWORD, { signal: controller.signal }), { name: 'AbortError' });
 });
 
+test('accepts the canonical legacy 32-byte verifier without weakening scrypt parameters', async () => {
+  assert.equal(validateScryptPasswordHash(LEGACY_32_BYTE_RECORD), true);
+  const verifier = createScryptPasswordVerifier(LEGACY_32_BYTE_RECORD);
+  assert.deepEqual(verifier.parameters, {
+    version: 1,
+    n: 131_072,
+    r: 8,
+    p: 1,
+    keyLength: 32
+  });
+  assert.equal(await verifier.verify(PASSWORD), true);
+  assert.equal(await verifier.verify(`${PASSWORD}!`), false);
+});
+
 test('rejects parameter downgrade, noncanonical encoding, and malformed fixed records', () => {
   assert.deepEqual(PASSWORD_SCRYPT_FORMAT, {
     prefix: 'scrypt$v=1$n=131072,r=8,p=1$',
@@ -49,6 +64,7 @@ test('rejects parameter downgrade, noncanonical encoding, and malformed fixed re
     RECORD.replace('$ABEi', '$ABEi='),
     `${RECORD}\n`,
     'scrypt$v=1$n=131072,r=8,p=1$c2hvcnQ$YWxzby1zaG9ydA',
+    RECORD.replace(/\$[^$]+$/u, '$' + 'A'.repeat(64)),
     RECORD.replace(/\$[^$]+$/u, '$' + 'A'.repeat(85))
   ]) {
     assert.throws(() => createScryptPasswordVerifier(malformed), TypeError);

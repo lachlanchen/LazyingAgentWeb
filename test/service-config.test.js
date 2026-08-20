@@ -15,6 +15,9 @@ import test from 'node:test';
 import {
   STANDALONE_SERVICE_CONFIG_SCHEMA,
   assertLoadedServiceConfig,
+  isSystemdCredentialPath,
+  isTrustedCredentialMode,
+  isTrustedCredentialOwner,
   loadServiceConfig
 } from '../src/service-config.js';
 
@@ -102,6 +105,30 @@ test('loads only owner-private config and rotating LoadCredential-style files', 
   assert.equal(serialized.includes(TOKEN_TWO), false);
   assert.equal(serialized.includes(AGINTI_TOKEN), false);
   assert.equal(serialized.includes('password"'), false);
+});
+
+test('accepts only the service uid or root for systemd credential ownership', () => {
+  assert.equal(isTrustedCredentialOwner(1_000, 1_000), true);
+  assert.equal(isTrustedCredentialOwner(0, 1_000, 0), true);
+  assert.equal(isTrustedCredentialOwner(0, 1_000, 100), false);
+  assert.equal(isTrustedCredentialOwner(0, 0, 100), false);
+  assert.equal(isTrustedCredentialOwner(2_000, 1_000), false);
+  assert.equal(isTrustedCredentialOwner(0, null, 0), true);
+  assert.throws(() => isTrustedCredentialOwner(-1, 1_000), TypeError);
+  assert.equal(isSystemdCredentialPath('/run/credentials/lazying-agent-web.service', { directory: true }), true);
+  assert.equal(isSystemdCredentialPath('/run/credentials/lazying-agent-web.service/localllm-token'), true);
+  assert.equal(isSystemdCredentialPath('/run/credentials/lazying-agent-web@blue.service/token.name'), true);
+  assert.equal(isSystemdCredentialPath('/run/credentials/lazying-agent-web.service', { directory: false }), false);
+  assert.equal(isSystemdCredentialPath('/run/credentials/lazying-agent-web.service/../token'), false);
+  assert.equal(isSystemdCredentialPath('/tmp/credentials/lazying-agent-web.service/token'), false);
+  assert.equal(isTrustedCredentialMode(0o100440, { rootOwned: true }), true);
+  assert.equal(isTrustedCredentialMode(0o040550, { rootOwned: true, directory: true }), true);
+  assert.equal(isTrustedCredentialMode(0o100640, { rootOwned: true }), true);
+  assert.equal(isTrustedCredentialMode(0o040750, { rootOwned: true, directory: true }), true);
+  assert.equal(isTrustedCredentialMode(0o100460, { rootOwned: true }), false);
+  assert.equal(isTrustedCredentialMode(0o040570, { rootOwned: true, directory: true }), false);
+  assert.equal(isTrustedCredentialMode(0o100600), true);
+  assert.equal(isTrustedCredentialMode(0o100640), false);
 });
 
 test('rejects permissive modes, symlinks, and hard-linked credential inputs', (t) => {

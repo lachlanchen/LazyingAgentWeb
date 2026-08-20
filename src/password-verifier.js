@@ -9,6 +9,7 @@ const SCRYPT_PARAMETERS = Object.freeze({
   keyLength: 64,
   maxmem: 256 * 1024 * 1024
 });
+const COMPATIBLE_KEY_LENGTHS = Object.freeze([32, SCRYPT_PARAMETERS.keyLength]);
 
 function canonicalBase64Url(value, name, { minimumBytes, maximumBytes }) {
   if (typeof value !== 'string' || !BASE64URL_PATTERN.test(value) || value.includes('=')) {
@@ -43,14 +44,18 @@ function parseRecord(record) {
   let digest;
   try {
     digest = canonicalBase64Url(fields[1], 'scrypt digest', {
-      minimumBytes: SCRYPT_PARAMETERS.keyLength,
+      minimumBytes: COMPATIBLE_KEY_LENGTHS[0],
       maximumBytes: SCRYPT_PARAMETERS.keyLength
     });
+    if (!COMPATIBLE_KEY_LENGTHS.includes(digest.byteLength)) {
+      digest.fill(0);
+      throw new TypeError('scrypt digest has an unsupported canonical length');
+    }
   } catch (error) {
     salt.fill(0);
     throw error;
   }
-  return { salt, digest };
+  return { salt, digest, keyLength: digest.byteLength };
 }
 
 function passwordInput(value) {
@@ -60,9 +65,9 @@ function passwordInput(value) {
   return value;
 }
 
-function derive(password, salt) {
+function derive(password, salt, keyLength) {
   return new Promise((resolve, reject) => {
-    scrypt(password, salt, SCRYPT_PARAMETERS.keyLength, {
+    scrypt(password, salt, keyLength, {
       N: SCRYPT_PARAMETERS.N,
       r: SCRYPT_PARAMETERS.r,
       p: SCRYPT_PARAMETERS.p,
@@ -79,6 +84,7 @@ export function createScryptPasswordVerifier(encodedHash) {
   const parsed = parseRecord(encodedHash);
   const salt = Buffer.from(parsed.salt);
   const expected = Buffer.from(parsed.digest);
+  const keyLength = parsed.keyLength;
   parsed.salt.fill(0);
   parsed.digest.fill(0);
 
@@ -89,7 +95,7 @@ export function createScryptPasswordVerifier(encodedHash) {
       n: SCRYPT_PARAMETERS.N,
       r: SCRYPT_PARAMETERS.r,
       p: SCRYPT_PARAMETERS.p,
-      keyLength: SCRYPT_PARAMETERS.keyLength
+      keyLength
     }),
     async verify(candidate, { signal } = {}) {
       const password = passwordInput(candidate);
@@ -97,7 +103,7 @@ export function createScryptPasswordVerifier(encodedHash) {
         throw new TypeError('signal must be an AbortSignal');
       }
       if (signal?.aborted) throw abortReason(signal);
-      const actual = await derive(password, salt);
+      const actual = await derive(password, salt, keyLength);
       try {
         if (signal?.aborted) throw abortReason(signal);
         return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);

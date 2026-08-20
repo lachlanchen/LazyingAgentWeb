@@ -153,7 +153,15 @@ owner-only `LoadCredential` files. A secret-free shape is:
 ```
 
 The filenames identify distinct credential files; raw password verifiers and
-bearer values never appear in the JSON. Set `aginti` to `{ "enabled": false }`
+bearer values never appear in the JSON. Credential directories and files may
+be systemd `LoadCredential` material owned by root (including its read-only
+root-group delivery modes under `/run/credentials/<unit>/`) or owner-only
+files owned by the service account;
+symlinks, hard links, world access, and any non-owner write access remain
+rejected. The preferred fixed-parameter scrypt verifier uses a 64-byte
+derived key, while the canonical 32-byte verifier used by the current v0.2
+login is accepted for a password-preserving migration. Set `aginti` to
+`{ "enabled": false }`
 and omit `credentials.agintiToken` when the Agent transport is intentionally
 absent. Configuring the transport does not claim Agent readiness: capability
 discovery stays fail-closed until AgInTi itself proves its native API, policy,

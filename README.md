@@ -4,12 +4,12 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Current status:** this repository contains the implementation and its
-> offline acceptance tests, but this release has **not been deployed** to
-> `llm.lazying.art`. AgInTi Agent mode remains fail-closed and disabled until
-> its native API, sandbox, replay/cancellation, resource-admission, tunnel, and
-> live rollback gates all pass. Direct Chat and the static PWA do not imply that
-> Agent mode is ready.
+> **Current status:** the PWA and Direct Chat release at commit `5ba906a` is
+> live at `llm.lazying.art`, with its preceding release retained for rollback.
+> AgInTi Agent mode remains fail-closed and disabled until its native API,
+> sandbox, replay/cancellation, resource-admission, tunnel, and live rollback
+> gates all pass. A live PWA and Direct Chat do not imply that Agent mode is
+> ready.
 
 The ownership model, Chat/Agent data planes, recovery semantics, artifact
 boundary, and replaceable-node contract are specified in

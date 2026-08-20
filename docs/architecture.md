@@ -1,9 +1,10 @@
 # LazyingAgentWeb architecture
 
-This document describes the implemented standalone package boundary. It is not
-a deployment record: this release is not yet deployed to `llm.lazying.art`, and
-AgInTi Agent remains disabled until every native, sandbox, tunnel, resource, and
-live rollback acceptance gate in the promotion rule passes.
+This document describes the implemented standalone package boundary. The PWA
+and Direct Chat release at commit `5ba906a` is live at `llm.lazying.art`, with
+its preceding immutable release retained for rollback. AgInTi Agent remains
+disabled until every native, sandbox, tunnel, resource, and live rollback
+acceptance gate in the promotion rule passes.
 
 ## Product boundary
 
@@ -247,5 +248,6 @@ context durability, artifact isolation, resource admission, tunnel outage and
 rollback. A live Docker/model acceptance run is additionally blocked whenever
 the shared-workstation resource policy fails. Releases are immutable and retain
 the current and immediately previous reproducible package with an executable
-rollback. Passing offline package tests alone does not authorize deployment;
-this repository currently describes a not-yet-deployed candidate.
+rollback. Passing offline package tests alone does not authorize deployment.
+The current live PWA/Direct Chat deployment does not authorize or imply Agent
+enablement.

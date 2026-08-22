@@ -5,16 +5,17 @@ import { pathToFileURL } from 'node:url';
 import { loadServiceConfig } from './service-config.js';
 import {
   checkStandaloneServiceConfiguration,
+  createStandaloneServiceEdgeRouteManifest,
   createStandaloneService
 } from './service.js';
 
 function parseArguments(argv, env) {
   if (!Array.isArray(argv) || (argv.length !== 1 && argv.length !== 3)) {
-    throw new TypeError('usage: lazying-agent-web <serve|config-check> [--config ABSOLUTE_PATH]');
+    throw new TypeError('usage: lazying-agent-web <serve|config-check|edge-routes> [--config ABSOLUTE_PATH]');
   }
   const command = argv[0];
-  if (command !== 'serve' && command !== 'config-check') {
-    throw new TypeError('only serve and config-check commands are supported');
+  if (command !== 'serve' && command !== 'config-check' && command !== 'edge-routes') {
+    throw new TypeError('only serve, config-check, and edge-routes commands are supported');
   }
   let configPath;
   if (argv.length === 3) {
@@ -62,10 +63,12 @@ export async function runCli({
   stdout = process.stdout,
   configLoader = loadServiceConfig,
   configChecker = checkStandaloneServiceConfiguration,
+  edgeRouteManifestBuilder = createStandaloneServiceEdgeRouteManifest,
   serviceFactory = createStandaloneService,
   terminationWaiter = waitForTermination
 } = {}) {
   if (typeof configLoader !== 'function' || typeof configChecker !== 'function'
+      || typeof edgeRouteManifestBuilder !== 'function'
       || typeof serviceFactory !== 'function' || typeof terminationWaiter !== 'function') {
     throw new TypeError('CLI dependencies must be functions');
   }
@@ -77,6 +80,11 @@ export async function runCli({
   if (command.command === 'config-check') {
     const report = await configChecker(loadedConfig);
     writeJson(stdout, { ok: true, command: 'config-check', ...report });
+    return 0;
+  }
+  if (command.command === 'edge-routes') {
+    const manifest = await edgeRouteManifestBuilder(loadedConfig);
+    writeJson(stdout, { ok: true, command: 'edge-routes', ...manifest });
     return 0;
   }
 

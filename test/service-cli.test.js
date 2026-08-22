@@ -62,6 +62,46 @@ test('config-check accepts only config location and emits a secret-free report',
   assert.equal(stdout.text().includes('token'), false);
 });
 
+test('edge-routes emits the candidate build exact static route contract', async () => {
+  const stdout = outputCollector();
+  const loaded = Object.freeze({ kind: 'loaded' });
+  const releaseId = `release-${'c'.repeat(64)}`;
+  const code = await runCli({
+    argv: ['edge-routes', '--config', '/private/service.json'],
+    env: environment(),
+    stdout,
+    configLoader: () => loaded,
+    configChecker() { throw new Error('config checker must not run'); },
+    async edgeRouteManifestBuilder(value) {
+      assert.equal(value, loaded);
+      return {
+        schema: 'lazying-agent-web/edge-route-manifest/v1',
+        publicOrigin: 'https://llm.test',
+        releaseId,
+        methods: ['GET', 'HEAD'],
+        paths: ['/', `/assets/r/${releaseId}/app.js`, '/manifest.webmanifest', '/sw.js'],
+        requestTargets: ['/', `/assets/r/${releaseId}/app.js`, `/manifest.webmanifest?v=${releaseId}`, '/sw.js']
+      };
+    },
+    serviceFactory() { throw new Error('serve factory must not run'); },
+    terminationWaiter() { throw new Error('termination waiter must not run'); }
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(stdout.json(), {
+    ok: true,
+    command: 'edge-routes',
+    schema: 'lazying-agent-web/edge-route-manifest/v1',
+    publicOrigin: 'https://llm.test',
+    releaseId,
+    methods: ['GET', 'HEAD'],
+    paths: ['/', `/assets/r/${releaseId}/app.js`, '/manifest.webmanifest', '/sw.js'],
+    requestTargets: ['/', `/assets/r/${releaseId}/app.js`, `/manifest.webmanifest?v=${releaseId}`, '/sw.js']
+  });
+  assert.equal(stdout.text().includes('password'), false);
+  assert.equal(stdout.text().includes('token'), false);
+});
+
 test('serve binds through the service only and always performs graceful shutdown', async () => {
   const stdout = outputCollector();
   const server = new EventEmitter();

@@ -169,6 +169,19 @@ absent. Configuring the transport does not claim Agent readiness: capability
 discovery stays fail-closed until AgInTi itself proves its native API, policy,
 sandbox, and current resource admission.
 
+Before switching an edge proxy to a candidate build, derive its exact,
+secret-free static allowlist from that same installed package and config:
+
+```sh
+lazying-agent-web edge-routes --config /etc/lazying-agent-web/service.json
+```
+
+The JSON contract contains the candidate content-bound `releaseId`, the exact
+`GET`/`HEAD` paths, and the query-bearing request targets used by the service
+worker. Stage and validate the proxy from this output, switch the proxy and app
+as one release, then verify every request target before retiring the previous
+allowlist. Unknown or foreign release assets must continue to return 404.
+
 Direct Chat vision remains fail-closed when `localLlm.vision` is absent or
 disabled. Enabling it requires the fixed `localllm-vision` alias while keeping a
 different default text alias. The PWA accepts exactly one JPEG or PNG plus a

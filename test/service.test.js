@@ -16,6 +16,7 @@ import test from 'node:test';
 import { loadServiceConfig } from '../src/service-config.js';
 import {
   checkStandaloneServiceConfiguration,
+  createStandaloneServiceEdgeRouteManifest,
   createStandaloneService
 } from '../src/service.js';
 import { verifyStandaloneAssetMap } from '../src/web/asset-map.js';
@@ -152,6 +153,47 @@ test('configuration check validates credentials and branded PWA without creating
   assert.equal(report.agentConfigured, true);
   assert.equal(existsSync(join(state.root, 'state')), false);
   const output = JSON.stringify(report);
+  assert.equal(output.includes(PASSWORD_RECORD), false);
+  assert.equal(output.includes(LOCAL_TOKEN), false);
+  assert.equal(output.includes(AGINTI_TOKEN), false);
+});
+
+test('edge route manifest binds the proxy allowlist to the exact candidate PWA', async (t) => {
+  const state = serviceFixture(t);
+  assert.equal(existsSync(join(state.root, 'state')), false);
+
+  const [report, manifest] = await Promise.all([
+    checkStandaloneServiceConfiguration(state.loadedConfig),
+    createStandaloneServiceEdgeRouteManifest(state.loadedConfig)
+  ]);
+
+  assert.equal(manifest.schema, 'lazying-agent-web/edge-route-manifest/v1');
+  assert.equal(manifest.publicOrigin, state.config.publicOrigin);
+  assert.equal(manifest.releaseId, report.releaseId);
+  assert.deepEqual(manifest.methods, ['GET', 'HEAD']);
+  assert.equal(Object.isFrozen(manifest), true);
+  assert.equal(Object.isFrozen(manifest.methods), true);
+  assert.equal(Object.isFrozen(manifest.paths), true);
+  assert.equal(Object.isFrozen(manifest.requestTargets), true);
+  assert.deepEqual(manifest.paths, [...manifest.paths].sort());
+  assert.equal(new Set(manifest.paths).size, manifest.paths.length);
+  assert.equal(manifest.paths.every((pathname) => pathname.startsWith('/') && !pathname.includes('?')), true);
+  assert.equal(manifest.requestTargets.length, manifest.paths.length);
+  assert.equal(manifest.paths.includes('/'), true);
+  assert.equal(manifest.paths.includes('/manifest.webmanifest'), true);
+  assert.equal(manifest.paths.includes('/sw.js'), true);
+  assert.equal(
+    manifest.requestTargets.includes(`/manifest.webmanifest?v=${manifest.releaseId}`),
+    true
+  );
+  const immutablePaths = manifest.paths.filter((pathname) => pathname.startsWith('/assets/'));
+  assert.equal(immutablePaths.length, manifest.paths.length - 3);
+  assert.equal(
+    immutablePaths.every((pathname) => pathname.startsWith(`/assets/r/${manifest.releaseId}/`)),
+    true
+  );
+  assert.equal(existsSync(join(state.root, 'state')), false);
+  const output = JSON.stringify(manifest);
   assert.equal(output.includes(PASSWORD_RECORD), false);
   assert.equal(output.includes(LOCAL_TOKEN), false);
   assert.equal(output.includes(AGINTI_TOKEN), false);

@@ -131,9 +131,32 @@ function safeReport(config, assetMap) {
   });
 }
 
+function safeEdgeRouteManifest(config, assetMap) {
+  verifyStandaloneAssetMap(assetMap);
+  const requestTargets = Object.freeze([...assetMap.routes]);
+  const paths = Object.freeze([...new Set(requestTargets.map((target) => target.split('?', 1)[0]))].sort());
+  if (paths.some((pathname) => typeof pathname !== 'string' || !pathname.startsWith('/'))
+      || requestTargets.some((target) => typeof target !== 'string' || !target.startsWith('/'))) {
+    throw new TypeError('standalone PWA edge route manifest is invalid');
+  }
+  return Object.freeze({
+    schema: 'lazying-agent-web/edge-route-manifest/v1',
+    publicOrigin: config.publicOrigin,
+    releaseId: assetMap.releaseVersion,
+    methods: Object.freeze(['GET', 'HEAD']),
+    paths,
+    requestTargets
+  });
+}
+
 export async function checkStandaloneServiceConfiguration(loadedConfig) {
   const materialized = await materializeInputs(loadedConfig, { createVerifier: false });
   return safeReport(materialized.loaded.config, materialized.assetMap);
+}
+
+export async function createStandaloneServiceEdgeRouteManifest(loadedConfig) {
+  const materialized = await materializeInputs(loadedConfig, { createVerifier: false });
+  return safeEdgeRouteManifest(materialized.loaded.config, materialized.assetMap);
 }
 
 export async function createStandaloneService({

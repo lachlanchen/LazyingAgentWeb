@@ -398,7 +398,7 @@ export function createAppShellHtml({
 </head>
 <body>
   <main id="login-view" class="login-view" aria-labelledby="login-title">
-    <form id="login-form" class="login-card" method="post" action="${safeLoginPath}" autocomplete="on">
+    <form id="login-form" class="login-card" method="post" action="${safeLoginPath}" autocomplete="on" aria-busy="true">
       <p class="eyebrow">Private cloud workspace</p>
       <h1 id="login-title">${safeTitle}</h1>
       <p class="muted">Sign in to resume your server-held session. The app does not save your password.</p>
@@ -406,7 +406,7 @@ export function createAppShellHtml({
       <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
       <label class="remember"><input id="remember-session" name="remember" type="checkbox" checked> Keep this device signed in</label>
       <p id="login-error" class="form-error" role="alert" hidden></p>
-      <button type="submit" class="primary">Sign in</button>
+      <button id="login-submit" type="submit" class="primary" disabled>Preparing secure sign-in…</button>
       <p class="privacy-note">Password saving is handled only by your browser or password manager.</p>
     </form>
   </main>
@@ -418,7 +418,7 @@ export function createAppShellHtml({
       <nav id="thread-list" class="thread-list" aria-label="Saved conversations"></nav>
       <footer>
         <span id="signed-in-user"></span>
-        <button id="logout" type="button">Sign out</button>
+        <button id="logout" type="button" disabled>Sign out</button>
       </footer>
     </aside>
     <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="Close conversations" hidden></button>

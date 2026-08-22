@@ -155,7 +155,7 @@ class DomDocument {
 }
 
 const APP_IDS = [
-  "login-view", "app-view", "login-form", "login-error", "username", "password", "remember-session",
+  "login-view", "app-view", "login-form", "login-submit", "login-error", "username", "password", "remember-session",
   "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
@@ -179,6 +179,10 @@ function appDocument({ basePath = "/" } = {}) {
   }
   document.getElementById("app-view").hidden = true;
   document.getElementById("update-banner").hidden = true;
+  document.getElementById("login-submit").disabled = true;
+  document.getElementById("login-submit").textContent = "Preparing secure sign-in…";
+  document.getElementById("login-form").setAttribute("aria-busy", "true");
+  document.getElementById("logout").disabled = true;
   document.getElementById("remember-session").checked = true;
   return document;
 }
@@ -451,6 +455,10 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.match(html, /autocomplete="username"/u);
   assert.match(html, /autocomplete="current-password"/u);
   assert.match(html, /<form id="login-form"[^>]*method="post"[^>]*action="\/api\/login"/u);
+  assert.match(html, /<form id="login-form"[^>]*aria-busy="true"/u);
+  assert.match(html, /<button id="login-submit"[^>]*type="submit"[^>]*disabled>Preparing secure sign-in…<\/button>/u);
+  assert.equal([...html.matchAll(/id="login-submit"/gu)].length, 1);
+  assert.match(html, /<button id="logout"[^>]*type="button"[^>]*disabled>Sign out<\/button>/u);
   assert.match(html, new RegExp(`href="${map.releaseNamespace}/app\\.css"`, "u"));
   assert.match(html, new RegExp(`src="${map.releaseNamespace}/app\\.js"`, "u"));
   assert.match(html, /meta name="lazying-agent-base-path" content="\/"/u);

@@ -91,7 +91,7 @@ class Node {
 }
 
 const IDS = [
-  "login-view", "app-view", "login-form", "login-error", "username", "password", "remember-session",
+  "login-view", "app-view", "login-form", "login-submit", "login-error", "username", "password", "remember-session",
   "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
@@ -106,6 +106,10 @@ class Document {
     this.ids = new Map(IDS.map((id) => [id, new Node(id === "composer" || id === "login-form" ? "form" : "div")]));
     this.ids.get("app-view").hidden = true;
     this.ids.get("mode-switch").hidden = true;
+    this.ids.get("login-submit").disabled = true;
+    this.ids.get("login-submit").textContent = "Preparing secure sign-in…";
+    this.ids.get("login-form").setAttribute("aria-busy", "true");
+    this.ids.get("logout").disabled = true;
     this.ids.get("remember-session").checked = true;
   }
   getElementById(id) { return this.ids.get(id) ?? null; }
@@ -156,6 +160,7 @@ function baseChat(overrides = {}) {
 function harness({
   restore = { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" },
   login,
+  logout,
   agent = baseAgent(),
   chat,
   credentialSaver = async () => false,
@@ -176,7 +181,7 @@ function harness({
   const sessionClient = {
     async restore() { return restore; },
     async login(value) { return login ? await login(value) : restore; },
-    async logout() { return { signedOut: true, agentCancellationPending: false }; },
+    async logout() { return logout ? await logout() : { signedOut: true, agentCancellationPending: false }; },
   };
   const directChat = chat ?? baseChat();
   const app = createBrowserApp({
@@ -198,6 +203,159 @@ function harness({
 }
 
 function digest(value) { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+test("sign-in stays disabled until startup restore settles and then accepts exactly one request", async () => {
+  const startup = Promise.withResolvers();
+  const loginResult = Promise.withResolvers();
+  let loginCalls = 0;
+  const browser = harness({
+    restore: startup.promise,
+    async login(value) {
+      loginCalls += 1;
+      assert.deepEqual(value, { username: "account-user", password: "correct horse", remember: true });
+      return await loginResult.promise;
+    },
+  });
+  const submit = browser.document.getElementById("login-submit");
+  const form = browser.document.getElementById("login-form");
+  const username = browser.document.getElementById("username");
+  const password = browser.document.getElementById("password");
+  username.value = "account-user";
+  password.value = "correct horse";
+
+  const initializing = browser.app.initialize();
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.textContent, "Preparing secure sign-in…");
+  assert.equal(form.getAttribute("aria-busy"), "true");
+  let prevented = false;
+  form.dispatch("submit", { preventDefault() { prevented = true; } });
+  assert.equal(prevented, true, "the bound form handler prevents native submission during restore");
+  await Promise.resolve();
+  assert.equal(loginCalls, 0, "login cannot overlap the authoritative startup restore");
+
+  startup.resolve({ authenticated: false });
+  await initializing;
+  assert.equal(password.value, "correct horse", "startup restore preserves typed or autofilled credentials");
+  assert.equal(submit.disabled, false);
+  assert.equal(submit.textContent, "Sign in");
+  assert.equal(form.getAttribute("aria-busy"), "false");
+
+  const first = browser.app.login({ preventDefault() {} });
+  const duplicate = browser.app.login({ preventDefault() {} });
+  assert.equal(loginCalls, 1, "a pending login remains single-flight");
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.textContent, "Signing in…");
+  loginResult.resolve({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" });
+  await Promise.all([first, duplicate]);
+  assert.equal(password.value, "", "an actual login attempt clears the password field");
+  assert.equal(browser.document.getElementById("login-view").hidden, true);
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  await browser.app.logout();
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(submit.disabled, false);
+  assert.equal(submit.textContent, "Sign in");
+});
+
+test("failed startup restore releases the guarded sign-in control", async () => {
+  const browser = harness({ restore: Promise.reject(new Error("session unavailable")) });
+  await browser.app.initialize();
+  assert.equal(browser.document.getElementById("login-submit").disabled, false);
+  assert.equal(browser.document.getElementById("login-submit").textContent, "Sign in");
+  assert.equal(browser.document.getElementById("login-form").getAttribute("aria-busy"), "false");
+  assert.equal(browser.document.getElementById("login-error").hidden, false);
+});
+
+test("authenticated startup restore clears a typed password before hydration can stall", async () => {
+  const startup = Promise.withResolvers();
+  const threads = Promise.withResolvers();
+  const threadsStarted = Promise.withResolvers();
+  const browser = harness({
+    restore: startup.promise,
+    chat: baseChat({
+      async listThreads() {
+        threadsStarted.resolve();
+        return await threads.promise;
+      },
+    }),
+  });
+  const password = browser.document.getElementById("password");
+  password.value = "must-not-remain-hidden";
+  const initializing = browser.app.initialize();
+  startup.resolve({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" });
+  await threadsStarted.promise;
+  assert.equal(password.value, "", "an authenticated restore clears typed or autofilled secret input immediately");
+  assert.equal(browser.document.getElementById("login-view").hidden, true);
+  assert.equal(browser.document.getElementById("logout").disabled, true, "sign-out stays guarded during hydration");
+  threads.resolve({ threads: [] });
+  await initializing;
+  assert.equal(browser.document.getElementById("logout").disabled, false);
+});
+
+test("sign-out stays disabled while successful login hydration is pending", async () => {
+  const threads = Promise.withResolvers();
+  const threadsStarted = Promise.withResolvers();
+  let logoutCalls = 0;
+  const browser = harness({
+    restore: { authenticated: false },
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    logout: async () => {
+      logoutCalls += 1;
+      return { signedOut: true, agentCancellationPending: false };
+    },
+    chat: baseChat({
+      async listThreads() {
+        threadsStarted.resolve();
+        return await threads.promise;
+      },
+    }),
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "not-retained";
+  const signingIn = browser.app.login({ preventDefault() {} });
+  await threadsStarted.promise;
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(browser.document.getElementById("password").value, "", "a validated login clears its secret before hydration finishes");
+  assert.equal(browser.document.getElementById("logout").disabled, true);
+  await browser.app.logout();
+  assert.equal(logoutCalls, 0, "a programmatic sign-out is also rejected while authentication is hydrating");
+  assert.equal(browser.document.getElementById("login-view").hidden, true);
+  assert.equal(browser.document.getElementById("login-submit").disabled, true);
+  threads.resolve({ threads: [] });
+  await signingIn;
+  assert.equal(browser.document.getElementById("logout").disabled, false);
+  await browser.app.logout();
+  assert.equal(logoutCalls, 1);
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("login-submit").disabled, false);
+});
+
+test("failed login clears the password and releases the single-flight guard", async () => {
+  let loginCalls = 0;
+  const browser = harness({
+    restore: { authenticated: false },
+    async login() {
+      loginCalls += 1;
+      if (loginCalls === 1) throw Object.assign(new Error("invalid credentials"), { status: 401 });
+      return { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" };
+    },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "wrong password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(loginCalls, 1);
+  assert.equal(browser.document.getElementById("password").value, "");
+  assert.equal(browser.document.getElementById("login-submit").disabled, false);
+  assert.equal(browser.document.getElementById("login-submit").textContent, "Sign in");
+  assert.equal(browser.document.getElementById("login-form").getAttribute("aria-busy"), "false");
+  assert.match(browser.document.getElementById("login-error").textContent, /Sign-in failed/u);
+  browser.document.getElementById("password").value = "correct password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(loginCalls, 2, "the released guard permits a second attempt");
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(browser.document.getElementById("password").value, "");
+});
 
 async function verifiedEvent({ seq, type, payload, previousHash }) {
   const envelope = {

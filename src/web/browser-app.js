@@ -90,7 +90,7 @@ function elementMap(document) {
     throw new TypeError("browser app requires a DOM document");
   }
   const ids = [
-    "login-view", "app-view", "login-form", "login-error", "username", "password", "remember-session",
+    "login-view", "app-view", "login-form", "login-submit", "login-error", "username", "password", "remember-session",
     "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
     "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
     "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
@@ -191,6 +191,9 @@ export function createBrowserApp({
   const state = {
     initialized: false,
     bound: false,
+    loginReady: false,
+    loginPending: false,
+    logoutPending: false,
     session: Object.freeze({ authenticated: false }),
     capabilities: FAIL_CLOSED_AGENT_CAPABILITIES,
     agent: null,
@@ -238,12 +241,20 @@ export function createBrowserApp({
     elements.connection_state.dataset.online = online ? "true" : "false";
   }
 
-  function showLogin(message = "") {
+  function loginControl({ ready, label }) {
+    state.loginReady = ready === true;
+    elements.login_submit.disabled = !state.loginReady;
+    elements.login_submit.textContent = String(label);
+    elements.login_form.setAttribute("aria-busy", state.loginReady ? "false" : "true");
+  }
+
+  function showLogin(message = "", { preservePassword = false } = {}) {
     elements.login_view.hidden = false;
     elements.app_view.hidden = true;
+    elements.logout.disabled = true;
     elements.login_error.textContent = message;
     elements.login_error.hidden = !message;
-    elements.password.value = "";
+    if (!preservePassword) elements.password.value = "";
   }
 
   function showApp() {
@@ -869,72 +880,104 @@ export function createBrowserApp({
     }
   }
 
-  async function authenticated(session) {
+  async function authenticated(session, {
+    preserveLoginInput = false,
+    clearPasswordOnAuthenticated = false,
+  } = {}) {
     state.session = sessionEnvelope(session);
-    if (!state.session.authenticated) { showLogin(); return; }
-    state.viewEpoch += 1;
-    state.streamAbort?.abort();
-    state.agentThreads = [];
-    state.chatThreads = [];
-    state.agentThreadId = null;
-    state.chatThreadId = null;
-    state.chatThread = null;
-    state.chatGeneration = null;
-    state.chatPendingSend = null;
-    state.runId = null;
-    clearConversation();
+    if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
     const authenticatedSession = state.session;
-    state.agent = createAgentClient(state.session);
-    state.chat = createChatClient(state.session);
-    requiredMethod(state.agent, "capabilities", "agent client");
-    requiredMethod(state.agent, "listThreads", "agent client");
-    requiredMethod(state.agent, "streamRunEvents", "agent client");
-    for (const method of [
-      "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages",
-      "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
-    ]) requiredMethod(state.chat, method, "chat client");
-    let capability;
-    try { capability = validateAgentCapabilities(await state.agent.capabilities()); }
-    catch { capability = FAIL_CLOSED_AGENT_CAPABILITIES; }
-    if (state.session !== authenticatedSession || !state.session.authenticated) return;
-    state.capabilities = capability;
-    showApp();
-    setMode(selectDefaultMode(capability), { restoreView: false });
-    connection("Connected");
-    try { await restoreModeView({ autoOpen: true }); }
-    catch {
-      if (state.mode === "agent") state.agentThreads = [];
-      else state.chatThreads = [];
-      renderThreads();
-      connection(state.mode === "agent" ? "Agent unavailable" : "Chat unavailable", false);
+    if (clearPasswordOnAuthenticated) elements.password.value = "";
+    elements.logout.disabled = true;
+    try {
+      state.viewEpoch += 1;
+      state.streamAbort?.abort();
+      state.agentThreads = [];
+      state.chatThreads = [];
+      state.agentThreadId = null;
+      state.chatThreadId = null;
+      state.chatThread = null;
+      state.chatGeneration = null;
+      state.chatPendingSend = null;
+      state.runId = null;
+      clearConversation();
+      state.agent = createAgentClient(state.session);
+      state.chat = createChatClient(state.session);
+      requiredMethod(state.agent, "capabilities", "agent client");
+      requiredMethod(state.agent, "listThreads", "agent client");
+      requiredMethod(state.agent, "streamRunEvents", "agent client");
+      for (const method of [
+        "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages",
+        "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
+      ]) requiredMethod(state.chat, method, "chat client");
+      let capability;
+      try { capability = validateAgentCapabilities(await state.agent.capabilities()); }
+      catch { capability = FAIL_CLOSED_AGENT_CAPABILITIES; }
+      if (state.session !== authenticatedSession || !state.session.authenticated) return;
+      state.capabilities = capability;
+      showApp();
+      setMode(selectDefaultMode(capability), { restoreView: false });
+      connection("Connected");
+      try { await restoreModeView({ autoOpen: true }); }
+      catch {
+        if (state.mode === "agent") state.agentThreads = [];
+        else state.chatThreads = [];
+        renderThreads();
+        connection(state.mode === "agent" ? "Agent unavailable" : "Chat unavailable", false);
+      }
+    } finally {
+      if (state.session === authenticatedSession && state.session.authenticated
+          && !state.loginPending && !state.logoutPending && !elements.app_view.hidden) {
+        elements.logout.disabled = false;
+      }
     }
   }
 
   async function login(event) {
     event?.preventDefault?.();
+    if (!state.loginReady || state.loginPending) return;
     const username = elements.username.value;
     const password = elements.password.value;
     const remember = elements.remember_session.checked === true;
+    state.loginPending = true;
+    elements.logout.disabled = true;
+    loginControl({ ready: false, label: "Signing in…" });
     elements.login_error.hidden = true;
     try {
       const session = await sessionClient.login({ username, password, remember });
-      await authenticated(session);
-      if (state.session.authenticated && remember) {
-        try { await credentialSaver(elements.login_form, navigator); } catch { /* Password manager is optional. */ }
+      const validatedSession = sessionEnvelope(session);
+      if (validatedSession.authenticated && remember) {
+        try {
+          const saving = credentialSaver(elements.login_form, navigator);
+          void Promise.resolve(saving).catch(() => {});
+        } catch { /* Password manager is optional. */ }
       }
+      elements.password.value = "";
+      await authenticated(validatedSession);
     } catch (error) {
       showLogin(loginFailureMessage(error));
     } finally {
       elements.password.value = "";
+      state.loginPending = false;
+      if (!elements.login_view.hidden) loginControl({ ready: true, label: "Sign in" });
+      else if (state.session.authenticated && !state.logoutPending) elements.logout.disabled = false;
     }
   }
 
   async function logout() {
+    if (state.loginPending || state.logoutPending || elements.logout.disabled) return;
+    state.logoutPending = true;
+    elements.logout.disabled = true;
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     let result;
     try { result = logoutEnvelope(await sessionClient.logout()); }
-    catch { showToast("Sign-out could not be confirmed. Please retry."); return; }
+    catch {
+      state.logoutPending = false;
+      if (state.session.authenticated && !elements.app_view.hidden) elements.logout.disabled = false;
+      showToast("Sign-out could not be confirmed. Please retry.");
+      return;
+    }
     state.session = Object.freeze({ authenticated: false });
     state.agent = null;
     state.chat = null;
@@ -949,6 +992,8 @@ export function createBrowserApp({
     state.runId = null;
     clearConversation();
     showLogin();
+    loginControl({ ready: true, label: "Sign in" });
+    state.logoutPending = false;
     if (result.agentCancellationPending) showToast("Signed out. AgInTi cancellation is still being confirmed server-side.");
   }
 
@@ -1174,8 +1219,21 @@ export function createBrowserApp({
     elements.theme_picker.value = theme;
     elements.offline_banner.hidden = navigator?.onLine !== false;
     void registerPwa();
-    try { await authenticated(await sessionClient.restore()); }
-    catch { showLogin("The session could not be restored safely."); connection("Signed out", false); }
+    try {
+      await authenticated(await sessionClient.restore(), {
+        preserveLoginInput: true,
+        clearPasswordOnAuthenticated: true,
+      });
+    }
+    catch {
+      showLogin("The session could not be restored safely.", { preservePassword: true });
+      connection("Signed out", false);
+    }
+    finally {
+      if (!state.session.authenticated || !elements.login_view.hidden) {
+        loginControl({ ready: true, label: "Sign in" });
+      }
+    }
   }
 
   return Object.freeze({ initialize, submitMessage, login, logout, stop, resume, openThread, setMode });

@@ -27,6 +27,7 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
     'persist-credentials: false',
     "test \"$(git describe --tags --exact-match HEAD)\" = \"$RELEASE_TAG\"",
     'npm ci --ignore-scripts',
+    'const x=Array.isArray(p)?p:Object.values(p)',
     'cmp --silent "$TARBALL" "$RUNNER_TEMP/release-asset/$TARBALL"',
     'test "$PUBLISHED_INTEGRITY" = "$EXPECTED_INTEGRITY"',
     'npm publish "./$TARBALL" --access public --provenance',

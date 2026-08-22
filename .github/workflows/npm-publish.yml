@@ -87,8 +87,8 @@ jobs:
         run: |
           set -euo pipefail
           npm pack --json --ignore-scripts > "$RUNNER_TEMP/npm-pack.json"
-          TARBALL="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));if(p.length!==1||typeof p[0].filename!=='string')process.exit(1);process.stdout.write(p[0].filename)" "$RUNNER_TEMP/npm-pack.json")"
-          INTEGRITY="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));if(p.length!==1||typeof p[0].integrity!=='string')process.exit(1);process.stdout.write(p[0].integrity)" "$RUNNER_TEMP/npm-pack.json")"
+          TARBALL="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const x=Array.isArray(p)?p:Object.values(p);if(x.length!==1||typeof x[0].filename!=='string')process.exit(1);process.stdout.write(x[0].filename)" "$RUNNER_TEMP/npm-pack.json")"
+          INTEGRITY="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const x=Array.isArray(p)?p:Object.values(p);if(x.length!==1||typeof x[0].integrity!=='string')process.exit(1);process.stdout.write(x[0].integrity)" "$RUNNER_TEMP/npm-pack.json")"
           test "$TARBALL" = "lazyingart-agent-web-${RELEASE_TAG#v}.tgz"
           mkdir "$RUNNER_TEMP/release-asset"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$TARBALL" --dir "$RUNNER_TEMP/release-asset"

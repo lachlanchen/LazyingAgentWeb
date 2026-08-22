@@ -1,7 +1,12 @@
 import { AgintiBrowserClient, selectDefaultMode } from "./aginti-client.js";
 import { AgintiProtocolError, FAIL_CLOSED_AGENT_CAPABILITIES, validateAgentCapabilities } from "./aginti-protocol.js";
 import { CloudSessionClient } from "./cloud-session-client.js";
-import { createBrowserOpaqueId, DirectChatBrowserClient, DirectChatProtocolError } from "./direct-chat-client.js";
+import {
+  createBrowserOpaqueId,
+  DirectChatBrowserClient,
+  DirectChatProtocolError,
+  DirectChatTransportError,
+} from "./direct-chat-client.js";
 import { createRunPresentation } from "./presentation-state.js";
 import {
   applyTheme,
@@ -13,11 +18,18 @@ import { canonicalizeVisionImage } from "./vision-image-client.js";
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 
-class LocalChatPreparationError extends Error {
+class LocalChatNotSentError extends Error {
   constructor(stage, cause) {
-    super("The LocalLLM request could not be prepared in this browser.", { cause });
-    this.name = "LocalChatPreparationError";
+    super("The LocalLLM request stopped before its durable run was dispatched.", { cause });
+    this.name = "LocalChatNotSentError";
     this.stage = stage;
+  }
+}
+
+class LocalChatPreparationError extends LocalChatNotSentError {
+  constructor(stage, cause) {
+    super(stage, cause);
+    this.name = "LocalChatPreparationError";
   }
 }
 
@@ -380,10 +392,15 @@ export function createBrowserApp({
   function updateImageControl() {
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
+    const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
+    const interactionLocked = state.busy || state.logoutPending;
     if (!available && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
     elements.add_image.hidden = !available;
-    elements.add_image.disabled = !available || state.busy || state.imagePreparing;
-    elements.send_message.disabled = !state.session.authenticated || state.busy || state.imagePreparing;
+    elements.add_image.disabled = !available || interactionLocked || state.imagePreparing || pendingChatSend;
+    elements.remove_image.disabled = !available || interactionLocked || pendingChatSend
+      || (state.selectedImage === null && !state.imagePreparing);
+    elements.message_input.disabled = !state.session.authenticated || interactionLocked || state.imagePreparing || pendingChatSend;
+    elements.send_message.disabled = !state.session.authenticated || interactionLocked || state.imagePreparing || pendingChatSend;
   }
 
   function currentThreads() {
@@ -398,7 +415,11 @@ export function createBrowserApp({
     const agentAvailable = state.capabilities.enabled === true;
     const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
     const changed = nextMode !== state.mode;
-    if (changed && state.busy) return;
+    if (changed && (state.busy || state.logoutPending)) return;
+    if (changed && state.mode === "chat" && state.chatPendingSend) {
+      showToast("Confirm the pending durable send with Resume before changing modes.");
+      return;
+    }
     if (changed) {
       state.viewEpoch += 1;
       state.streamAbort?.abort();
@@ -437,27 +458,33 @@ export function createBrowserApp({
     state.assistantNode = null;
   }
 
-  function messageNode(role, content, { runId, attachment, threadId } = {}) {
+  function messageNode(role, content, { runId, attachment, threadId, localAttachment } = {}) {
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.role = role;
     if (runId) article.dataset.runId = runId;
-    if (attachment !== undefined && role === "user" && threadId && state.chat) {
+    if (role === "user" && (localAttachment !== undefined || (attachment !== undefined && threadId && state.chat))) {
       const image = document.createElement("img");
       image.className = "message-attachment";
       image.alt = "Attached image";
       article.appendChild(image);
-      const expectedEpoch = state.viewEpoch;
-      const expectedImageEpoch = state.imageRenderEpoch;
-      const chat = state.chat;
-      void chat.getAttachment({ threadId, attachment }).then(({ bytes, descriptor }) => {
-        if (state.viewEpoch !== expectedEpoch || state.imageRenderEpoch !== expectedImageEpoch || state.chat !== chat) return;
-        const url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
+      if (localAttachment !== undefined) {
+        const url = createObjectUrl(new Blob([localAttachment.bytes], { type: localAttachment.mediaType }));
         state.messageImageUrls.add(url);
         image.src = url;
-      }).catch(() => {
-        image.alt = "Attached image preview unavailable";
-      });
+      } else {
+        const expectedEpoch = state.viewEpoch;
+        const expectedImageEpoch = state.imageRenderEpoch;
+        const chat = state.chat;
+        void chat.getAttachment({ threadId, attachment }).then(({ bytes, descriptor }) => {
+          if (state.viewEpoch !== expectedEpoch || state.imageRenderEpoch !== expectedImageEpoch || state.chat !== chat) return;
+          const url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
+          state.messageImageUrls.add(url);
+          image.src = url;
+        }).catch(() => {
+          image.alt = "Attached image preview unavailable";
+        });
+      }
     }
     const body = document.createElement("div");
     body.className = "message-content";
@@ -476,6 +503,7 @@ export function createBrowserApp({
       const threadId = mode === "agent" ? thread.id : thread.threadId;
       const title = thread.title || "New conversation";
       const button = makeButton(document, title, () => { void openThread(threadId, { mode }); });
+      button.disabled = mode === "chat" && state.chatPendingSend !== null;
       button.dataset.threadId = threadId;
       button.dataset.mode = mode;
       button.setAttribute("aria-current", threadId === selected ? "true" : "false");
@@ -656,6 +684,42 @@ export function createBrowserApp({
     }
   }
 
+  function isAuthoritativeChatRejection(error) {
+    return error instanceof DirectChatTransportError
+      && error.retryable === false
+      && Number.isSafeInteger(error.status)
+      && error.status >= 400
+      && error.status < 499;
+  }
+
+  function releaseRejectedChatWorkflow(workflow) {
+    const composer = workflow.lockedComposer ?? workflow.recoveryComposer;
+    if (composer !== null && composer !== undefined) {
+      if (!elements.message_input.value || elements.message_input.value === workflow.text
+          || elements.message_input.value === composer.draft) {
+        elements.message_input.value = composer.draft;
+      }
+      if (composer.image !== null && state.selectedImage === null) {
+        try {
+          restoreDetachedImage(Object.freeze({
+            selected: composer.image,
+            previewUrl: createObjectUrl(composer.image.previewBlob),
+          }));
+        } catch { /* The exact text remains recoverable even if a local preview cannot be recreated. */ }
+      }
+    }
+    workflow.lockedComposer = null;
+    workflow.recoveryComposer = null;
+    if (state.chatPendingSend === workflow) state.chatPendingSend = null;
+    elements.resume_run.hidden = true;
+    renderThreads();
+    updateImageControl();
+    connection("Request not sent", false);
+    showToast(composer?.image
+      ? "The image message was rejected before it ran. Its prompt and image are ready to edit or retry."
+      : "The message was rejected before it ran. Its prompt is ready to edit or retry.");
+  }
+
   async function fetchChatSnapshot(threadId, signal) {
     const chat = state.chat;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -734,11 +798,19 @@ export function createBrowserApp({
       elements.run_state.textContent = statusLabel(generation.status);
       elements.resume_run.hidden = true;
     }
+    let refreshFailed = false;
     if (generation.status === "completed" && presenting && state.chatThreadId === generation.threadId) {
-      const snapshot = await refreshChatThread(generation.threadId, controller.signal, { expectedEpoch });
-      state.chatThread = snapshot.thread;
+      try {
+        const snapshot = await refreshChatThread(generation.threadId, controller.signal, { expectedEpoch });
+        state.chatThread = snapshot.thread;
+      } catch {
+        refreshFailed = true;
+      }
     }
-    if (presenting) connection("Connected");
+    if (presenting && refreshFailed) {
+      connection("Completed · refresh pending", false);
+      showToast("LocalLLM completed this response. Reopen the conversation if its final view does not refresh automatically.");
+    } else if (presenting) connection("Connected");
   }
 
   async function streamChatGeneration(generation, { afterSequence = 0, output = "" } = {}) {
@@ -757,7 +829,9 @@ export function createBrowserApp({
     elements.stop_run.hidden = false;
     elements.resume_run.hidden = true;
     elements.workspace.dataset.status = "running";
-    elements.run_state.textContent = "Running";
+    const hasOutput = state.chatOutput.length > 0;
+    elements.run_state.textContent = hasOutput ? "Generating" : "Warming LocalLLM";
+    if (!hasOutput) connection("Warming LocalLLM…");
     let recoveries = 0;
     try {
       while (!controller.signal.aborted) {
@@ -772,6 +846,8 @@ export function createBrowserApp({
             onCursor: async (cursor) => { state.chatAfterSequence = cursor.afterSequence; },
           })) {
             if (event.type === "delta") {
+              elements.run_state.textContent = "Generating";
+              connection("Connected");
               state.chatOutput += event.delta.content;
               renderer.renderMarkdown(state.assistantNode, state.chatOutput);
             } else {
@@ -849,7 +925,11 @@ export function createBrowserApp({
   }
 
   async function openThread(threadId, { mode = state.mode } = {}) {
-    if (state.busy || mode !== state.mode) return;
+    if (state.busy || state.logoutPending || mode !== state.mode) return;
+    if (mode === "chat" && state.chatPendingSend) {
+      showToast("Confirm the pending durable send with Resume before opening another conversation.");
+      return;
+    }
     state.busy = true;
     state.viewEpoch += 1;
     state.streamAbort?.abort();
@@ -918,6 +998,18 @@ export function createBrowserApp({
         () => chat.prepareThread({ title: conversationTitle(workflow.text) }),
       );
     }
+    if (workflow.threadTicket && !workflow.runTicket) {
+      workflow.runTicket = prepareLocalChat(
+        "run",
+        () => chat.prepareRun({
+          threadId: workflow.threadTicket.threadId,
+          content: workflow.text,
+          expectedRevision: 0,
+          expectedHash: null,
+          ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
+        }),
+      );
+    }
     if (workflow.threadTicket && !workflow.thread) {
       const firstDispatch = workflow.threadDispatched
         ? () => chat.retryCreateThread(workflow.threadTicket)
@@ -937,56 +1029,58 @@ export function createBrowserApp({
       renderThreads();
     }
     thread = workflow.thread ?? thread;
-    if (workflow.runTicket) {
-      const started = await exactMutation(
+    let started;
+    if (workflow.runTicket && workflow.runDispatched) {
+      started = await exactMutation(
         () => chat.retryRun(workflow.runTicket),
         () => chat.retryRun(workflow.runTicket),
       );
       ensureCurrentSession();
-      state.chatPendingSend = null;
-      state.chatGeneration = started.generation;
-      state.chatAfterSequence = 0;
-      state.chatOutput = "";
-      await refreshChatThread(started.generation.threadId);
-      ensureCurrentSession();
-      if (started.generation.terminal) await finishChatGeneration(started.generation, new AbortController());
-      else await streamChatGeneration(started.generation);
-      return;
-    }
-    if (!thread || thread.threadId !== state.chatThreadId) {
-      thread = (await fetchChatSnapshot(state.chatThreadId)).thread;
-      ensureCurrentSession();
-      state.chatThread = thread;
     } else {
-      thread = (await fetchChatSnapshot(thread.threadId)).thread;
-      ensureCurrentSession();
-      state.chatThread = thread;
-    }
-    if (thread.currentGenerationId) throw new TypeError("the conversation already has a generation in progress");
-    if (!workflow.runTicket) {
-      workflow.runTicket = prepareLocalChat(
-        "run",
-        () => chat.prepareRun({
-          threadId: thread.threadId,
-          content: workflow.text,
-          expectedRevision: thread.revision,
-          expectedHash: thread.ledgerHash,
-          ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
-        }),
+      if (!workflow.runTicket) {
+        const threadId = thread?.threadId === state.chatThreadId ? thread.threadId : state.chatThreadId;
+        if (!threadId) throw new TypeError("the Direct Chat thread is unavailable");
+        thread = (await fetchChatSnapshot(threadId)).thread;
+        ensureCurrentSession();
+        state.chatThread = thread;
+        if (thread.currentGenerationId) throw new TypeError("the conversation already has a generation in progress");
+        workflow.runTicket = prepareLocalChat(
+          "run",
+          () => chat.prepareRun({
+            threadId: thread.threadId,
+            content: workflow.text,
+            expectedRevision: thread.revision,
+            expectedHash: thread.ledgerHash,
+            ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
+          }),
+        );
+      }
+      workflow.runDispatched = true;
+      started = await exactMutation(
+        () => chat.startRun(workflow.runTicket),
+        () => chat.retryRun(workflow.runTicket),
       );
+      ensureCurrentSession();
     }
-    workflow.runDispatched = true;
-    const started = await exactMutation(
-      () => chat.startRun(workflow.runTicket),
-      () => chat.retryRun(workflow.runTicket),
-    );
-    ensureCurrentSession();
+    if (workflow.lockedComposer !== null) {
+      if (elements.message_input.value === workflow.lockedComposer.draft) elements.message_input.value = "";
+      if (workflow.lockedComposer.image !== null && state.selectedImage === workflow.lockedComposer.image) {
+        clearSelectedImage();
+      }
+      workflow.lockedComposer = null;
+    }
+    workflow.recoveryComposer = null;
     state.chatPendingSend = null;
+    renderThreads();
     state.chatGeneration = started.generation;
     state.chatAfterSequence = 0;
     state.chatOutput = "";
-    await refreshChatThread(thread.threadId);
-    ensureCurrentSession();
+    if (state.mode === "chat" && state.chatThreadId === started.generation.threadId) {
+      messageNode("user", workflow.text, {
+        runId: started.generation.generationId,
+        ...(workflow.attachment === null ? {} : { localAttachment: workflow.attachment }),
+      });
+    }
     if (started.generation.terminal) await finishChatGeneration(started.generation, new AbortController());
     else await streamChatGeneration(started.generation);
   }
@@ -1002,23 +1096,33 @@ export function createBrowserApp({
       thread: null,
       runTicket: null,
       runDispatched: false,
+      lockedComposer: null,
+      recoveryComposer: null,
     };
     state.chatPendingSend = workflow;
+    renderThreads();
     try { await continueChatSend(workflow); }
     catch (error) {
-      if (error instanceof LocalChatPreparationError) {
+      const authoritativeRejection = isAuthoritativeChatRejection(error);
+      const notSent = error instanceof LocalChatNotSentError || authoritativeRejection
+        || (!workflow.runDispatched && (!workflow.threadDispatched || workflow.thread !== null));
+      if (notSent) {
         if (state.chatPendingSend === workflow) state.chatPendingSend = null;
         elements.resume_run.hidden = true;
       } else {
         elements.resume_run.hidden = false;
       }
-      throw error;
+      renderThreads();
+      throw notSent && !(error instanceof LocalChatNotSentError)
+        ? new LocalChatNotSentError("before_run_dispatch", error)
+        : error;
     }
   }
 
   async function selectImage() {
     if (state.busy || !state.session.authenticated || state.mode !== "chat"
-        || state.chatCapabilities.visionInput !== true) return;
+        || state.chatCapabilities.visionInput !== true || state.chatPendingSend !== null
+        || state.logoutPending) return;
     const files = elements.image_input.files;
     if (!files || files.length !== 1) {
       clearSelectedImage();
@@ -1038,7 +1142,7 @@ export function createBrowserApp({
       });
       if (selectionEpoch !== state.imageSelectionEpoch || !state.imagePreparing
           || !state.session.authenticated || state.mode !== "chat"
-          || state.chatCapabilities.visionInput !== true) return;
+          || state.chatCapabilities.visionInput !== true || state.logoutPending) return;
       const previewUrl = createObjectUrl(selected.previewBlob);
       state.selectedImage = selected;
       state.selectedImageUrl = previewUrl;
@@ -1057,12 +1161,19 @@ export function createBrowserApp({
 
   async function submitMessage(event) {
     event?.preventDefault?.();
-    if (state.busy || !state.session.authenticated) return;
+    if (state.busy || state.logoutPending || !state.session.authenticated) return;
+    if (state.mode === "chat" && state.chatPendingSend) {
+      showToast("The previous durable send is awaiting confirmation. Use Resume; this draft and image were not changed.");
+      return;
+    }
     if (state.imagePreparing) {
       clearSelectedImage();
       updateImageControl();
       return;
     }
+    const submissionSession = state.session;
+    const submissionMode = state.mode;
+    const submissionChat = state.chat;
     const draft = elements.message_input.value;
     let text;
     try { text = boundedMessage(draft); }
@@ -1084,9 +1195,16 @@ export function createBrowserApp({
     try {
       if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text);
       else await sendChat(text, attachment);
-      connection("Connected");
     } catch (error) {
-      if (state.mode === "chat" && error instanceof LocalChatPreparationError) {
+      const sameOwner = state.session === submissionSession
+        && state.session.authenticated
+        && state.mode === submissionMode
+        && (submissionMode !== "chat" || state.chat === submissionChat);
+      if (!sameOwner) return;
+      if (state.mode === "chat" && state.chatPendingSend) {
+        state.chatPendingSend.recoveryComposer = Object.freeze({ draft, image: selected });
+      }
+      if (state.mode === "chat" && error instanceof LocalChatNotSentError) {
         elements.message_input.value = draft;
         const imageRestored = restoreDetachedImage(detachedImage);
         detachedImage = null;
@@ -1094,11 +1212,32 @@ export function createBrowserApp({
         showToast(imageRestored
           ? "This image message was not sent. Your prompt and image are still ready; edit or retry them."
           : "This message was not sent. Your prompt is still in the composer; edit it and try again.");
+      } else if (state.mode === "chat" && state.chatPendingSend && !state.chatPendingSend.runDispatched) {
+        elements.message_input.value = draft;
+        const imageRestored = restoreDetachedImage(detachedImage);
+        detachedImage = null;
+        state.chatPendingSend.lockedComposer = Object.freeze({
+          draft,
+          image: imageRestored ? selected : null,
+        });
+        connection("Thread confirmation pending", false);
+        showToast(imageRestored
+          ? "The thread may already exist. Your prompt and image remain visible and locked; Resume confirms the exact send."
+          : "The thread may already exist. Your prompt remains visible and locked; Resume confirms the exact send.");
       } else {
-        connection("Request interrupted", false);
-        showToast(state.mode === "agent"
-          ? "AgInTi did not accept or complete this request. Existing server work was not replaced."
-          : "LocalLLM chat was interrupted. Use Resume if this durable request remains pending.");
+        if (state.mode === "agent") {
+          connection("Request interrupted", false);
+          showToast("AgInTi did not accept or complete this request. Existing server work was not replaced.");
+        } else if (state.chatPendingSend) {
+          connection("Send confirmation pending", false);
+          showToast("The durable send is awaiting confirmation. Resume reuses it without dispatching a duplicate.");
+        } else if (state.chatGeneration?.status === "in_progress") {
+          connection("Generation connection paused", false);
+          showToast("The LocalLLM generation remains server-owned. Resume reconnects to it without restarting.");
+        } else {
+          connection("Chat unavailable", false);
+          showToast("This chat request could not be completed or safely retried.");
+        }
       }
     } finally {
       disposeDetachedImage(detachedImage);
@@ -1205,18 +1344,23 @@ export function createBrowserApp({
     if (state.loginPending || state.logoutPending || elements.logout.disabled) return;
     state.logoutPending = true;
     elements.logout.disabled = true;
-    state.viewEpoch += 1;
-    state.streamAbort?.abort();
-    clearSelectedImage();
+    elements.resume_run.disabled = true;
     updateImageControl();
     let result;
     try { result = logoutEnvelope(await sessionClient.logout()); }
     catch {
       state.logoutPending = false;
+      elements.resume_run.disabled = false;
+      updateImageControl();
       if (state.session.authenticated && !elements.app_view.hidden) elements.logout.disabled = false;
       showToast("Sign-out could not be confirmed. Please retry.");
       return;
     }
+    state.viewEpoch += 1;
+    state.streamAbort?.abort();
+    state.imageSelectionEpoch += 1;
+    state.imagePreparing = false;
+    elements.message_input.value = "";
     state.session = Object.freeze({ authenticated: false });
     state.agent = null;
     state.chat = null;
@@ -1236,6 +1380,7 @@ export function createBrowserApp({
     showLogin();
     loginControl({ ready: true, label: "Sign in" });
     state.logoutPending = false;
+    elements.resume_run.disabled = false;
     if (result.agentCancellationPending) showToast("Signed out. AgInTi cancellation is still being confirmed server-side.");
   }
 
@@ -1272,8 +1417,10 @@ export function createBrowserApp({
   }
 
   async function resume() {
-    if (state.busy) return;
+    if (state.busy || state.logoutPending) return;
     state.busy = true;
+    elements.resume_run.disabled = true;
+    updateImageControl();
     try {
       if (state.mode === "chat") {
         if (state.chatPendingSend) await continueChatSend(state.chatPendingSend);
@@ -1285,15 +1432,23 @@ export function createBrowserApp({
         const { run } = await state.agent.resumeRun(state.runId);
         await streamAgentRun(run);
       }
-    } catch {
-      showToast(state.mode === "chat"
-        ? "The durable LocalLLM request could not reconnect yet."
-        : "AgInTi could not resume this run.");
-    } finally { state.busy = false; }
+    } catch (error) {
+      if (state.mode === "chat" && state.chatPendingSend && isAuthoritativeChatRejection(error)) {
+        releaseRejectedChatWorkflow(state.chatPendingSend);
+      } else {
+        showToast(state.mode === "chat"
+          ? "The durable LocalLLM request could not reconnect yet."
+          : "AgInTi could not resume this run.");
+      }
+    } finally {
+      state.busy = false;
+      elements.resume_run.disabled = false;
+      updateImageControl();
+    }
   }
 
   function newConversation() {
-    if (state.busy) return;
+    if (state.busy || state.logoutPending) return;
     if (state.mode === "chat" && state.chatPendingSend) {
       showToast("This durable request has an uncertain response. Use Resume before starting another conversation.");
       return;
@@ -1326,6 +1481,7 @@ export function createBrowserApp({
     elements.add_image.addEventListener("click", () => elements.image_input.click?.());
     elements.image_input.addEventListener("change", () => { void selectImage(); });
     elements.remove_image.addEventListener("click", () => {
+      if (state.busy || state.chatPendingSend) return;
       clearSelectedImage();
       updateImageControl();
     });

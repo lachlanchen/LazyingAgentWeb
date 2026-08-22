@@ -346,6 +346,7 @@ export class AgintiBrowserClient {
     this.baseUrl = normalizedBaseUrl(baseUrl);
     this.resolveEndpoint = endpointResolver(transportEndpoint, this.baseUrl);
     this.fetch = requireFunction(fetchImpl, "fetchImpl");
+    if (fetchImpl === globalThis.fetch) this.fetch = this.fetch.bind(globalThis);
     this.csrf = normalizedCsrf({ csrfToken, csrfHeader });
     this.makeIdempotencyKey = requireFunction(makeIdempotencyKey, "makeIdempotencyKey");
     this.timeoutMs = timeoutMs;

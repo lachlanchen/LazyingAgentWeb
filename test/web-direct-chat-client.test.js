@@ -237,6 +237,27 @@ test("read routes validate public owner-free thread and message envelopes", asyn
   ]);
 });
 
+test("the default Direct Chat fetch keeps the global browser receiver", async () => {
+  const receivers = [];
+  const originalFetch = globalThis.fetch;
+  let clients;
+  try {
+    globalThis.fetch = function receiverSensitiveFetch() {
+      receivers.push(this);
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(jsonResponse({ threads: [] }));
+    };
+    clients = [
+      new DirectChatBrowserClient(clientOptions()),
+      new DirectChatBrowserClient(clientOptions({ fetchImpl: globalThis.fetch })),
+    ];
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  for (const client of clients) assert.deepEqual(await client.listThreads(), { threads: [] });
+  assert.deepEqual(receivers, [globalThis, globalThis]);
+});
+
 test("public response validation rejects account identity, unknown fields, inconsistent hashes, and wrong statuses", async () => {
   let response = jsonResponse({ threads: [{ ...publicThread(), accountId: "principal-private" }] });
   const client = new DirectChatBrowserClient(clientOptions({ fetchImpl: async () => response }));

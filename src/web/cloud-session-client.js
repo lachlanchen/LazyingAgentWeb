@@ -295,7 +295,7 @@ export class CloudSessionClient {
       throw new TypeError("timeoutMs is invalid");
     }
     this.baseOrigin = normalizedBaseOrigin(baseUrl);
-    this.fetch = fetchImpl;
+    this.fetch = fetchImpl === globalThis.fetch ? fetchImpl.bind(globalThis) : fetchImpl;
     this.readCookie = cookieReader(cookieSource);
     this.timeoutMs = timeoutMs;
   }

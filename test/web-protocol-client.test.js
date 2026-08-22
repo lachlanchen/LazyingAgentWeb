@@ -295,6 +295,29 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   }), /normalized|absolute-path/u);
 });
 
+test("the default AgInTi fetch keeps the global browser receiver", async () => {
+  const receivers = [];
+  const originalFetch = globalThis.fetch;
+  let clients;
+  try {
+    globalThis.fetch = function receiverSensitiveFetch() {
+      receivers.push(this);
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(jsonResponse(capabilities()));
+    };
+    clients = [
+      new AgintiBrowserClient({ transportEndpoint: "/api/edge", baseUrl: "https://llm.lazying.art/" }),
+      new AgintiBrowserClient({
+        transportEndpoint: "/api/edge", baseUrl: "https://llm.lazying.art/", fetchImpl: globalThis.fetch,
+      }),
+    ];
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  for (const client of clients) assert.equal((await client.capabilities()).enabled, false);
+  assert.deepEqual(receivers, [globalThis, globalThis]);
+});
+
 test("capability probe remains fail-closed on the current WIP or malformed native API", async () => {
   for (const response of [
     capabilities(),

@@ -664,7 +664,7 @@ export class DirectChatBrowserClient {
       if (!Number.isSafeInteger(value) || value < 1_000 || value > 120_000) throw new TypeError(`${name} is invalid`);
     }
     this.baseOrigin = normalizedBaseOrigin(baseUrl);
-    this.fetch = fetchImpl;
+    this.fetch = fetchImpl === globalThis.fetch ? fetchImpl.bind(globalThis) : fetchImpl;
     this.readCookie = cookieReader(cookieSource);
     this.makeOpaqueId = makeOpaqueId;
     this.timeoutMs = timeoutMs;

@@ -104,6 +104,29 @@ test("signed-out restore works without a readable CSRF cookie but authenticated 
   await assert.rejects(() => client.restore(), /not bound to the browser CSRF cookie/u);
 });
 
+test("the default browser fetch keeps the global receiver instead of the client instance", async () => {
+  const receivers = [];
+  const originalFetch = globalThis.fetch;
+  let clients;
+  try {
+    globalThis.fetch = function receiverSensitiveFetch() {
+      receivers.push(this);
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(jsonResponse({ authenticated: false }));
+    };
+    clients = [
+      new CloudSessionClient({ baseUrl: "https://llm.lazying.art/", cookieSource: "" }),
+      new CloudSessionClient({
+        baseUrl: "https://llm.lazying.art/", cookieSource: "", fetchImpl: globalThis.fetch,
+      }),
+    ];
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  for (const client of clients) assert.deepEqual(await client.restore(), { authenticated: false });
+  assert.deepEqual(receivers, [globalThis, globalThis]);
+});
+
 test("session response validation rejects principal leakage, unknown fields, cookie mismatch, and wrong success status", async () => {
   let response = jsonResponse({ authenticated: true, username: "lachlanchen", csrfToken: CSRF, principalId: "private" });
   const client = new CloudSessionClient({

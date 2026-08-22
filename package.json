@@ -1,6 +1,6 @@
 {
   "name": "@lazyingart/agent-web",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Cloud presentation and delivery-index foundation for the LazyingArt agent web application",
   "type": "module",
   "engines": {

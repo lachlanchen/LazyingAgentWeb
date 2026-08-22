@@ -653,6 +653,165 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
 });
 
+test("PWA submit blocks and invalidates an image preparation race without consuming the prompt", async () => {
+  const pending = Promise.withResolvers();
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  let thread = null;
+  let messages = [];
+  let preparedRun = null;
+  let objectUrls = 0;
+  const chat = baseChat({
+    async capabilities() {
+      return {
+        visionInput: true,
+        visionMediaTypes: ["image/jpeg", "image/png"],
+        maximumImageBytes: 4 * 1024 * 1024,
+      };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_race_xxxxxxxxx" });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparedRun = request;
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_race_xxxxxxxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [
+        chatMessage(1, "user", ticket.content),
+        chatMessage(2, "assistant", "Text-only answer"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage() { return await pending.promise; },
+    createObjectUrl() { objectUrls += 1; return `blob:unexpected-${objectUrls}`; },
+  });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("image-input");
+  const message = browser.document.getElementById("message-input");
+  const send = browser.document.getElementById("send-message");
+  input.files = [{ name: "slow-private.png" }];
+  input.dispatch("change");
+  message.value = "Keep this text-only prompt";
+  assert.equal(send.disabled, true, "Send is disabled before canonicalization yields");
+  assert.equal(browser.document.getElementById("add-image").disabled, true);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(preparedRun, null, "a programmatic form submission cannot bypass the pending guard");
+  assert.equal(message.value, "Keep this text-only prompt", "the blocked submission preserves typed text");
+  assert.equal(send.disabled, false, "cancelling the pending selection releases the composer");
+
+  pending.resolve(Object.freeze({
+    attachmentId: "image_0000000000000002",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 128,
+    height: 128,
+    bytes,
+    previewBlob: new Blob([bytes], { type: "image/png" }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(objectUrls, 0, "the invalidated completion never receives a preview URL");
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(Object.hasOwn(preparedRun, "attachment"), false, "the later prompt cannot inherit the stale private image");
+  assert.equal(message.value, "");
+  assert.match(browser.document.getElementById("messages").textContent, /Keep this text-only promptText-only answer/u);
+});
+
+test("PWA mode, explicit clear, and logout each invalidate unresolved image preparation", async () => {
+  const pending = [Promise.withResolvers(), Promise.withResolvers(), Promise.withResolvers()];
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const selected = Object.freeze({
+    attachmentId: "image_0000000000000003",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 96,
+    height: 96,
+    bytes,
+    previewBlob: new Blob([bytes], { type: "image/png" }),
+  });
+  let canonicalizations = 0;
+  let objectUrls = 0;
+  const browser = harness({
+    agent: baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    chat: baseChat({
+      async capabilities() {
+        return {
+          visionInput: true,
+          visionMediaTypes: ["image/jpeg", "image/png"],
+          maximumImageBytes: 4 * 1024 * 1024,
+        };
+      },
+    }),
+    canonicalizeImage() {
+      const deferred = pending[canonicalizations];
+      canonicalizations += 1;
+      return deferred.promise;
+    },
+    createObjectUrl() { objectUrls += 1; return `blob:unexpected-${objectUrls}`; },
+  });
+  await browser.app.initialize();
+  browser.app.setMode("chat", { restoreView: false });
+  const input = browser.document.getElementById("image-input");
+  const send = browser.document.getElementById("send-message");
+
+  input.files = [{ name: "mode-race.png" }];
+  input.dispatch("change");
+  assert.equal(send.disabled, true);
+  browser.app.setMode("agent", { restoreView: false });
+  pending[0].resolve(selected);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+
+  browser.app.setMode("chat", { restoreView: false });
+  input.files = [{ name: "clear-race.png" }];
+  input.dispatch("change");
+  assert.equal(send.disabled, true);
+  browser.document.getElementById("remove-image").dispatch("click");
+  assert.equal(send.disabled, false);
+  pending[1].resolve(selected);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+
+  input.files = [{ name: "logout-race.png" }];
+  input.dispatch("change");
+  assert.equal(send.disabled, true);
+  await browser.app.logout();
+  pending[2].resolve(selected);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(objectUrls, 0, "no invalidated preparation can become a selectable preview");
+  assert.equal(canonicalizations, 3);
+});
+
 test("Resume preserves an ambiguous Direct Chat run ticket after both automatic dispatch attempts fail", async () => {
   let thread = chatThread();
   let messages = [];

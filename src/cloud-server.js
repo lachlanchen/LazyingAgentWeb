@@ -1187,11 +1187,6 @@ export function createCloudRequestHandler({
 
   async function handleChat(req, res, route, body, session, requestSignal) {
     const accountId = configuredAccount.principalId;
-    if (route.pathname === CLOUD_ROUTES.chatRunsStart && !visionEnabled
-        && body !== null && typeof body === 'object' && !Array.isArray(body)
-        && Object.hasOwn(body, 'attachment')) {
-      throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
-    }
     const input = validateChatRequest(route.pathname, body);
     const idempotencyKey = routeRequiresIdempotency(route.pathname)
       ? requestIdempotency(req)
@@ -1496,10 +1491,7 @@ export function createCloudRequestHandler({
         : clientAddress;
       releaseBody = bodyGate.enter(admissionKey);
       if (!releaseBody) throw new CloudHttpError(503, 'request_busy', 'The request service is temporarily busy.', { retryAfter: 1 });
-      const maximumBodyBytes = route.pathname === CLOUD_ROUTES.chatRunsStart && !visionEnabled
-        ? CLOUD_HTTP_LIMITS.chatBodyBytes
-        : bodyLimitForRoute(route.pathname);
-      const body = await readJsonBody(req, maximumBodyBytes, limits.bodyTimeoutMs);
+      const body = await readJsonBody(req, bodyLimitForRoute(route.pathname), limits.bodyTimeoutMs);
       releaseBody();
       releaseBody = null;
       const streamRoute = route.pathname === CLOUD_ROUTES.chatRunsEvents

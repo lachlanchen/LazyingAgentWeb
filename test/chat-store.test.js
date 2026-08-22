@@ -537,7 +537,7 @@ test('atomically stores private canonical image bytes while exposing only a hash
   }).content, attachment.content);
 });
 
-test('gates the v3 attachment migration for expansion and accepts v3 when vision is disabled for rollback', (t) => {
+test('gates v3 expansion but exactly replays committed image turns while vision is disabled for rollback', (t) => {
   const state = testState(t, { modelAlias: 'localllm-fast' });
   const thread = createThread(state.store, 'vision-migration');
   assert.equal(
@@ -583,6 +583,9 @@ test('gates the v3 attachment migration for expansion and accepts v3 when vision
     accountId: thread.accountId,
     threadId: thread.threadId
   })[0].attachment.attachmentId, 'image-migrated-0000000000000001');
+  assert.deepEqual(startTurn(reopened, thread, 'vision-migrated', {
+    attachment: visionAttachment('migrated')
+  }), committed, 'validated bytes and the exact receipt replay before the disabled new-write gate');
   assert.throws(
     () => reopened.startTurn({
       accountId: thread.accountId,
@@ -598,6 +601,18 @@ test('gates the v3 attachment migration for expansion and accepts v3 when vision
     }),
     /not enabled/u
   );
+  assert.throws(
+    () => startTurn(reopened, thread, 'rollback-image-followup', {
+      content: 'A new text follow-up must not select vision while rollback has it disabled.',
+      expectedRevision: committed.message.revision,
+      expectedHash: committed.message.messageHash
+    }),
+    /not enabled/u
+  );
+  assert.deepEqual(reopened.listMessages({
+    accountId: thread.accountId,
+    threadId: thread.threadId
+  }), [committed.message], 'replay and rejected new writes leave the image ledger unchanged');
 });
 
 test('replays an atomic turn exactly after response loss and restart without duplicating either resource', (t) => {

@@ -239,6 +239,7 @@ export function createBrowserApp({
     chatPendingSend: null,
     selectedImage: null,
     selectedImageUrl: null,
+    imagePreparing: false,
     imageSelectionEpoch: 0,
     imageRenderEpoch: 0,
     messageImageUrls: new Set(),
@@ -300,6 +301,7 @@ export function createBrowserApp({
 
   function clearSelectedImage() {
     state.imageSelectionEpoch += 1;
+    state.imagePreparing = false;
     if (state.selectedImageUrl !== null) revokeObjectUrl(state.selectedImageUrl);
     state.selectedImage = null;
     state.selectedImageUrl = null;
@@ -312,9 +314,10 @@ export function createBrowserApp({
   function updateImageControl() {
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
+    if (!available && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
     elements.add_image.hidden = !available;
-    elements.add_image.disabled = !available || state.busy;
-    if (!available && state.selectedImage !== null) clearSelectedImage();
+    elements.add_image.disabled = !available || state.busy || state.imagePreparing;
+    elements.send_message.disabled = !state.session.authenticated || state.busy || state.imagePreparing;
   }
 
   function currentThreads() {
@@ -937,23 +940,27 @@ export function createBrowserApp({
   }
 
   async function selectImage() {
-    if (state.busy || state.mode !== "chat" || state.chatCapabilities.visionInput !== true) return;
+    if (state.busy || !state.session.authenticated || state.mode !== "chat"
+        || state.chatCapabilities.visionInput !== true) return;
     const files = elements.image_input.files;
     if (!files || files.length !== 1) {
       clearSelectedImage();
+      updateImageControl();
       showToast("Choose exactly one JPEG or PNG image.");
       return;
     }
     const file = files[0];
     clearSelectedImage();
     const selectionEpoch = state.imageSelectionEpoch;
-    elements.add_image.disabled = true;
+    state.imagePreparing = true;
+    updateImageControl();
     try {
       const selected = await canonicalizeImage(file, {
         document,
         makeAttachmentId: createBrowserOpaqueId,
       });
-      if (selectionEpoch !== state.imageSelectionEpoch || state.mode !== "chat"
+      if (selectionEpoch !== state.imageSelectionEpoch || !state.imagePreparing
+          || !state.session.authenticated || state.mode !== "chat"
           || state.chatCapabilities.visionInput !== true) return;
       const previewUrl = createObjectUrl(selected.previewBlob);
       state.selectedImage = selected;
@@ -962,10 +969,11 @@ export function createBrowserApp({
       elements.image_preview_label.textContent = `${selected.width}×${selected.height} · ${Math.ceil(selected.byteLength / 1024)} KiB`;
       elements.image_preview.hidden = false;
     } catch {
-      if (selectionEpoch === state.imageSelectionEpoch) {
+      if (selectionEpoch === state.imageSelectionEpoch && state.imagePreparing) {
         showToast("That image could not be prepared safely. Use one JPEG or PNG under the displayed limits.");
       }
     } finally {
+      if (selectionEpoch === state.imageSelectionEpoch) state.imagePreparing = false;
       updateImageControl();
     }
   }
@@ -973,6 +981,11 @@ export function createBrowserApp({
   async function submitMessage(event) {
     event?.preventDefault?.();
     if (state.busy || !state.session.authenticated) return;
+    if (state.imagePreparing) {
+      clearSelectedImage();
+      updateImageControl();
+      return;
+    }
     let text;
     try { text = boundedMessage(elements.message_input.value); }
     catch { return; }
@@ -985,7 +998,7 @@ export function createBrowserApp({
       height: selected.height,
       bytes: selected.bytes,
     });
-    if (selected !== null) clearSelectedImage();
+    clearSelectedImage();
     elements.message_input.value = "";
     state.busy = true;
     elements.send_message.disabled = true;
@@ -1001,7 +1014,6 @@ export function createBrowserApp({
         : "LocalLLM chat was interrupted.");
     } finally {
       state.busy = false;
-      elements.send_message.disabled = false;
       updateImageControl();
     }
   }
@@ -1106,6 +1118,8 @@ export function createBrowserApp({
     elements.logout.disabled = true;
     state.viewEpoch += 1;
     state.streamAbort?.abort();
+    clearSelectedImage();
+    updateImageControl();
     let result;
     try { result = logoutEnvelope(await sessionClient.logout()); }
     catch {
@@ -1127,6 +1141,7 @@ export function createBrowserApp({
     state.chatPendingSend = null;
     state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
     clearSelectedImage();
+    updateImageControl();
     state.runId = null;
     clearConversation();
     showLogin();
@@ -1208,6 +1223,7 @@ export function createBrowserApp({
       state.chatOutput = "";
     }
     clearSelectedImage();
+    updateImageControl();
     elements.conversation_title.textContent = "New conversation";
     clearConversation();
     renderThreads();
@@ -1220,7 +1236,10 @@ export function createBrowserApp({
     elements.composer.addEventListener("submit", (event) => { void submitMessage(event); });
     elements.add_image.addEventListener("click", () => elements.image_input.click?.());
     elements.image_input.addEventListener("change", () => { void selectImage(); });
-    elements.remove_image.addEventListener("click", clearSelectedImage);
+    elements.remove_image.addEventListener("click", () => {
+      clearSelectedImage();
+      updateImageControl();
+    });
     elements.logout.addEventListener("click", () => { void logout(); });
     elements.new_thread.addEventListener("click", newConversation);
     elements.stop_run.addEventListener("click", () => { void stop(); });

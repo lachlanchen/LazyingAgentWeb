@@ -1013,6 +1013,211 @@ test('keeps vision capability and new image persistence fail-closed when disable
   assert.equal(dispatches, 0);
 });
 
+test('rollback server exactly replays a large committed image turn while rejecting every new vision mutation', async (t) => {
+  let enabledDispatches = 0;
+  const state = testState(t, {
+    visionEnabled: true,
+    connector: {
+      async generate() {
+        enabledDispatches += 1;
+        return (async function* () { yield 'Committed vision response'; })();
+      }
+    }
+  });
+  const first = await state.start();
+  const auth = await login(first.baseUrl);
+  const threadId = 'chat-vision-rollback-replay';
+  assert.equal((await post(first.baseUrl, '/api/chat/threads/create', {
+    threadId,
+    title: 'Vision rollback replay'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-vision-rollback-01'
+  })).status, 201);
+
+  const image = Buffer.from(createPwaIcon(512));
+  const startBody = {
+    threadId,
+    messageId: 'message-vision-rollback-user',
+    generationId: 'generation-vision-rollback',
+    assistantMessageId: 'message-vision-rollback-assistant',
+    content: `Describe this image without losing the committed request. ${'x'.repeat(40 * 1024)}`,
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: 'image-vision-rollback-00000001',
+      mediaType: 'image/png',
+      data: image.toString('base64')
+    }
+  };
+  const encodedBytes = Buffer.byteLength(JSON.stringify(startBody), 'utf8');
+  assert.ok(encodedBytes > CLOUD_HTTP_LIMITS.chatBodyBytes, 'the replay exercises the former disabled 72 KiB cap');
+  assert.ok(encodedBytes < CLOUD_HTTP_LIMITS.visionChatBodyBytes);
+
+  // Treat the accepted response as lost; only durable state may authorize the retry after rollback.
+  await post(first.baseUrl, '/api/chat/runs/start', startBody, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-01'
+  });
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId,
+    generationId: startBody.generationId
+  })?.status === 'completed');
+  assert.equal(enabledDispatches, 1);
+  await state.stop(first.server);
+  const beforeRollback = {
+    thread: state.directChatStore.getThread(PRINCIPAL_ID, threadId),
+    messages: state.directChatStore.listMessages({ accountId: PRINCIPAL_ID, threadId }),
+    generation: state.directChatStore.getGeneration({
+      accountId: PRINCIPAL_ID,
+      threadId,
+      generationId: startBody.generationId
+    }),
+    attachment: state.directChatStore.getVisionAttachment({
+      accountId: PRINCIPAL_ID,
+      threadId,
+      attachmentId: startBody.attachment.attachmentId
+    })
+  };
+  state.directChatStore.close();
+
+  const rollbackStore = state.registerStore(new DirectChatStore({
+    databasePath: join(state.root, 'chat', 'chat.sqlite'),
+    modelAlias: 'local-test',
+    enableVisionAttachments: false
+  }));
+  let rollbackStartCalls = 0;
+  const observedRollbackStore = new Proxy(rollbackStore, {
+    get(target, property) {
+      if (property === 'startTurn') {
+        return (input) => {
+          rollbackStartCalls += 1;
+          return target.startTurn(input);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  const rollbackContext = new DirectChatContextCoordinator({
+    store: rollbackStore,
+    maxContextBytes: 512 * 1024,
+    contextWindowTokens: 600_000,
+    outputTokenReserve: 64_000,
+    protocolTokenReserve: 32_000,
+    minimumRecentTurns: 4
+  });
+  let rollbackDispatches = 0;
+  const second = await state.start({
+    directChatStore: observedRollbackStore,
+    directChatContext: rollbackContext,
+    visionEnabled: false,
+    directChatConnector: {
+      async generate() {
+        rollbackDispatches += 1;
+        return (async function* () { yield 'must never dispatch'; })();
+      }
+    }
+  });
+
+  const replay = await post(second.baseUrl, '/api/chat/runs/start', startBody, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-01'
+  });
+  assert.equal(replay.status, 202);
+  assert.equal((await replay.json()).generation.status, 'completed');
+  assert.equal(rollbackStartCalls, 1, 'the exact retry reaches the store replay authority');
+  assert.equal(rollbackDispatches, 0);
+
+  const mismatched = await post(second.baseUrl, '/api/chat/runs/start', {
+    ...startBody,
+    content: `${startBody.content}!`
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-01'
+  });
+  assert.equal(mismatched.status, 409);
+  assert.equal((await mismatched.json()).error.code, 'idempotency_conflict');
+  assert.equal(rollbackStartCalls, 2, 'a mismatched retry is rejected by the store receipt');
+
+  const malformed = await post(second.baseUrl, '/api/chat/runs/start', {
+    ...startBody,
+    messageId: 'message-vision-rollback-malformed-user',
+    generationId: 'generation-vision-rollback-malformed',
+    assistantMessageId: 'message-vision-rollback-malformed-assistant',
+    content: 'Malformed image input must be validated before the disabled feature gate.',
+    expectedRevision: beforeRollback.thread.revision,
+    expectedHash: beforeRollback.thread.ledgerHash,
+    attachment: {
+      attachmentId: 'image-vision-rollback-malformed',
+      mediaType: 'image/png',
+      data: Buffer.from('not an image').toString('base64')
+    }
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-malformed'
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error.code, 'invalid_attachment');
+
+  const newImage = await post(second.baseUrl, '/api/chat/runs/start', {
+    ...startBody,
+    messageId: 'message-vision-rollback-new-user',
+    generationId: 'generation-vision-rollback-new',
+    assistantMessageId: 'message-vision-rollback-new-assistant',
+    content: 'A genuinely new image turn must remain disabled.',
+    expectedRevision: beforeRollback.thread.revision,
+    expectedHash: beforeRollback.thread.ledgerHash,
+    attachment: {
+      ...startBody.attachment,
+      attachmentId: 'image-vision-rollback-new-0001'
+    }
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-new-01'
+  });
+  assert.equal(newImage.status, 503);
+  assert.equal((await newImage.json()).error.code, 'vision_unavailable');
+
+  const newTextFollowup = await post(second.baseUrl, '/api/chat/runs/start', {
+    threadId,
+    messageId: 'message-vision-rollback-text-user',
+    generationId: 'generation-vision-rollback-text',
+    assistantMessageId: 'message-vision-rollback-text-assistant',
+    content: 'A new text follow-up must not silently invoke the disabled vision model.',
+    expectedRevision: beforeRollback.thread.revision,
+    expectedHash: beforeRollback.thread.ledgerHash
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-rollback-text-01'
+  });
+  assert.equal(newTextFollowup.status, 503);
+  assert.equal((await newTextFollowup.json()).error.code, 'vision_unavailable');
+  assert.equal(rollbackDispatches, 0);
+  assert.deepEqual({
+    thread: rollbackStore.getThread(PRINCIPAL_ID, threadId),
+    messages: rollbackStore.listMessages({ accountId: PRINCIPAL_ID, threadId }),
+    generation: rollbackStore.getGeneration({
+      accountId: PRINCIPAL_ID,
+      threadId,
+      generationId: startBody.generationId
+    }),
+    attachment: rollbackStore.getVisionAttachment({
+      accountId: PRINCIPAL_ID,
+      threadId,
+      attachmentId: startBody.attachment.attachmentId
+    })
+  }, beforeRollback, 'rollback replay and rejected requests do not alter durable chat state');
+});
+
 test('does not redispatch a partially streamed stateless generation after restart', async (t) => {
   let firstSignal;
   const firstConnector = {

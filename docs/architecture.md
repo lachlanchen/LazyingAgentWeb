@@ -1,8 +1,8 @@
 # LazyingAgentWeb architecture
 
-This document describes the implemented standalone package boundary. The PWA
-and Direct Chat release at commit `5ba906a` is live at `llm.lazying.art`, with
-its preceding immutable release retained for rollback. AgInTi Agent remains
+This document describes the implemented standalone package boundary.
+Production is promoted independently from repository commits, with immutable
+acceptance receipts and a verified rollback release. AgInTi Agent remains
 disabled until every native, sandbox, tunnel, resource, and live rollback
 acceptance gate in the promotion rule passes.
 
@@ -101,9 +101,11 @@ presentation migration to silently acquire Direct Chat or Agent authority.
 The attachment migration is an explicit expand/enable boundary. New and
 existing v2 databases remain at v2 while vision is disabled. First enablement
 advances the private Direct Chat database to v3 atomically. A v3-aware service
-can subsequently run with vision disabled and refuse new image turns, but an
-older binary that knows only v2 cannot reopen the migrated database; backup or
-a retained v3-aware rollback release is required before first enablement.
+can subsequently run with vision disabled: it still serves authenticated
+previews and exact retries of committed turns, but refuses new image turns and
+follow-ups that would reuse stored images. An older binary that knows only v2
+cannot reopen the migrated database; backup or a retained v3-aware rollback
+release is required before first enablement.
 
 The cloud database must never contain AgInTi plans, agent context or summaries,
 tool calls/results, commands, workspace paths, runtime policy, raw artifacts or

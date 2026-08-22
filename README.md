@@ -4,8 +4,8 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Current status:** the PWA and Direct Chat release at commit `5ba906a` is
-> live at `llm.lazying.art`, with its preceding release retained for rollback.
+> **Deployment status:** production is promoted independently from repository
+> commits, with immutable acceptance receipts and a verified rollback release.
 > AgInTi Agent mode remains fail-closed and disabled until its native API,
 > sandbox, replay/cancellation, resource-admission, tunnel, and live rollback
 > gates all pass. A live PWA and Direct Chat do not imply that Agent mode is
@@ -232,10 +232,11 @@ or IndexedDB. Base64 exists only transiently in the browser's exact in-memory
 retry ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies.
 
 The attachment table is schema v3 and is created only when vision is enabled.
-A v3-aware build can reopen the database with vision disabled and will refuse
-new image turns, but a pre-v3 binary cannot reopen a database after this
-migration. Take a private database backup or retain a v3-aware rollback build
-before first enablement.
+A v3-aware build can reopen the database with vision disabled. It continues to
+serve authenticated previews and exact retries of committed turns, while
+refusing new image turns and follow-ups that would reuse stored images. A
+pre-v3 binary cannot reopen a database after this migration. Take a private
+database backup or retain a v3-aware rollback build before first enablement.
 
 The production server is designed to bind on loopback behind Caddy. It trusts
 the configured public authority/client-address headers only from that local

@@ -1238,9 +1238,6 @@ export class DirectChatStore {
     });
     const cursor = assertCursor(input.expectedRevision, input.expectedHash);
     const attachment = input.attachment === undefined ? null : assertTurnAttachment(input.attachment);
-    if (attachment !== null && (!this.#enableVisionAttachments || this.#schemaVersion < 3)) {
-      throw new ValidationError('Vision attachments are not enabled for new Direct Chat turns.');
-    }
     if (messageId === assistantMessageId) {
       throw new ConflictError('The user and assistant message identifiers must be different.');
     }
@@ -1355,6 +1352,17 @@ export class DirectChatStore {
         `).get(accountId, threadId, generationId);
         if (existingMessage || existingGeneration) return replayTurn();
 
+        const existingVision = this.#schemaVersion >= 3
+          ? this.#database.prepare(`
+              SELECT 1 AS present FROM direct_chat_attachments
+              WHERE account_id = ? AND thread_id = ?
+              LIMIT 1
+            `).get(accountId, threadId)
+          : null;
+        if ((attachment !== null || existingVision)
+            && (!this.#enableVisionAttachments || this.#schemaVersion < 3)) {
+          throw new ValidationError('Vision attachments are not enabled for new Direct Chat turns.');
+        }
         if (thread.current_generation_id !== null) {
           throw new ConflictError('A user turn cannot start while generation is in progress.');
         }
@@ -1391,14 +1399,7 @@ export class DirectChatStore {
         }
 
         let inferenceModelAlias = thread.model_alias;
-        if (this.#schemaVersion >= 3) {
-          const existingVision = this.#database.prepare(`
-            SELECT 1 AS present FROM direct_chat_attachments
-            WHERE account_id = ? AND thread_id = ?
-            LIMIT 1
-          `).get(accountId, threadId);
-          if (existingVision || attachment !== null) inferenceModelAlias = this.#visionModelAlias;
-        }
+        if (existingVision || attachment !== null) inferenceModelAlias = this.#visionModelAlias;
         if (attachment !== null) {
           const threadAttachmentTotals = this.#database.prepare(`
             SELECT count(*) AS count, coalesce(sum(byte_length), 0) AS bytes

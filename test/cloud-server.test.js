@@ -15,6 +15,7 @@ import { CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
 import { CloudIndexStore } from '../src/store.js';
 import { canonicalJson } from '../src/web/aginti-protocol.js';
 import { createStandaloneAssetMap } from '../src/web/asset-map.js';
+import { createPwaIcon } from '../src/web/pwa-assets.js';
 
 const TEST_BOOTSTRAP = `
 import './browser-app.js';
@@ -77,12 +78,13 @@ function publicOriginFor(baseUrl) {
   return url.origin;
 }
 
-function testState(t, { connector, adapter, limits } = {}) {
+function testState(t, { connector, adapter, limits, visionEnabled = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-cloud-server-test-'));
   const controlStore = new CloudIndexStore({ databasePath: join(root, 'control', 'index.sqlite') });
   const directChatStore = new DirectChatStore({
     databasePath: join(root, 'chat', 'chat.sqlite'),
-    modelAlias: 'local-test'
+    modelAlias: 'local-test',
+    enableVisionAttachments: visionEnabled
   });
   const directChatContext = new DirectChatContextCoordinator({
     store: directChatStore,
@@ -113,6 +115,7 @@ function testState(t, { connector, adapter, limits } = {}) {
     directChatStore,
     directChatContext,
     directChatConnector: connector,
+    visionEnabled,
     agintiAdapter: adapter,
     limits
   };
@@ -811,6 +814,203 @@ test('starts a user turn and generation through the one atomic store mutation', 
   assertNoOwnerIdentity(replay);
   assert.equal(replay.generation.status, 'completed');
   assert.equal(connectorDispatches, 1);
+});
+
+test('validates, stores, dispatches, and previews one private image through the fixed vision model', async (t) => {
+  const image = Buffer.from(createPwaIcon(192));
+  const imageBase64 = image.toString('base64');
+  const dispatches = [];
+  const connector = {
+    async generate(input) {
+      dispatches.push(input);
+      assert.equal(input.modelAlias, 'localllm-vision');
+      assert.equal(input.context.messages.at(-1).role, 'user');
+      assert.equal(input.visionAttachment.mediaType, 'image/png');
+      assert.equal(input.visionAttachment.width, 192);
+      assert.equal(input.visionAttachment.height, 192);
+      assert.deepEqual(input.visionAttachment.content, image);
+      return (async function* () { yield `Vision response ${dispatches.length}`; })();
+    }
+  };
+  const state = testState(t, { connector, visionEnabled: true });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+
+  const capabilities = await post(baseUrl, '/api/chat/capabilities', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.equal(capabilities.status, 200);
+  assert.deepEqual(await capabilities.json(), {
+    visionInput: true,
+    visionMediaTypes: ['image/jpeg', 'image/png'],
+    maximumImageBytes: 4 * 1024 * 1024
+  });
+  assert.equal((await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'chat-vision', title: 'Vision'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-vision-000001'
+  })).status, 201);
+
+  const malformed = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-vision',
+    messageId: 'message-vision-malformed-user',
+    generationId: 'generation-vision-malformed',
+    assistantMessageId: 'message-vision-malformed-assistant',
+    content: 'This invalid image must not commit.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: 'image-vision-malformed',
+      mediaType: 'image/png',
+      data: Buffer.from('not an image').toString('base64')
+    }
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-malformed-01'
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error.code, 'invalid_attachment');
+  assert.equal(state.directChatStore.getThread(PRINCIPAL_ID, 'chat-vision').revision, 0);
+
+  const attachment = {
+    attachmentId: 'image-vision-0000000000000001',
+    mediaType: 'image/png',
+    data: imageBase64
+  };
+  const startBody = {
+    threadId: 'chat-vision',
+    messageId: 'message-vision-user',
+    generationId: 'generation-vision',
+    assistantMessageId: 'message-vision-assistant',
+    content: 'Describe this image precisely.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment
+  };
+  const started = await post(baseUrl, '/api/chat/runs/start', startBody, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-00000001'
+  });
+  assert.equal(started.status, 202);
+  const startedBody = await started.json();
+  assertNoOwnerIdentity(startedBody);
+  assert.equal(startedBody.generation.modelAlias, 'localllm-vision');
+  assert.doesNotMatch(JSON.stringify(startedBody), new RegExp(imageBase64, 'u'));
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-vision',
+    generationId: 'generation-vision'
+  })?.status === 'completed');
+  assert.equal(dispatches.length, 1);
+
+  const messagesResponse = await post(baseUrl, '/api/chat/messages/list', {
+    threadId: 'chat-vision', afterRevision: 0, limit: 20
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(messagesResponse.status, 200);
+  const messagesBody = await messagesResponse.json();
+  assertNoOwnerIdentity(messagesBody);
+  assert.equal(messagesBody.messages[0].attachment.attachmentId, attachment.attachmentId);
+  assert.equal(messagesBody.messages[0].attachment.mediaType, 'image/png');
+  assert.equal(messagesBody.messages[0].attachment.byteLength, image.byteLength);
+  assert.equal(Object.hasOwn(messagesBody.messages[0].attachment, 'data'), false);
+  assert.equal(Object.hasOwn(messagesBody.messages[0].attachment, 'content'), false);
+  assert.doesNotMatch(JSON.stringify(messagesBody), new RegExp(imageBase64, 'u'));
+
+  const preview = await post(baseUrl, '/api/chat/attachments/get', {
+    threadId: 'chat-vision', attachmentId: attachment.attachmentId
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(preview.status, 200);
+  assert.equal(preview.headers.get('content-type'), 'image/png');
+  assert.equal(preview.headers.get('cache-control'), 'no-store');
+  assert.equal(preview.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(preview.headers.get('content-disposition'), 'inline');
+  assert.deepEqual(Buffer.from(await preview.arrayBuffer()), image);
+
+  const missingPreview = await post(baseUrl, '/api/chat/attachments/get', {
+    threadId: 'chat-vision', attachmentId: 'image-vision-missing'
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(missingPreview.status, 404);
+
+  const thread = state.directChatStore.getThread(PRINCIPAL_ID, 'chat-vision');
+  const followup = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-vision',
+    messageId: 'message-vision-followup-user',
+    generationId: 'generation-vision-followup',
+    assistantMessageId: 'message-vision-followup-assistant',
+    content: 'Now focus on the proportions.',
+    expectedRevision: thread.revision,
+    expectedHash: thread.ledgerHash
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-followup-01'
+  });
+  assert.equal(followup.status, 202);
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-vision',
+    generationId: 'generation-vision-followup'
+  })?.status === 'completed');
+  assert.equal(dispatches.length, 2);
+  assert.deepEqual(dispatches[1].visionAttachment.content, image);
+});
+
+test('keeps vision capability and new image persistence fail-closed when disabled', async (t) => {
+  let dispatches = 0;
+  const state = testState(t, {
+    connector: {
+      async generate() {
+        dispatches += 1;
+        return (async function* () { yield 'must not run'; })();
+      }
+    }
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const capabilities = await post(baseUrl, '/api/chat/capabilities', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.deepEqual(await capabilities.json(), {
+    visionInput: false,
+    visionMediaTypes: [],
+    maximumImageBytes: 0
+  });
+  await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'chat-vision-disabled', title: ''
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-vision-disabled-01'
+  });
+  const image = Buffer.from(createPwaIcon(192));
+  const rejected = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-vision-disabled',
+    messageId: 'message-vision-disabled-user',
+    generationId: 'generation-vision-disabled',
+    assistantMessageId: 'message-vision-disabled-assistant',
+    content: 'Do not persist this image.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: 'image-vision-disabled',
+      mediaType: 'image/png',
+      data: image.toString('base64')
+    }
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-vision-disabled-01'
+  });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).error.code, 'vision_unavailable');
+  assert.equal(state.directChatStore.getThread(PRINCIPAL_ID, 'chat-vision-disabled').revision, 0);
+  assert.equal(dispatches, 0);
 });
 
 test('does not redispatch a partially streamed stateless generation after restart', async (t) => {

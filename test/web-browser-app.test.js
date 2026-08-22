@@ -97,7 +97,8 @@ const IDS = [
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
   "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
-  "stop-run", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+  "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
+  "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
 ];
 
 class Document {
@@ -140,12 +141,14 @@ function baseAgent(capability = capabilities()) {
 
 function baseChat(overrides = {}) {
   return {
+    async capabilities() { return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }; },
     prepareThread() { throw new Error("unexpected Direct Chat mutation"); },
     async createThread() { throw new Error("unexpected Direct Chat mutation"); },
     async retryCreateThread() { throw new Error("unexpected Direct Chat mutation"); },
     async listThreads() { return { threads: [] }; },
     async getThread() { throw new Error("unexpected Direct Chat read"); },
     async listMessages() { throw new Error("unexpected Direct Chat read"); },
+    async getAttachment() { throw new Error("unexpected Direct Chat attachment read"); },
     prepareRun() { throw new Error("unexpected Direct Chat mutation"); },
     async startRun() { throw new Error("unexpected Direct Chat mutation"); },
     async retryRun() { throw new Error("unexpected Direct Chat mutation"); },
@@ -164,6 +167,9 @@ function harness({
   agent = baseAgent(),
   chat,
   credentialSaver = async () => false,
+  canonicalizeImage,
+  createObjectUrl,
+  revokeObjectUrl,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
 } = {}) {
@@ -196,6 +202,9 @@ function harness({
       renderArtifact(target, value) { target.textContent = value.title; return true; },
     },
     credentialSaver,
+    ...(canonicalizeImage === undefined ? {} : { canonicalizeImage }),
+    ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
+    ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
     wait,
     maxStreamBackoffSteps,
   });
@@ -514,6 +523,134 @@ test("Direct Chat creates and starts with exact retry tickets, then reconnects S
   assert.equal(streams, 2);
   assert.match(browser.document.getElementById("messages").textContent, /Hello durable worldHello authoritative/u);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("PWA image control canonicalizes exactly one file, sends it once, and renders only authenticated previews", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    sha256: "c".repeat(64),
+  };
+  let thread = null;
+  let messages = [];
+  let preparedRun;
+  let canonicalizations = 0;
+  let previewReads = 0;
+  const createdUrls = [];
+  const revokedUrls = [];
+  const chat = baseChat({
+    async capabilities() {
+      return {
+        visionInput: true,
+        visionMediaTypes: ["image/jpeg", "image/png"],
+        maximumImageBytes: 4 * 1024 * 1024,
+      };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_image_xxxxxxxxx" });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparedRun = request;
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_image_xxxxxxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [
+        chatMessage(1, "user", ticket.content, { attachment: descriptor }),
+        chatMessage(2, "assistant", "Authenticated vision answer"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+    async getAttachment({ threadId, attachment }) {
+      previewReads += 1;
+      assert.equal(threadId, CHAT_THREAD_ID);
+      assert.deepEqual(attachment, descriptor);
+      return { descriptor, bytes };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage(selectedFile, options) {
+      canonicalizations += 1;
+      assert.equal(selectedFile.name, "private.png");
+      assert.equal(typeof options.makeAttachmentId, "function");
+      return Object.freeze({
+        attachmentId: descriptor.attachmentId,
+        mediaType: descriptor.mediaType,
+        byteLength: descriptor.byteLength,
+        width: descriptor.width,
+        height: descriptor.height,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() {
+      const value = `blob:vision-${createdUrls.length + 1}`;
+      createdUrls.push(value);
+      return value;
+    },
+    revokeObjectUrl(value) { revokedUrls.push(value); },
+  });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("image-input");
+  const add = browser.document.getElementById("add-image");
+  assert.equal(add.hidden, false);
+
+  input.files = [{ name: "one.png" }, { name: "two.png" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(canonicalizations, 0);
+  assert.match(browser.document.getElementById("toast").textContent, /exactly one/u);
+
+  input.files = [{ name: "private.png" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(canonicalizations, 1);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:vision-1");
+
+  browser.document.getElementById("message-input").value = "Describe the private image.";
+  await browser.app.submitMessage({ preventDefault() {} });
+  await Promise.resolve();
+  assert.deepEqual(preparedRun.attachment, {
+    attachmentId: descriptor.attachmentId,
+    mediaType: descriptor.mediaType,
+    byteLength: descriptor.byteLength,
+    width: descriptor.width,
+    height: descriptor.height,
+    bytes,
+  });
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.ok(revokedUrls.includes("blob:vision-1"), "the local selection preview is revoked after dispatch");
+  assert.ok(previewReads >= 1, "rendering retrieves bytes through the authenticated attachment client");
+  assert.match(browser.document.getElementById("messages").textContent, /Describe the private image.Authenticated vision answer/u);
+  assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
 });
 
 test("Resume preserves an ambiguous Direct Chat run ticket after both automatic dispatch attempts fail", async () => {

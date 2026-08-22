@@ -164,6 +164,47 @@ test('supports an explicitly disabled Agent without an AgInTi endpoint or creden
   assert.throws(() => loaded.createCredentialProvider('agintiToken'), /not configured/u);
 });
 
+test('keeps vision fail-closed by default and enables only the fixed LocalLLM vision alias', (t) => {
+  const disabled = loadServiceConfig(fixture(t));
+  assert.deepEqual(disabled.config.localLlm.vision, {
+    enabled: false,
+    modelAlias: 'localllm-vision'
+  });
+
+  const enabledState = fixture(t, {
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-test', 'localllm-vision'],
+      defaultModelAlias: 'localllm-test',
+      vision: { enabled: true }
+    }
+  });
+  assert.deepEqual(loadServiceConfig(enabledState).config.localLlm.vision, {
+    enabled: true,
+    modelAlias: 'localllm-vision'
+  });
+
+  const missingAlias = fixture(t, {
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-test'],
+      defaultModelAlias: 'localllm-test',
+      vision: { enabled: true }
+    }
+  });
+  assert.throws(() => loadServiceConfig(missingAlias), /must include localllm-vision/u);
+
+  const visionAsText = fixture(t, {
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-vision'],
+      defaultModelAlias: 'localllm-vision',
+      vision: { enabled: true }
+    }
+  });
+  assert.throws(() => loadServiceConfig(visionAsText), /must remain the text alias/u);
+});
+
 test('rejects public binds, non-private LocalLLM, shared databases, and secret config fields', (t) => {
   const cases = [
     (root) => configValue(root, { listen: { host: '0.0.0.0', port: 18_543 } }),

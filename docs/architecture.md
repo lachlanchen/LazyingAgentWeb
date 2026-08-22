@@ -92,8 +92,18 @@ Cloud-authoritative storage is divided so ownership is visible in the schema:
 migration chains. `CloudIndexStore` holds items 1, 3, 4, and their bounded
 receipts. `DirectChatStore` holds item 2, a hash-linked immutable message ledger,
 replayable generation deltas, terminal receipts, compaction snapshots, and
-durable dispatch-lease metadata. The split makes it difficult for a future
+durable dispatch-lease metadata. When Direct Chat vision is enabled, it also
+holds immutable canonical attachment bytes in an owner-private table; the
+message ledger contains only the attachment MIME, size, dimensions, opaque ID,
+and SHA-256 descriptor bound into its hash. The split makes it difficult for a future
 presentation migration to silently acquire Direct Chat or Agent authority.
+
+The attachment migration is an explicit expand/enable boundary. New and
+existing v2 databases remain at v2 while vision is disabled. First enablement
+advances the private Direct Chat database to v3 atomically. A v3-aware service
+can subsequently run with vision disabled and refuse new image turns, but an
+older binary that knows only v2 cannot reopen the migrated database; backup or
+a retained v3-aware rollback release is required before first enablement.
 
 The cloud database must never contain AgInTi plans, agent context or summaries,
 tool calls/results, commands, workspace paths, runtime policy, raw artifacts or
@@ -124,6 +134,15 @@ admission, lease, and recovery contract as normal Direct Chat generation.
 
 Direct Chat:
 
+- The PWA accepts exactly one JPEG or PNG and requires a text prompt. It checks
+  source dimensions before decode, redraws through canvas to discard source
+  metadata, and rejects canonical output above 4 MiB. No image is placed in
+  browser storage or the service-worker cache.
+- The BFF independently validates canonical base64, MIME/signature, structure,
+  dimensions, metadata absence, and digest. It atomically commits the prompt,
+  descriptor-bound ledger row, private BLOB, and pending generation. Public
+  message records contain only the descriptor; authenticated preview bytes are
+  same-origin `no-store` responses.
 - The browser prepares stable thread/message/generation/idempotency identifiers.
   The store commits the user message and pending generation atomically, so an
   ambiguous retry returns the same turn without a second dispatch intent.
@@ -196,7 +215,12 @@ The Direct Chat connector accepts only an unprivileged exact
 service endpoint. A server-side provider supplies its bearer credential for
 each request. The connector uses an allowlist of fixed `localllm-*` aliases,
 checks `/models` readiness, sends bounded provenance-checked Direct Chat
-context, and consumes only strict OpenAI-compatible SSE text deltas.
+context, and consumes only strict OpenAI-compatible SSE text deltas. A thread
+uses its text alias until its first image; that turn and later turns use the
+fixed `localllm-vision` alias and receive the latest private attachment as one
+OpenAI-compatible `image_url` content part. Base64 is created only for that
+bounded in-flight connector request and is never written to a ledger, log,
+receipt, cache, or browser storage.
 
 Redirects, compressed or malformed streams, oversized frames/output, unknown
 aliases, and partial-generation redispatch fail closed. The connector has no
@@ -211,7 +235,10 @@ and Markdown schemas. Plot data is finite, URL-free and expression-free; the
 browser builds DOM/SVG with text nodes. Active HTML, SVG and PDF are never
 served inline on the authenticated origin. File downloads, uploads and vision
 inputs remain disabled until their independent byte, MIME, decompression,
-ownership and sandbox acceptance matrices pass.
+ownership and sandbox acceptance matrices pass. Direct Chat's single-image
+input is the narrow exception: it is descriptor-bound, owner-private,
+metadata-stripped, independently revalidated, and has no Agent or artifact
+authority.
 
 ## Replaceable nodes
 

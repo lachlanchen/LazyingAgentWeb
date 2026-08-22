@@ -20,6 +20,12 @@ import {
   nowIso,
   sha256
 } from './validation.js';
+import {
+  VISION_ATTACHMENT_LIMITS,
+  VISION_MODEL_ALIAS,
+  validateStoredVisionAttachment,
+  visionAttachmentDescriptor
+} from './vision-attachment.js';
 
 const DEFAULT_CLOCK = () => new Date();
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
@@ -34,6 +40,7 @@ const FAILURE_CODES = new Set([
   'content_rejected'
 ]);
 const PRE_DISPATCH_FAILURE_CODES = new Set(['provider_unavailable', 'timeout']);
+const DATABASE_METADATA = new WeakMap();
 
 export const DIRECT_CHAT_LIMITS = Object.freeze({
   threadsPerAccount: 100,
@@ -159,7 +166,7 @@ function threadView(row) {
   };
 }
 
-function messageView(row) {
+function messageView(row, attachment = null) {
   if (!row) return null;
   return {
     accountId: row.account_id,
@@ -172,8 +179,90 @@ function messageView(row) {
     previousHash: row.previous_hash,
     messageHash: row.message_hash,
     generationId: row.generation_id,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    ...(attachment === null ? {} : { attachment: visionAttachmentDescriptor(attachment) })
   };
+}
+
+function attachmentFromRow(row) {
+  if (!row) return null;
+  let checked;
+  try {
+    checked = validateStoredVisionAttachment({
+      accountId: row.account_id,
+      threadId: row.thread_id,
+      attachmentId: row.attachment_id,
+      messageId: row.message_id,
+      mediaType: row.media_type,
+      byteLength: Number(row.byte_length),
+      width: Number(row.width),
+      height: Number(row.height),
+      contentSha256: row.content_sha256,
+      content: row.content,
+      createdAt: row.created_at
+    });
+  } catch (error) {
+    throw new StorageCorruptionError('A stored direct-chat vision attachment is invalid.', { cause: error });
+  }
+  assertStoredIdentifier(checked.accountId, 'attachment.accountId');
+  assertStoredIdentifier(checked.threadId, 'attachment.threadId');
+  assertStoredIdentifier(checked.messageId, 'attachment.messageId');
+  assertStoredTimestamp(checked.createdAt, 'attachment.createdAt');
+  return checked;
+}
+
+function attachmentDescriptorFromRow(row) {
+  if (!row) return null;
+  try {
+    assertStoredIdentifier(row.account_id, 'attachment.accountId');
+    assertStoredIdentifier(row.thread_id, 'attachment.threadId');
+    assertStoredIdentifier(row.attachment_id, 'attachment.attachmentId');
+    assertStoredIdentifier(row.message_id, 'attachment.messageId');
+    assertStoredTimestamp(row.created_at, 'attachment.createdAt');
+  } catch (error) {
+    if (error instanceof StorageCorruptionError) throw error;
+    throw new StorageCorruptionError('A stored direct-chat attachment descriptor is invalid.', { cause: error });
+  }
+  const byteLength = Number(row.byte_length);
+  const width = Number(row.width);
+  const height = Number(row.height);
+  if (!['image/jpeg', 'image/png'].includes(row.media_type)
+      || !Number.isSafeInteger(byteLength) || byteLength < 1 || byteLength > VISION_ATTACHMENT_LIMITS.bytes
+      || !Number.isSafeInteger(width) || width < 1 || width > VISION_ATTACHMENT_LIMITS.maximumEdge
+      || !Number.isSafeInteger(height) || height < 1 || height > VISION_ATTACHMENT_LIMITS.maximumEdge
+      || width * height > VISION_ATTACHMENT_LIMITS.pixels
+      || !HASH_PATTERN.test(row.content_sha256)
+      || (row.content_length !== undefined && Number(row.content_length) !== byteLength)) {
+    throw new StorageCorruptionError('A stored direct-chat attachment descriptor is inconsistent.');
+  }
+  return Object.freeze({
+    accountId: row.account_id,
+    threadId: row.thread_id,
+    attachmentId: row.attachment_id,
+    messageId: row.message_id,
+    mediaType: row.media_type,
+    byteLength,
+    width,
+    height,
+    contentSha256: row.content_sha256,
+    createdAt: row.created_at,
+    descriptor: visionAttachmentDescriptor({
+      attachmentId: row.attachment_id,
+      mediaType: row.media_type,
+      byteLength,
+      width,
+      height,
+      contentSha256: row.content_sha256
+    })
+  });
+}
+
+function attachmentForMessage(database, accountId, threadId, messageId) {
+  if ((DATABASE_METADATA.get(database)?.schemaVersion ?? 0) < 3) return null;
+  return attachmentFromRow(database.prepare(`
+    SELECT * FROM direct_chat_attachments
+    WHERE account_id = ? AND thread_id = ? AND message_id = ?
+  `).get(accountId, threadId, messageId));
 }
 
 function generationView(row) {
@@ -255,7 +344,7 @@ function dispatchLeaseView(row, timestamp) {
   };
 }
 
-function calculateMessageHash(row) {
+function calculateMessageHash(row, attachment = null) {
   return sha256(canonicalJson({
     accountId: row.account_id,
     threadId: row.thread_id,
@@ -266,7 +355,8 @@ function calculateMessageHash(row) {
     contentBytes: Number(row.content_bytes),
     previousHash: row.previous_hash,
     generationId: row.generation_id,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    ...(attachment === null ? {} : { attachment: visionAttachmentDescriptor(attachment) })
   }));
 }
 
@@ -440,6 +530,35 @@ function auditThread(database, thread) {
     WHERE account_id = ? AND thread_id = ?
     ORDER BY revision
   `).all(thread.account_id, thread.thread_id);
+  const metadata = DATABASE_METADATA.get(database);
+  const attachmentRows = metadata?.schemaVersion >= 3
+    ? database.prepare(`
+        SELECT account_id, thread_id, attachment_id, message_id, media_type,
+               byte_length, width, height, content_sha256, created_at,
+               length(content) AS content_length
+        FROM direct_chat_attachments
+        WHERE account_id = ? AND thread_id = ?
+        ORDER BY created_at, attachment_id
+      `).all(thread.account_id, thread.thread_id)
+    : [];
+  if (attachmentRows.length > VISION_ATTACHMENT_LIMITS.attachmentsPerThread) {
+    throw new StorageCorruptionError('A direct-chat thread exceeds its vision attachment count bound.');
+  }
+  const attachments = attachmentRows.map(attachmentDescriptorFromRow);
+  const attachmentByMessage = new Map(attachments.map((attachment) => [attachment.messageId, attachment]));
+  const attachmentBytes = attachments.reduce((total, attachment) => total + attachment.byteLength, 0);
+  if (attachmentBytes > VISION_ATTACHMENT_LIMITS.bytesPerThread
+      || attachmentByMessage.size !== attachments.length) {
+    throw new StorageCorruptionError('A direct-chat thread exceeds its vision attachment storage bound.');
+  }
+  const messageRevisionById = new Map(messages.map((message) => [message.message_id, Number(message.revision)]));
+  const firstVisionRevision = attachments.reduce((minimum, attachment) => {
+    const revision = messageRevisionById.get(attachment.messageId);
+    if (revision === undefined) {
+      throw new StorageCorruptionError('A direct-chat vision attachment has no ledger message.');
+    }
+    return Math.min(minimum, revision);
+  }, Number.POSITIVE_INFINITY);
   let previousHash = null;
   let bytes = 0;
   for (let index = 0; index < messages.length; index += 1) {
@@ -450,13 +569,17 @@ function auditThread(database, thread) {
     if (message.generation_id !== null) {
       assertStoredIdentifier(message.generation_id, 'message.generation_id');
     }
+    const attachment = attachmentByMessage.get(message.message_id) ?? null;
+    if (attachment !== null && message.role !== 'user') {
+      throw new StorageCorruptionError('A direct-chat vision attachment is not bound to a user message.');
+    }
     assertStoredText(message.content, 'message.content', { maxBytes: DIRECT_CHAT_LIMITS.messageBytes });
     const expectedRevision = index + 1;
     if (
       Number(message.revision) !== expectedRevision ||
       message.previous_hash !== previousHash ||
       Number(message.content_bytes) !== utf8Bytes(message.content) ||
-      calculateMessageHash(message) !== message.message_hash
+      calculateMessageHash(message, attachment) !== message.message_hash
     ) {
       throw new StorageCorruptionError('A direct-chat message ledger hash chain is inconsistent.');
     }
@@ -486,9 +609,11 @@ function auditThread(database, thread) {
   const completedGenerationIds = new Set();
   for (const generation of generations) {
     const source = messages[Number(generation.source_revision) - 1];
+    const hasVision = firstVisionRevision <= Number(generation.source_revision);
+    const expectedModelAlias = hasVision ? metadata.visionModelAlias : thread.model_alias;
     if (
       !source || source.message_hash !== generation.source_hash || source.role !== 'user' ||
-      generation.model_alias !== thread.model_alias
+      generation.model_alias !== expectedModelAlias
     ) {
       throw new StorageCorruptionError('A direct-chat generation does not reference an exact user-ledger state.');
     }
@@ -587,7 +712,7 @@ function auditThread(database, thread) {
     }
     assertStoredTimestamp(snapshot.created_at, 'compaction.created_at');
   }
-  return { messages, generations };
+  return { messages, generations, attachments, attachmentBytes };
 }
 
 function auditDatabase(database) {
@@ -595,13 +720,29 @@ function auditDatabase(database) {
     SELECT * FROM direct_chat_threads ORDER BY account_id, thread_id
   `).all();
   const counts = new Map();
+  const attachmentBytesByAccount = new Map();
   for (const thread of threads) {
     const count = (counts.get(thread.account_id) ?? 0) + 1;
     if (count > DIRECT_CHAT_LIMITS.threadsPerAccount) {
       throw new StorageCorruptionError('An account exceeds the direct-chat thread bound.');
     }
     counts.set(thread.account_id, count);
-    auditThread(database, thread);
+    const audit = auditThread(database, thread);
+    attachmentBytesByAccount.set(
+      thread.account_id,
+      (attachmentBytesByAccount.get(thread.account_id) ?? 0) + audit.attachmentBytes
+    );
+    if (attachmentBytesByAccount.get(thread.account_id) > VISION_ATTACHMENT_LIMITS.bytesPerAccount) {
+      throw new StorageCorruptionError('An account exceeds its vision attachment storage bound.');
+    }
+    if ((DATABASE_METADATA.get(database)?.schemaVersion ?? 0) >= 3) {
+      for (const descriptor of audit.attachments) {
+        attachmentFromRow(database.prepare(`
+          SELECT * FROM direct_chat_attachments
+          WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
+        `).get(thread.account_id, thread.thread_id, descriptor.attachmentId));
+      }
+    }
   }
   const receiptOverflows = database.prepare(`
     SELECT account_id, count(*) AS count
@@ -640,6 +781,20 @@ function assertCursorMatches(thread, cursor) {
   }
 }
 
+function assertTurnAttachment(value) {
+  assertExactKeys(
+    value,
+    {
+      required: [
+        'attachmentId', 'mediaType', 'byteLength', 'width', 'height',
+        'contentSha256', 'content'
+      ]
+    },
+    'direct chat turn attachment'
+  );
+  return validateStoredVisionAttachment(value);
+}
+
 function statusVersion(generation) {
   const deltaCount = Number(generation.delta_count ?? generation.deltaCount);
   const finalRevision = Number(generation.final_revision ?? generation.finalRevision);
@@ -672,12 +827,26 @@ export class DirectChatStore {
   #closed = false;
   #database;
   #databasePath;
+  #enableVisionAttachments;
   #modelAlias;
+  #schemaVersion;
+  #visionModelAlias;
 
-  constructor({ databasePath, modelAlias = 'local-default', clock = DEFAULT_CLOCK } = {}) {
+  constructor({
+    databasePath,
+    modelAlias = 'local-default',
+    visionModelAlias = VISION_MODEL_ALIAS,
+    enableVisionAttachments = false,
+    clock = DEFAULT_CLOCK
+  } = {}) {
     if (typeof clock !== 'function') throw new ValidationError('clock must be a function.');
+    if (typeof enableVisionAttachments !== 'boolean') {
+      throw new ValidationError('enableVisionAttachments must be boolean.');
+    }
     this.#clock = clock;
     this.#modelAlias = assertModelAlias(modelAlias);
+    this.#visionModelAlias = assertModelAlias(visionModelAlias);
+    this.#enableVisionAttachments = enableVisionAttachments;
     this.#databasePath = prepareSecureDatabasePath(databasePath);
 
     let database;
@@ -697,7 +866,13 @@ export class DirectChatStore {
         PRAGMA trusted_schema = OFF;
         PRAGMA secure_delete = ON;
       `);
-      applyChatMigrations(database, nowIso(this.#clock));
+      this.#schemaVersion = applyChatMigrations(database, nowIso(this.#clock), {
+        enableVisionAttachments
+      });
+      DATABASE_METADATA.set(database, Object.freeze({
+        schemaVersion: this.#schemaVersion,
+        visionModelAlias: this.#visionModelAlias
+      }));
       database.exec('BEGIN');
       try {
         auditDatabase(database);
@@ -1048,7 +1223,8 @@ export class DirectChatStore {
           'accountId', 'threadId', 'messageId', 'content',
           'generationId', 'assistantMessageId',
           'expectedRevision', 'expectedHash', 'idempotencyKey'
-        ]
+        ],
+        optional: ['attachment']
       },
       'atomic direct chat turn'
     );
@@ -1061,6 +1237,10 @@ export class DirectChatStore {
       maxBytes: DIRECT_CHAT_LIMITS.messageBytes
     });
     const cursor = assertCursor(input.expectedRevision, input.expectedHash);
+    const attachment = input.attachment === undefined ? null : assertTurnAttachment(input.attachment);
+    if (attachment !== null && (!this.#enableVisionAttachments || this.#schemaVersion < 3)) {
+      throw new ValidationError('Vision attachments are not enabled for new Direct Chat turns.');
+    }
     if (messageId === assistantMessageId) {
       throw new ConflictError('The user and assistant message identifiers must be different.');
     }
@@ -1072,7 +1252,8 @@ export class DirectChatStore {
       generationId,
       assistantMessageId,
       expectedRevision: cursor.revision,
-      expectedHash: cursor.hash
+      expectedHash: cursor.hash,
+      ...(attachment === null ? {} : { attachment: visionAttachmentDescriptor(attachment) })
     };
 
     const immutableDigest = (result) => ({
@@ -1086,7 +1267,8 @@ export class DirectChatStore {
         contentBytes: result.message.contentBytes,
         previousHash: result.message.previousHash,
         messageHash: result.message.messageHash,
-        createdAt: result.message.createdAt
+        createdAt: result.message.createdAt,
+        ...(result.message.attachment === undefined ? {} : { attachment: result.message.attachment })
       },
       generation: {
         accountId: result.generation.accountId,
@@ -1111,6 +1293,24 @@ export class DirectChatStore {
       if (!message || !generation) {
         throw new ConflictError('The atomic direct-chat turn is only partially present.');
       }
+      const storedAttachment = attachmentForMessage(this.#database, accountId, threadId, messageId);
+      const expectedAttachment = attachment === null ? null : visionAttachmentDescriptor(attachment);
+      const actualAttachment = storedAttachment === null ? null : visionAttachmentDescriptor(storedAttachment);
+      const latestAttachment = this.#schemaVersion >= 3
+        ? this.#database.prepare(`
+            SELECT 1 AS present
+            FROM direct_chat_attachments AS attachment
+            JOIN direct_chat_messages AS owned
+              ON owned.account_id = attachment.account_id
+             AND owned.thread_id = attachment.thread_id
+             AND owned.message_id = attachment.message_id
+            WHERE attachment.account_id = ? AND attachment.thread_id = ?
+              AND owned.revision <= ?
+            LIMIT 1
+          `).get(accountId, threadId, Number(message.revision))
+        : null;
+      const ownerThread = requireThread(this.#database, accountId, threadId);
+      const expectedModelAlias = latestAttachment ? this.#visionModelAlias : ownerThread.model_alias;
       if (
         message.role !== 'user' ||
         message.content !== content.value ||
@@ -1118,12 +1318,14 @@ export class DirectChatStore {
         message.previous_hash !== cursor.hash ||
         generation.assistant_message_id !== assistantMessageId ||
         Number(generation.source_revision) !== Number(message.revision) ||
-        generation.source_hash !== message.message_hash
+        generation.source_hash !== message.message_hash ||
+        generation.model_alias !== expectedModelAlias ||
+        canonicalJson(actualAttachment) !== canonicalJson(expectedAttachment)
       ) {
         throw new ConflictError('The atomic direct-chat turn identifiers are bound to different data.');
       }
       return {
-        message: messageView(message),
+        message: messageView(message, storedAttachment),
         generation: generationView(generation)
       };
     };
@@ -1188,6 +1390,32 @@ export class DirectChatStore {
           throw new ConflictError('The assistant message identifier is already reserved.');
         }
 
+        let inferenceModelAlias = thread.model_alias;
+        if (this.#schemaVersion >= 3) {
+          const existingVision = this.#database.prepare(`
+            SELECT 1 AS present FROM direct_chat_attachments
+            WHERE account_id = ? AND thread_id = ?
+            LIMIT 1
+          `).get(accountId, threadId);
+          if (existingVision || attachment !== null) inferenceModelAlias = this.#visionModelAlias;
+        }
+        if (attachment !== null) {
+          const threadAttachmentTotals = this.#database.prepare(`
+            SELECT count(*) AS count, coalesce(sum(byte_length), 0) AS bytes
+            FROM direct_chat_attachments
+            WHERE account_id = ? AND thread_id = ?
+          `).get(accountId, threadId);
+          const accountAttachmentBytes = Number(this.#database.prepare(`
+            SELECT coalesce(sum(byte_length), 0) AS bytes
+            FROM direct_chat_attachments WHERE account_id = ?
+          `).get(accountId).bytes);
+          if (Number(threadAttachmentTotals.count) >= VISION_ATTACHMENT_LIMITS.attachmentsPerThread
+              || Number(threadAttachmentTotals.bytes) + attachment.byteLength > VISION_ATTACHMENT_LIMITS.bytesPerThread
+              || accountAttachmentBytes + attachment.byteLength > VISION_ATTACHMENT_LIMITS.bytesPerAccount) {
+            throw new ConflictError('The Direct Chat vision attachment storage quota is reached.');
+          }
+        }
+
         const timestamp = nowIso(this.#clock);
         const message = {
           account_id: accountId,
@@ -1201,7 +1429,7 @@ export class DirectChatStore {
           generation_id: null,
           created_at: timestamp
         };
-        message.message_hash = calculateMessageHash(message);
+        message.message_hash = calculateMessageHash(message, attachment);
         try {
           this.#database.prepare(`
             INSERT INTO direct_chat_messages(
@@ -1219,6 +1447,26 @@ export class DirectChatStore {
             message.message_hash,
             timestamp
           );
+          if (attachment !== null) {
+            this.#database.prepare(`
+              INSERT INTO direct_chat_attachments(
+                account_id, thread_id, attachment_id, message_id, media_type,
+                byte_length, width, height, content_sha256, content, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              accountId,
+              threadId,
+              attachment.attachmentId,
+              messageId,
+              attachment.mediaType,
+              attachment.byteLength,
+              attachment.width,
+              attachment.height,
+              attachment.contentSha256,
+              attachment.content,
+              timestamp
+            );
+          }
           this.#database.prepare(`
             INSERT INTO direct_chat_generations(
               account_id, thread_id, generation_id, assistant_message_id, status,
@@ -1229,7 +1477,7 @@ export class DirectChatStore {
             threadId,
             generationId,
             assistantMessageId,
-            thread.model_alias,
+            inferenceModelAlias,
             message.revision,
             message.message_hash,
             timestamp,
@@ -1261,7 +1509,7 @@ export class DirectChatStore {
           throw new ConflictError('The direct-chat thread changed concurrently.');
         }
         return {
-          message: messageView(message),
+          message: messageView(message, attachment),
           generation: generationView(
             requireGeneration(this.#database, accountId, threadId, generationId)
           )
@@ -1435,6 +1683,19 @@ export class DirectChatStore {
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
         auditThread(this.#database, thread);
+        const inferenceModelAlias = this.#schemaVersion >= 3 && this.#database.prepare(`
+          SELECT 1 AS present
+          FROM direct_chat_attachments AS attachment
+          JOIN direct_chat_messages AS message
+            ON message.account_id = attachment.account_id
+           AND message.thread_id = attachment.thread_id
+           AND message.message_id = attachment.message_id
+          WHERE attachment.account_id = ? AND attachment.thread_id = ?
+            AND message.revision <= ?
+          LIMIT 1
+        `).get(accountId, threadId, cursor.revision)
+          ? this.#visionModelAlias
+          : thread.model_alias;
         const existing = this.#database.prepare(`
           SELECT * FROM direct_chat_generations
           WHERE account_id = ? AND thread_id = ? AND generation_id = ?
@@ -1443,7 +1704,7 @@ export class DirectChatStore {
           if (
             existing.assistant_message_id !== assistantMessageId ||
             Number(existing.source_revision) !== cursor.revision ||
-            existing.source_hash !== cursor.hash || existing.model_alias !== thread.model_alias
+            existing.source_hash !== cursor.hash || existing.model_alias !== inferenceModelAlias
           ) {
             throw new ConflictError('The generation identifier is already bound to a different request.');
           }
@@ -1483,7 +1744,7 @@ export class DirectChatStore {
           ) VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?)
         `).run(
           accountId, threadId, generationId, assistantMessageId,
-          thread.model_alias, cursor.revision, cursor.hash, timestamp, timestamp
+          inferenceModelAlias, cursor.revision, cursor.hash, timestamp, timestamp
         );
         const updated = this.#database.prepare(`
           UPDATE direct_chat_threads
@@ -2250,7 +2511,84 @@ export class DirectChatStore {
         ORDER BY revision
         LIMIT ?
       `).all(accountId, threadId, afterRevision, limit);
-      return rows.map(messageView);
+      if (this.#schemaVersion < 3 || rows.length === 0) return rows.map((row) => messageView(row));
+      const attachmentRows = this.#database.prepare(`
+        SELECT attachment.account_id, attachment.thread_id, attachment.attachment_id,
+               attachment.message_id, attachment.media_type, attachment.byte_length,
+               attachment.width, attachment.height, attachment.content_sha256,
+               attachment.created_at, length(attachment.content) AS content_length
+        FROM direct_chat_attachments AS attachment
+        JOIN direct_chat_messages AS message
+          ON message.account_id = attachment.account_id
+         AND message.thread_id = attachment.thread_id
+         AND message.message_id = attachment.message_id
+        WHERE attachment.account_id = ? AND attachment.thread_id = ?
+          AND message.revision > ? AND message.revision <= ?
+      `).all(accountId, threadId, afterRevision, Number(rows.at(-1).revision));
+      const byMessage = new Map(
+        attachmentRows.map((row) => {
+          const attachment = attachmentDescriptorFromRow(row);
+          return [attachment.messageId, attachment];
+        })
+      );
+      return rows.map((row) => messageView(row, byMessage.get(row.message_id) ?? null));
+    });
+  }
+
+  getVisionAttachment(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'threadId', 'attachmentId'] },
+      'direct chat vision attachment lookup'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const threadId = assertIdentifier(input.threadId, 'threadId');
+    const attachmentId = assertIdentifier(input.attachmentId, 'attachmentId');
+    if (this.#schemaVersion < 3) return null;
+    return this.#readTransaction(() => {
+      const thread = this.#database.prepare(`
+        SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
+      `).get(accountId, threadId);
+      if (!thread) return null;
+      auditThread(this.#database, thread);
+      return attachmentFromRow(this.#database.prepare(`
+        SELECT * FROM direct_chat_attachments
+        WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
+      `).get(accountId, threadId, attachmentId));
+    });
+  }
+
+  getLatestVisionAttachment(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'threadId', 'sourceRevision'] },
+      'latest direct chat vision attachment lookup'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const threadId = assertIdentifier(input.threadId, 'threadId');
+    const sourceRevision = assertInteger(input.sourceRevision, 'sourceRevision', { min: 1, max: 2_000 });
+    if (this.#schemaVersion < 3) return null;
+    return this.#readTransaction(() => {
+      const thread = this.#database.prepare(`
+        SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
+      `).get(accountId, threadId);
+      if (!thread) return null;
+      auditThread(this.#database, thread);
+      const row = this.#database.prepare(`
+        SELECT attachment.*
+        FROM direct_chat_attachments AS attachment
+        JOIN direct_chat_messages AS message
+          ON message.account_id = attachment.account_id
+         AND message.thread_id = attachment.thread_id
+         AND message.message_id = attachment.message_id
+        WHERE attachment.account_id = ? AND attachment.thread_id = ?
+          AND message.revision <= ?
+        ORDER BY message.revision DESC, attachment.attachment_id DESC
+        LIMIT 1
+      `).get(accountId, threadId, sourceRevision);
+      return attachmentFromRow(row);
     });
   }
 

@@ -167,6 +167,8 @@ export async function createStandaloneService({
     directChatStore = new DirectChatStore({
       databasePath: config.state.directChatDatabase,
       modelAlias: config.localLlm.defaultModelAlias,
+      visionModelAlias: config.localLlm.vision.modelAlias,
+      enableVisionAttachments: config.localLlm.vision.enabled,
       ...(clock === undefined ? {} : { clock })
     });
     const account = controlStore.provisionAccount({
@@ -213,6 +215,8 @@ export async function createStandaloneService({
       directChatContext,
       directChatSummarizer,
       directChatConnector,
+      visionEnabled: config.localLlm.vision.enabled,
+      visionModelAlias: config.localLlm.vision.modelAlias,
       agintiAdapter,
       ...(clock === undefined ? {} : { clock })
     });

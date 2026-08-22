@@ -23,8 +23,11 @@ import {
 } from '../src/chat-store.js';
 import {
   CHAT_SQLITE_APPLICATION_ID,
+  DEFAULT_CHAT_SCHEMA_VERSION,
   LATEST_CHAT_SCHEMA_VERSION
 } from '../src/chat-migrations.js';
+import { validateVisionAttachmentRequest, VISION_MODEL_ALIAS } from '../src/vision-attachment.js';
+import { createPwaIcon } from '../src/web/pwa-assets.js';
 import { sha256 } from '../src/validation.js';
 import {
   ConflictError,
@@ -104,6 +107,14 @@ function startTurn(store, thread, suffix = 'one', overrides = {}) {
     expectedHash: thread.ledgerHash,
     idempotencyKey: `start-turn-${suffix}-0001`,
     ...overrides
+  });
+}
+
+function visionAttachment(suffix = 'one') {
+  return validateVisionAttachmentRequest({
+    attachmentId: `image-${suffix}-0000000000000001`,
+    mediaType: 'image/png',
+    data: Buffer.from(createPwaIcon(192)).toString('base64')
   });
 }
 
@@ -425,6 +436,167 @@ test('atomically persists one user message, one active generation, and one idemp
       providerUrl: 'https://provider.invalid'
     }),
     ValidationError
+  );
+});
+
+test('atomically stores private canonical image bytes while exposing only a hash-bound descriptor', (t) => {
+  const { databasePath, store } = testState(t, {
+    modelAlias: 'localllm-fast',
+    enableVisionAttachments: true
+  });
+  const thread = createThread(store, 'vision');
+  const attachment = visionAttachment('vision');
+  const request = {
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    messageId: 'user-vision',
+    content: 'Describe the important details in this image.',
+    generationId: 'generation-vision',
+    assistantMessageId: 'assistant-vision',
+    expectedRevision: thread.revision,
+    expectedHash: thread.ledgerHash,
+    idempotencyKey: 'start-turn-vision-0001',
+    attachment
+  };
+  const committed = store.startTurn(request);
+
+  assert.equal(committed.generation.modelAlias, VISION_MODEL_ALIAS);
+  assert.deepEqual(committed.message.attachment, {
+    attachmentId: attachment.attachmentId,
+    mediaType: attachment.mediaType,
+    byteLength: attachment.byteLength,
+    width: attachment.width,
+    height: attachment.height,
+    sha256: attachment.contentSha256
+  });
+  assert.equal(Object.hasOwn(committed.message.attachment, 'content'), false);
+  assert.equal(Object.hasOwn(committed.message.attachment, 'data'), false);
+  assert.deepEqual(store.startTurn(request), committed);
+
+  const publicLedger = store.listMessages({
+    accountId: thread.accountId,
+    threadId: thread.threadId
+  });
+  assert.deepEqual(publicLedger, [committed.message]);
+  assert.doesNotMatch(JSON.stringify(publicLedger), new RegExp(attachment.content.toString('base64'), 'u'));
+
+  const privateAttachment = store.getVisionAttachment({
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    attachmentId: attachment.attachmentId
+  });
+  assert.deepEqual(privateAttachment.content, attachment.content);
+  assert.equal(privateAttachment.contentSha256, attachment.contentSha256);
+  assert.equal(store.getVisionAttachment({
+    accountId: 'account-other',
+    threadId: thread.threadId,
+    attachmentId: attachment.attachmentId
+  }), null);
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    const persisted = database.prepare(`
+      SELECT typeof(content) AS storage_type, content
+      FROM direct_chat_attachments
+      WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
+    `).get(thread.accountId, thread.threadId, attachment.attachmentId);
+    assert.equal(persisted.storage_type, 'blob');
+    assert.deepEqual(Buffer.from(persisted.content), attachment.content);
+    assert.equal(database.prepare(`
+      SELECT content FROM direct_chat_messages
+      WHERE account_id = ? AND thread_id = ? AND message_id = ?
+    `).get(thread.accountId, thread.threadId, committed.message.messageId).content, request.content);
+    assert.throws(() => database.prepare(`
+      UPDATE direct_chat_attachments SET content = zeroblob(byte_length)
+      WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
+    `).run(thread.accountId, thread.threadId, attachment.attachmentId), /immutable/u);
+    assert.throws(() => database.prepare(`
+      DELETE FROM direct_chat_attachments
+      WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
+    `).run(thread.accountId, thread.threadId, attachment.attachmentId), /durable/u);
+  } finally {
+    database.close();
+  }
+
+  appendDelta(store, committed.generation, 0, 'The image contains the LazyingArt mark.');
+  store.finalizeGeneration({
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    generationId: committed.generation.generationId,
+    idempotencyKey: 'finalize-vision-0001'
+  });
+  const updated = store.getThread(thread.accountId, thread.threadId);
+  const followup = startTurn(store, updated, 'vision-followup', {
+    content: 'Now focus on its proportions.'
+  });
+  assert.equal(followup.generation.modelAlias, VISION_MODEL_ALIAS);
+  assert.deepEqual(store.getLatestVisionAttachment({
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    sourceRevision: followup.generation.sourceRevision
+  }).content, attachment.content);
+});
+
+test('gates the v3 attachment migration for expansion and accepts v3 when vision is disabled for rollback', (t) => {
+  const state = testState(t, { modelAlias: 'localllm-fast' });
+  const thread = createThread(state.store, 'vision-migration');
+  assert.equal(
+    Number(scalar(state.databasePath, 'SELECT user_version AS value FROM pragma_user_version')),
+    DEFAULT_CHAT_SCHEMA_VERSION
+  );
+  assert.equal(
+    Number(scalar(state.databasePath, `
+      SELECT count(*) AS value FROM sqlite_schema
+      WHERE type = 'table' AND name = 'direct_chat_attachments'
+    `)),
+    0
+  );
+  assert.throws(
+    () => startTurn(state.store, thread, 'vision-disabled', { attachment: visionAttachment('disabled') }),
+    /not enabled/u
+  );
+
+  state.store.close();
+  let reopened = new DirectChatStore({
+    databasePath: state.databasePath,
+    modelAlias: 'localllm-fast',
+    enableVisionAttachments: true
+  });
+  state.replaceStore(reopened);
+  assert.equal(
+    Number(scalar(state.databasePath, 'SELECT user_version AS value FROM pragma_user_version')),
+    LATEST_CHAT_SCHEMA_VERSION
+  );
+  const committed = startTurn(reopened, thread, 'vision-migrated', {
+    attachment: visionAttachment('migrated')
+  });
+  assert.equal(committed.generation.modelAlias, VISION_MODEL_ALIAS);
+
+  reopened.close();
+  reopened = new DirectChatStore({
+    databasePath: state.databasePath,
+    modelAlias: 'localllm-fast',
+    enableVisionAttachments: false
+  });
+  state.replaceStore(reopened);
+  assert.equal(reopened.listMessages({
+    accountId: thread.accountId,
+    threadId: thread.threadId
+  })[0].attachment.attachmentId, 'image-migrated-0000000000000001');
+  assert.throws(
+    () => reopened.startTurn({
+      accountId: thread.accountId,
+      threadId: thread.threadId,
+      messageId: 'user-rollback-new-image',
+      content: 'A new image must remain gated.',
+      generationId: 'generation-rollback-new-image',
+      assistantMessageId: 'assistant-rollback-new-image',
+      expectedRevision: committed.message.revision,
+      expectedHash: committed.message.messageHash,
+      idempotencyKey: 'start-turn-rollback-image-0001',
+      attachment: visionAttachment('rollback')
+    }),
+    /not enabled/u
   );
 });
 
@@ -1252,7 +1424,7 @@ test('migrates an exact version-one chat database to fenced dispatch leases', (t
   state.replaceStore(migrated);
   assert.equal(
     Number(scalar(state.databasePath, 'SELECT user_version AS value FROM pragma_user_version')),
-    LATEST_CHAT_SCHEMA_VERSION
+    DEFAULT_CHAT_SCHEMA_VERSION
   );
   assert.equal(
     Number(scalar(

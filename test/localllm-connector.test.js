@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import {
   LocalLlmConnectorError,
   createLocalLlmConnector
 } from '../src/localllm-connector.js';
+import { createPwaIcon } from '../src/web/pwa-assets.js';
 
 const TOKEN = 'local-test-token-0000000000000001';
 const HASH_A = 'a'.repeat(64);
@@ -125,6 +127,70 @@ test('streams only bounded assistant text through the exact authenticated route'
     stream_options: { include_usage: false }
   });
   assert.doesNotMatch(JSON.stringify(value), /local-test-token/u);
+});
+
+test('sends the latest private canonical image only to the fixed vision alias as OpenAI image content', async () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  const calls = [];
+  const value = connector(async (url, init) => {
+    calls.push({ url, init });
+    return streamResponse(['data: [DONE]\n\n']);
+  }, {
+    allowedModelAliases: ['localllm-fast', 'localllm-vision']
+  });
+  const visionAttachment = {
+    attachmentId: 'image_0000000000000001',
+    messageId: 'message-one',
+    mediaType: 'image/png',
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    contentSha256: createHash('sha256').update(bytes).digest('hex'),
+    content: bytes
+  };
+  const output = await value.generate(generationInput({
+    modelAlias: 'localllm-vision',
+    visionAttachment
+  }));
+  await collect(output);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:18120/v1/chat/completions');
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.model, 'localllm-vision');
+  assert.deepEqual(body.messages.at(-1), {
+    role: 'user',
+    content: [
+      {
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` }
+      },
+      { type: 'text', text: 'Plot y = x².' }
+    ]
+  });
+  assert.doesNotMatch(JSON.stringify(value), new RegExp(bytes.toString('base64'), 'u'));
+
+  await assert.rejects(
+    value.generate(generationInput({ modelAlias: 'localllm-fast', visionAttachment })),
+    (error) => error instanceof LocalLlmConnectorError
+      && error.code === 'LOCALLLM_MODEL_REJECTED'
+      && error.failureCode === 'content_rejected'
+  );
+  await assert.rejects(
+    value.generate(generationInput({ modelAlias: 'localllm-vision' })),
+    (error) => error instanceof LocalLlmConnectorError
+      && error.code === 'LOCALLLM_MODEL_REJECTED'
+      && error.failureCode === 'content_rejected'
+  );
+
+  await assert.rejects(
+    value.generate(generationInput({
+      modelAlias: 'localllm-vision',
+      visionAttachment: { ...visionAttachment, contentSha256: '0'.repeat(64) }
+    })),
+    /visionAttachment/u
+  );
+  assert.equal(calls.length, 1);
 });
 
 test('lists models and reports readiness without exposing the credential', async () => {

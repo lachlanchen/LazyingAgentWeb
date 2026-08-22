@@ -1,13 +1,14 @@
 import { AgintiBrowserClient, selectDefaultMode } from "./aginti-client.js";
 import { AgintiProtocolError, FAIL_CLOSED_AGENT_CAPABILITIES, validateAgentCapabilities } from "./aginti-protocol.js";
 import { CloudSessionClient } from "./cloud-session-client.js";
-import { DirectChatBrowserClient, DirectChatProtocolError } from "./direct-chat-client.js";
+import { createBrowserOpaqueId, DirectChatBrowserClient, DirectChatProtocolError } from "./direct-chat-client.js";
 import { createRunPresentation } from "./presentation-state.js";
 import {
   applyTheme,
   offerPasswordManagerSave,
   restoreTheme,
 } from "./pwa-assets.js";
+import { canonicalizeVisionImage } from "./vision-image-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
@@ -42,6 +43,25 @@ function logoutEnvelope(value) {
   const result = exactObject(value, ["signedOut", "agentCancellationPending"], ["signedOut", "agentCancellationPending"], "logout response");
   if (result.signedOut !== true || typeof result.agentCancellationPending !== "boolean") throw new TypeError("logout response is invalid");
   return Object.freeze({ signedOut: true, agentCancellationPending: result.agentCancellationPending });
+}
+
+function chatCapabilityEnvelope(value) {
+  const result = exactObject(value, ["visionInput", "visionMediaTypes", "maximumImageBytes"], [
+    "visionInput", "visionMediaTypes", "maximumImageBytes",
+  ], "chat capabilities");
+  if (typeof result.visionInput !== "boolean" || !Array.isArray(result.visionMediaTypes)
+      || !Number.isSafeInteger(result.maximumImageBytes)
+      || (result.visionInput
+        ? result.maximumImageBytes !== 4 * 1024 * 1024
+          || result.visionMediaTypes.join(",") !== "image/jpeg,image/png"
+        : result.maximumImageBytes !== 0 || result.visionMediaTypes.length !== 0)) {
+    throw new TypeError("chat capabilities are invalid");
+  }
+  return Object.freeze({
+    visionInput: result.visionInput,
+    visionMediaTypes: Object.freeze([...result.visionMediaTypes]),
+    maximumImageBytes: result.maximumImageBytes,
+  });
 }
 
 function requiredMethod(value, name, owner) {
@@ -96,7 +116,8 @@ function elementMap(document) {
     "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
     "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
-    "stop-run", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+    "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
+    "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
   ];
   return Object.freeze(Object.fromEntries(ids.map((id) => {
     const value = document.getElementById(id);
@@ -127,6 +148,9 @@ export function createBrowserApp({
   renderer,
   cursorStore,
   credentialSaver = offerPasswordManagerSave,
+  canonicalizeImage = canonicalizeVisionImage,
+  createObjectUrl = (blob) => globalThis.URL.createObjectURL(blob),
+  revokeObjectUrl = (url) => globalThis.URL.revokeObjectURL(url),
   serviceWorkerPath,
   serviceWorkerScope,
   updateCheckIntervalMs = 15 * 60 * 1_000,
@@ -162,6 +186,10 @@ export function createBrowserApp({
   requiredMethod(renderer, "renderArtifact", "renderer");
   if (cursorStore !== undefined) requiredMethod(cursorStore, "save", "cursorStore");
   if (typeof credentialSaver !== "function") throw new TypeError("credentialSaver must be a function");
+  if (typeof canonicalizeImage !== "function" || typeof createObjectUrl !== "function"
+      || typeof revokeObjectUrl !== "function") {
+    throw new TypeError("browser image handlers must be functions");
+  }
   const workerScope = normalizedBrowserPath(
     serviceWorkerScope ?? metaContent(document, "lazying-agent-base-path") ?? "/",
     "serviceWorkerScope",
@@ -196,6 +224,7 @@ export function createBrowserApp({
     logoutPending: false,
     session: Object.freeze({ authenticated: false }),
     capabilities: FAIL_CLOSED_AGENT_CAPABILITIES,
+    chatCapabilities: Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }),
     agent: null,
     chat: null,
     mode: "chat",
@@ -208,6 +237,11 @@ export function createBrowserApp({
     chatAfterSequence: 0,
     chatOutput: "",
     chatPendingSend: null,
+    selectedImage: null,
+    selectedImageUrl: null,
+    imageSelectionEpoch: 0,
+    imageRenderEpoch: 0,
+    messageImageUrls: new Set(),
     runId: null,
     presentation: null,
     assistantNode: null,
@@ -264,6 +298,25 @@ export function createBrowserApp({
     elements.login_error.hidden = true;
   }
 
+  function clearSelectedImage() {
+    state.imageSelectionEpoch += 1;
+    if (state.selectedImageUrl !== null) revokeObjectUrl(state.selectedImageUrl);
+    state.selectedImage = null;
+    state.selectedImageUrl = null;
+    elements.image_input.value = "";
+    elements.image_preview_thumbnail.src = "";
+    elements.image_preview_label.textContent = "";
+    elements.image_preview.hidden = true;
+  }
+
+  function updateImageControl() {
+    const available = state.session.authenticated && state.mode === "chat"
+      && state.chatCapabilities.visionInput === true;
+    elements.add_image.hidden = !available;
+    elements.add_image.disabled = !available || state.busy;
+    if (!available && state.selectedImage !== null) clearSelectedImage();
+  }
+
   function currentThreads() {
     return state.mode === "agent" ? state.agentThreads : state.chatThreads;
   }
@@ -292,11 +345,15 @@ export function createBrowserApp({
       ? "AgInTi owns planning, tools, context, compaction, runs, and artifacts."
       : "Durable server-owned conversations with LocalLLM, without Agent tools or browser-owned history.";
     elements.message_input.placeholder = state.mode === "agent" ? "Ask AgInTi Agent" : "Message LocalLLM";
+    updateImageControl();
     renderThreads();
     if (changed && restoreView && state.session.authenticated) void restoreModeView({ autoOpen: true });
   }
 
   function clearConversation() {
+    state.imageRenderEpoch += 1;
+    for (const url of state.messageImageUrls) revokeObjectUrl(url);
+    state.messageImageUrls.clear();
     elements.messages.replaceChildren();
     elements.agent_plan.replaceChildren();
     elements.agent_timeline.replaceChildren();
@@ -311,11 +368,28 @@ export function createBrowserApp({
     state.assistantNode = null;
   }
 
-  function messageNode(role, content, { runId } = {}) {
+  function messageNode(role, content, { runId, attachment, threadId } = {}) {
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.role = role;
     if (runId) article.dataset.runId = runId;
+    if (attachment !== undefined && role === "user" && threadId && state.chat) {
+      const image = document.createElement("img");
+      image.className = "message-attachment";
+      image.alt = "Attached image";
+      article.appendChild(image);
+      const expectedEpoch = state.viewEpoch;
+      const expectedImageEpoch = state.imageRenderEpoch;
+      const chat = state.chat;
+      void chat.getAttachment({ threadId, attachment }).then(({ bytes, descriptor }) => {
+        if (state.viewEpoch !== expectedEpoch || state.imageRenderEpoch !== expectedImageEpoch || state.chat !== chat) return;
+        const url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
+        state.messageImageUrls.add(url);
+        image.src = url;
+      }).catch(() => {
+        image.alt = "Attached image preview unavailable";
+      });
+    }
     const body = document.createElement("div");
     body.className = "message-content";
     renderer.renderMarkdown(body, content);
@@ -560,7 +634,11 @@ export function createBrowserApp({
     state.chatThread = snapshot.thread;
     state.chatThreadId = snapshot.thread.threadId;
     elements.conversation_title.textContent = snapshot.thread.title || "New conversation";
-    snapshot.messages.forEach((message) => messageNode(message.role, message.content, { runId: message.generationId ?? undefined }));
+    snapshot.messages.forEach((message) => messageNode(message.role, message.content, {
+      runId: message.generationId ?? undefined,
+      attachment: message.attachment,
+      threadId: snapshot.thread.threadId,
+    }));
     const last = snapshot.messages.at(-1);
     elements.workspace.dataset.status = last?.role === "assistant" ? "completed" : "idle";
     elements.run_state.textContent = last?.role === "assistant" ? "Completed" : "Idle";
@@ -819,6 +897,7 @@ export function createBrowserApp({
         content: workflow.text,
         expectedRevision: thread.revision,
         expectedHash: thread.ledgerHash,
+        ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
       });
     }
     workflow.runDispatched = true;
@@ -837,11 +916,12 @@ export function createBrowserApp({
     else await streamChatGeneration(started.generation);
   }
 
-  async function sendChat(text) {
+  async function sendChat(text, attachment = null) {
     if (state.chatPendingSend) throw new TypeError("a durable chat request is already pending");
     if (state.chatGeneration?.status === "in_progress") throw new TypeError("the current generation must finish or be cancelled first");
     const workflow = {
       text,
+      attachment,
       threadTicket: null,
       threadDispatched: false,
       thread: null,
@@ -856,18 +936,63 @@ export function createBrowserApp({
     }
   }
 
+  async function selectImage() {
+    if (state.busy || state.mode !== "chat" || state.chatCapabilities.visionInput !== true) return;
+    const files = elements.image_input.files;
+    if (!files || files.length !== 1) {
+      clearSelectedImage();
+      showToast("Choose exactly one JPEG or PNG image.");
+      return;
+    }
+    const file = files[0];
+    clearSelectedImage();
+    const selectionEpoch = state.imageSelectionEpoch;
+    elements.add_image.disabled = true;
+    try {
+      const selected = await canonicalizeImage(file, {
+        document,
+        makeAttachmentId: createBrowserOpaqueId,
+      });
+      if (selectionEpoch !== state.imageSelectionEpoch || state.mode !== "chat"
+          || state.chatCapabilities.visionInput !== true) return;
+      const previewUrl = createObjectUrl(selected.previewBlob);
+      state.selectedImage = selected;
+      state.selectedImageUrl = previewUrl;
+      elements.image_preview_thumbnail.src = previewUrl;
+      elements.image_preview_label.textContent = `${selected.width}×${selected.height} · ${Math.ceil(selected.byteLength / 1024)} KiB`;
+      elements.image_preview.hidden = false;
+    } catch {
+      if (selectionEpoch === state.imageSelectionEpoch) {
+        showToast("That image could not be prepared safely. Use one JPEG or PNG under the displayed limits.");
+      }
+    } finally {
+      updateImageControl();
+    }
+  }
+
   async function submitMessage(event) {
     event?.preventDefault?.();
     if (state.busy || !state.session.authenticated) return;
     let text;
     try { text = boundedMessage(elements.message_input.value); }
     catch { return; }
+    const selected = state.mode === "chat" ? state.selectedImage : null;
+    const attachment = selected === null ? null : Object.freeze({
+      attachmentId: selected.attachmentId,
+      mediaType: selected.mediaType,
+      byteLength: selected.byteLength,
+      width: selected.width,
+      height: selected.height,
+      bytes: selected.bytes,
+    });
+    if (selected !== null) clearSelectedImage();
     elements.message_input.value = "";
     state.busy = true;
     elements.send_message.disabled = true;
+    updateImageControl();
     try {
       if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text);
-      else await sendChat(text);
+      else await sendChat(text, attachment);
       connection("Connected");
     } catch {
       connection("Request interrupted", false);
@@ -877,6 +1002,7 @@ export function createBrowserApp({
     } finally {
       state.busy = false;
       elements.send_message.disabled = false;
+      updateImageControl();
     }
   }
 
@@ -907,14 +1033,24 @@ export function createBrowserApp({
       requiredMethod(state.agent, "listThreads", "agent client");
       requiredMethod(state.agent, "streamRunEvents", "agent client");
       for (const method of [
-        "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages",
+        "capabilities", "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages", "getAttachment",
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
+      const [rawAgentCapability, rawChatCapability] = await Promise.all([
+        Promise.resolve().then(() => state.agent.capabilities()).catch(() => FAIL_CLOSED_AGENT_CAPABILITIES),
+        Promise.resolve().then(() => state.chat.capabilities()).catch(() => ({
+          visionInput: false, visionMediaTypes: [], maximumImageBytes: 0,
+        })),
+      ]);
       let capability;
-      try { capability = validateAgentCapabilities(await state.agent.capabilities()); }
+      try { capability = validateAgentCapabilities(rawAgentCapability); }
       catch { capability = FAIL_CLOSED_AGENT_CAPABILITIES; }
+      let chatCapability;
+      try { chatCapability = chatCapabilityEnvelope(rawChatCapability); }
+      catch { chatCapability = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }); }
       if (state.session !== authenticatedSession || !state.session.authenticated) return;
       state.capabilities = capability;
+      state.chatCapabilities = chatCapability;
       showApp();
       setMode(selectDefaultMode(capability), { restoreView: false });
       connection("Connected");
@@ -989,6 +1125,8 @@ export function createBrowserApp({
     state.chatThread = null;
     state.chatGeneration = null;
     state.chatPendingSend = null;
+    state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
+    clearSelectedImage();
     state.runId = null;
     clearConversation();
     showLogin();
@@ -1069,6 +1207,7 @@ export function createBrowserApp({
       state.chatAfterSequence = 0;
       state.chatOutput = "";
     }
+    clearSelectedImage();
     elements.conversation_title.textContent = "New conversation";
     clearConversation();
     renderThreads();
@@ -1079,6 +1218,9 @@ export function createBrowserApp({
     state.bound = true;
     elements.login_form.addEventListener("submit", (event) => { void login(event); });
     elements.composer.addEventListener("submit", (event) => { void submitMessage(event); });
+    elements.add_image.addEventListener("click", () => elements.image_input.click?.());
+    elements.image_input.addEventListener("change", () => { void selectImage(); });
+    elements.remove_image.addEventListener("click", clearSelectedImage);
     elements.logout.addEventListener("click", () => { void logout(); });
     elements.new_thread.addEventListener("click", newConversation);
     elements.stop_run.addEventListener("click", () => { void stop(); });

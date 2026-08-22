@@ -443,6 +443,53 @@ BEGIN
 END;
 `;
 
+const VISION_ATTACHMENT_SCHEMA = `
+CREATE TABLE direct_chat_attachments (
+  account_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL CHECK (length(attachment_id) BETWEEN 1 AND 128),
+  message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128),
+  media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png')),
+  byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 4194304),
+  width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+  height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+  content_sha256 TEXT NOT NULL CHECK (
+    length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+  ),
+  content BLOB NOT NULL CHECK (length(content) = byte_length),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, thread_id, attachment_id),
+  UNIQUE (account_id, thread_id, message_id),
+  FOREIGN KEY (account_id, thread_id, message_id)
+    REFERENCES direct_chat_messages(account_id, thread_id, message_id) ON DELETE RESTRICT,
+  CHECK (width * height <= 16777216)
+) STRICT;
+
+CREATE INDEX direct_chat_attachments_owner_latest
+  ON direct_chat_attachments(account_id, thread_id, created_at DESC, attachment_id DESC);
+
+CREATE TRIGGER direct_chat_attachments_no_update
+BEFORE UPDATE ON direct_chat_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat attachments are immutable');
+END;
+
+CREATE TRIGGER direct_chat_attachments_no_delete
+BEFORE DELETE ON direct_chat_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat attachments are durable');
+END;
+
+CREATE TRIGGER direct_chat_generations_model_immutable
+BEFORE UPDATE OF model_alias, source_revision, source_hash ON direct_chat_generations
+WHEN NEW.model_alias != OLD.model_alias
+  OR NEW.source_revision != OLD.source_revision
+  OR NEW.source_hash != OLD.source_hash
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat generation inference authority is immutable');
+END;
+`;
+
 function checksum(sql) {
   return createHash('sha256').update(sql, 'utf8').digest('hex');
 }
@@ -459,12 +506,19 @@ export const CHAT_MIGRATIONS = Object.freeze([
     name: 'fenced_generation_dispatch_leases',
     sql: GENERATION_DISPATCH_LEASE_SCHEMA,
     checksum: checksum(GENERATION_DISPATCH_LEASE_SCHEMA)
+  }),
+  Object.freeze({
+    version: 3,
+    name: 'private_vision_attachments',
+    sql: VISION_ATTACHMENT_SCHEMA,
+    checksum: checksum(VISION_ATTACHMENT_SCHEMA)
   })
 ]);
 
 export const LATEST_CHAT_SCHEMA_VERSION = CHAT_MIGRATIONS[CHAT_MIGRATIONS.length - 1].version;
+export const DEFAULT_CHAT_SCHEMA_VERSION = 2;
 
-const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
+const EXPECTED_SCHEMA_OBJECTS_V2 = Object.freeze([
   'index:direct_chat_compactions_owner_range:direct_chat_compactions',
   'index:direct_chat_deltas_replay:direct_chat_deltas',
   'index:direct_chat_generations_owner_started:direct_chat_generations',
@@ -496,7 +550,23 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
   'trigger:direct_chat_messages_no_update:direct_chat_messages'
 ]);
 
-const EXPECTED_SCHEMA_FINGERPRINT = 'ad84514c28ac6762061439579862853249f6c87b613f81b79a20947d5c52d4d5';
+const EXPECTED_SCHEMA_OBJECTS_V3 = Object.freeze([
+  'index:direct_chat_attachments_owner_latest:direct_chat_attachments',
+  ...EXPECTED_SCHEMA_OBJECTS_V2.slice(0, 9),
+  'table:chat_schema_migrations:chat_schema_migrations',
+  'table:direct_chat_attachments:direct_chat_attachments',
+  ...EXPECTED_SCHEMA_OBJECTS_V2.slice(10, 17),
+  'trigger:direct_chat_attachments_no_delete:direct_chat_attachments',
+  'trigger:direct_chat_attachments_no_update:direct_chat_attachments',
+  ...EXPECTED_SCHEMA_OBJECTS_V2.slice(17, 24),
+  'trigger:direct_chat_generations_model_immutable:direct_chat_generations',
+  ...EXPECTED_SCHEMA_OBJECTS_V2.slice(24)
+]);
+
+const EXPECTED_SCHEMA_FINGERPRINTS = Object.freeze({
+  2: 'ad84514c28ac6762061439579862853249f6c87b613f81b79a20947d5c52d4d5',
+  3: '1707c8971cd41ed0fe3743af381528ff176dc91c2ed398b2e74ffb0d17b5d0bb'
+});
 
 function pragmaInteger(database, pragma) {
   const row = database.prepare(`PRAGMA ${pragma}`).get();
@@ -554,7 +624,7 @@ function verifyMigrationLedger(database, currentVersion) {
   }
 }
 
-function verifySchemaObjects(database) {
+function verifySchemaObjects(database, currentVersion) {
   const rows = database.prepare(`
     SELECT type, name, tbl_name, sql
     FROM sqlite_schema
@@ -562,15 +632,18 @@ function verifySchemaObjects(database) {
     ORDER BY type, name, tbl_name
   `).all();
   const actual = rows.map((row) => `${row.type}:${row.name}:${row.tbl_name}`);
-  if (JSON.stringify(actual) !== JSON.stringify(EXPECTED_SCHEMA_OBJECTS)) {
+  const expectedObjects = currentVersion === 2
+    ? EXPECTED_SCHEMA_OBJECTS_V2
+    : (currentVersion === 3 ? EXPECTED_SCHEMA_OBJECTS_V3 : null);
+  if (expectedObjects === null || JSON.stringify(actual) !== JSON.stringify(expectedObjects)) {
     throw new StorageCorruptionError('The direct-chat schema object set is missing, altered, or extended.');
   }
-  if (checksum(JSON.stringify(rows)) !== EXPECTED_SCHEMA_FINGERPRINT) {
+  if (checksum(JSON.stringify(rows)) !== EXPECTED_SCHEMA_FINGERPRINTS[currentVersion]) {
     throw new StorageCorruptionError('The direct-chat schema definition fingerprint does not match.');
   }
 }
 
-export function applyChatMigrations(database, appliedAt) {
+export function applyChatMigrations(database, appliedAt, { enableVisionAttachments = false } = {}) {
   assertIntegrity(database);
 
   const currentVersion = pragmaInteger(database, 'user_version');
@@ -586,9 +659,23 @@ export function applyChatMigrations(database, appliedAt) {
     throw new StorageCorruptionError('The direct-chat database application identifier is not recognized.');
   }
 
-  if (currentVersion > 0) verifyMigrationLedger(database, currentVersion);
+  if (typeof enableVisionAttachments !== 'boolean') {
+    throw new TypeError('enableVisionAttachments must be boolean');
+  }
+  if (currentVersion > 0) {
+    verifyMigrationLedger(database, currentVersion);
+    if (currentVersion >= 2) verifySchemaObjects(database, currentVersion);
+  }
 
-  for (const migration of CHAT_MIGRATIONS.slice(currentVersion)) {
+  // Disabled deployments deliberately remain on v2 until the feature is
+  // enabled. Once a database reaches v3, this v3-aware build continues
+  // accepting it with vision disabled; a pre-v3 binary is not a rollback
+  // target after first enablement.
+  const targetVersion = enableVisionAttachments || currentVersion >= 3
+    ? LATEST_CHAT_SCHEMA_VERSION
+    : DEFAULT_CHAT_SCHEMA_VERSION;
+
+  for (const migration of CHAT_MIGRATIONS.slice(currentVersion, targetVersion)) {
     database.exec('BEGIN IMMEDIATE');
     try {
       database.exec(migration.sql);
@@ -612,7 +699,8 @@ export function applyChatMigrations(database, appliedAt) {
     }
   }
 
-  verifyMigrationLedger(database, LATEST_CHAT_SCHEMA_VERSION);
-  verifySchemaObjects(database);
+  verifyMigrationLedger(database, targetVersion);
+  verifySchemaObjects(database, targetVersion);
   assertIntegrity(database);
+  return targetVersion;
 }

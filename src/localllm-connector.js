@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 
 import { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from './direct-chat-contract.js';
+import { VISION_MODEL_ALIAS } from './vision-attachment.js';
 
 const MODEL_ALIAS_PATTERN = /^localllm-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MAX_MODELS = 512;
@@ -10,6 +11,8 @@ const MAX_CONTEXT_BYTES = 512 * 1024;
 const MAX_STREAM_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_VISION_ATTACHMENT_BYTES = 4 * 1024 * 1024;
+const MAX_VISION_REQUEST_BYTES = 7 * 1024 * 1024;
 const CONTEXT_SCHEMA = 'lazying.direct-chat.context.v1';
 const DEFAULT_SYSTEM_PROMPT =
   'You are the direct LocalLLM chat assistant. Be accurate, capable, and concise. ' +
@@ -210,6 +213,30 @@ function validateContext(value) {
     throw new TypeError('the current Direct Chat context must end with a user message');
   }
   return Object.freeze(messages);
+}
+
+function validateVisionAttachment(value) {
+  const attachment = exactKeys(value, [
+    'attachmentId', 'messageId', 'mediaType', 'byteLength', 'width', 'height',
+    'contentSha256', 'content'
+  ], [], 'visionAttachment');
+  if (typeof attachment.attachmentId !== 'string' || typeof attachment.messageId !== 'string'
+      || !['image/jpeg', 'image/png'].includes(attachment.mediaType)
+      || !(attachment.content instanceof Uint8Array)
+      || attachment.content.byteLength < 1
+      || attachment.content.byteLength > MAX_VISION_ATTACHMENT_BYTES
+      || attachment.byteLength !== attachment.content.byteLength
+      || !Number.isSafeInteger(attachment.width) || attachment.width < 1 || attachment.width > 4_096
+      || !Number.isSafeInteger(attachment.height) || attachment.height < 1 || attachment.height > 4_096
+      || attachment.width * attachment.height > 16 * 1024 * 1024
+      || typeof attachment.contentSha256 !== 'string'
+      || attachment.contentSha256 !== sha256(attachment.content)) {
+    throw new TypeError('visionAttachment is invalid');
+  }
+  return Object.freeze({
+    mediaType: attachment.mediaType,
+    content: Buffer.from(attachment.content)
+  });
 }
 
 function contentType(response) {
@@ -496,10 +523,20 @@ export function createLocalLlmConnector({
   }
 
   async function generate(input = {}) {
-      const checked = exactKeys(input, ['modelAlias', 'context', 'replay', 'signal'], [], 'generate input');
+      const checked = exactKeys(
+        input,
+        ['modelAlias', 'context', 'replay', 'signal'],
+        ['visionAttachment'],
+        'generate input'
+      );
       const { modelAlias, context, signal } = checked;
       if (!allowed.has(modelAlias)) {
         fail('LOCALLLM_MODEL_REJECTED', 'The requested LocalLLM alias is not enabled.', {
+          failureCode: 'content_rejected'
+        });
+      }
+      if ((checked.visionAttachment !== undefined) !== (modelAlias === VISION_MODEL_ALIAS)) {
+        fail('LOCALLLM_MODEL_REJECTED', 'Vision input must use the fixed LocalLLM vision alias.', {
           failureCode: 'content_rejected'
         });
       }
@@ -512,7 +549,23 @@ export function createLocalLlmConnector({
           { failureCode: 'content_rejected' }
         );
       }
-      const messages = validateContext(context);
+      const messages = [...validateContext(context)];
+      if (checked.visionAttachment !== undefined) {
+        const attachment = validateVisionAttachment(checked.visionAttachment);
+        const last = messages.at(-1);
+        messages[messages.length - 1] = Object.freeze({
+          role: 'user',
+          content: Object.freeze([
+            Object.freeze({
+              type: 'image_url',
+              image_url: Object.freeze({
+                url: `data:${attachment.mediaType};base64,${attachment.content.toString('base64')}`
+              })
+            }),
+            Object.freeze({ type: 'text', text: last.content })
+          ])
+        });
+      }
       const payloadMessages = Object.freeze([
         Object.freeze({ role: 'system', content: fixedSystemPrompt }),
         ...messages
@@ -523,7 +576,9 @@ export function createLocalLlmConnector({
         stream: true,
         stream_options: { include_usage: false }
       });
-      if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) {
+      if (Buffer.byteLength(body, 'utf8') > (checked.visionAttachment === undefined
+        ? 1024 * 1024
+        : MAX_VISION_REQUEST_BYTES)) {
         fail('LOCALLLM_CONTEXT_LIMIT', 'The Direct Chat context exceeds the connector request bound.', {
           failureCode: 'content_rejected'
         });

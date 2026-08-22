@@ -161,7 +161,8 @@ const APP_IDS = [
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
   "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
-  "stop-run", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+  "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
+  "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
 ];
 
 function appDocument({ basePath = "/" } = {}) {

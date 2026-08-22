@@ -19,8 +19,8 @@ boundary, and replaceable-node contract are specified in
 
 - A bright-by-default installable PWA with persistent theme preference,
   browser-password-manager integration, durable thread restoration, resumable
-  streaming, explicit cancellation, Markdown, KaTeX math, and safe declarative
-  plot/table/Markdown rendering.
+  streaming, explicit cancellation, optional single-image Direct Chat input,
+  Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
   admission, owner-safe response projections, and graceful job draining.
@@ -30,7 +30,7 @@ boundary, and replaceable-node contract are specified in
 - `DirectChatStore` for cloud-owned Direct Chat threads and hash-linked message
   ledgers, atomic user-message/generation start, durable fenced dispatch leases,
   exact-once assistant finalization, replayable deltas, cancellation, bounded
-  retention, and compaction snapshots.
+  retention, compaction snapshots, and private immutable vision attachments.
 - `DirectChatContextCoordinator` for bounded LocalLLM context assembly and
   provenance-bound chat compaction. The standalone service uses a deterministic
   local summarizer that performs no model or network call, so compaction cannot
@@ -40,7 +40,8 @@ boundary, and replaceable-node contract are specified in
 - `createLocalLlmConnector()` for a fixed set of LocalLLM model aliases over an
   exact authenticated `127.0.0.1` OpenAI-compatible `/v1` endpoint. It validates
   models and SSE frames, bounds input/output, rejects redirects and partial
-  redispatch, and has no hosted-provider fallback.
+  redispatch, sends canonical images only through the fixed `localllm-vision`
+  alias, and has no hosted-provider fallback.
 - A fail-closed AgInTi BFF transport and cloud-owned stateless adapter. The
   browser can call only the frozen public protocol; the server derives
   identity/session context, validates exact requests and responses, and sends
@@ -137,8 +138,9 @@ owner-only `LoadCredential` files. A secret-free shape is:
   },
   "localLlm": {
     "baseUrl": "http://127.0.0.1:18008/v1",
-    "allowedModelAliases": ["localllm-deep"],
-    "defaultModelAlias": "localllm-deep"
+    "allowedModelAliases": ["localllm-deep", "localllm-vision"],
+    "defaultModelAlias": "localllm-deep",
+    "vision": { "enabled": false }
   },
   "aginti": {
     "enabled": true,
@@ -166,6 +168,14 @@ and omit `credentials.agintiToken` when the Agent transport is intentionally
 absent. Configuring the transport does not claim Agent readiness: capability
 discovery stays fail-closed until AgInTi itself proves its native API, policy,
 sandbox, and current resource admission.
+
+Direct Chat vision remains fail-closed when `localLlm.vision` is absent or
+disabled. Enabling it requires the fixed `localllm-vision` alias while keeping a
+different default text alias. The PWA accepts exactly one JPEG or PNG plus a
+non-empty prompt, redraws it through a browser canvas to remove source metadata,
+and enforces a 4 MiB canonical limit. The server independently validates MIME,
+framing, dimensions, metadata absence, and digest before committing the user
+message, private bytes, and generation atomically.
 
 A minimal storage-only probe is:
 
@@ -213,6 +223,19 @@ caches. Direct Chat starts a user message and its pending generation in one
 transaction. A durable owner digest plus monotonic fence prevents two cloud
 workers from dispatching the same generation concurrently; a stale worker
 cannot append or finalize after losing its lease.
+
+Canonical attachment bytes are durable only in the owner-private Direct Chat
+database. The message ledger and browser API expose a size/dimension/MIME/SHA-256
+descriptor, never the bytes or base64. Authenticated previews are `no-store`
+responses, and image data never enters Cache Storage, localStorage, sessionStorage,
+or IndexedDB. Base64 exists only transiently in the browser's exact in-memory
+retry ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies.
+
+The attachment table is schema v3 and is created only when vision is enabled.
+A v3-aware build can reopen the database with vision disabled and will refuse
+new image turns, but a pre-v3 binary cannot reopen a database after this
+migration. Take a private database backup or retain a v3-aware rollback build
+before first enablement.
 
 The production server is designed to bind on loopback behind Caddy. It trusts
 the configured public authority/client-address headers only from that local

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { CLOUD_CSRF_COOKIE_NAME } from "../src/web/cloud-session-client.js";
@@ -8,6 +9,7 @@ import {
   DirectChatProtocolError,
   DirectChatTransportError,
 } from "../src/web/direct-chat-client.js";
+import { createPwaIcon } from "../src/web/pwa-assets.js";
 
 const CSRF = "csrf_token_abcdefghijklmnopqrstuvwxyz0123456789";
 const NOW = "2026-08-20T08:00:00.000Z";
@@ -196,6 +198,147 @@ test("prepared create/start requests carry browser IDs and remain byte-identical
     assert.equal(options.headers.get("authorization"), null);
     assert.equal(options.headers.get("x-lazyedge-principal-id"), null);
   }
+});
+
+test("vision capabilities, canonical image retries, and authenticated previews stay exact and bounded", async () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const calls = [];
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith(DIRECT_CHAT_ROUTES.capabilities)) {
+        return jsonResponse({
+          visionInput: true,
+          visionMediaTypes: ["image/jpeg", "image/png"],
+          maximumImageBytes: 4 * 1024 * 1024,
+        });
+      }
+      if (url.endsWith(DIRECT_CHAT_ROUTES.attachmentsGet)) {
+        return new Response(bytes, {
+          headers: {
+            "content-type": "image/png",
+            "content-length": String(bytes.byteLength),
+            "cache-control": "no-store",
+          },
+        });
+      }
+      const body = JSON.parse(options.body);
+      return jsonResponse({ generation: publicGeneration({
+        threadId: body.threadId,
+        generationId: body.generationId,
+        assistantMessageId: body.assistantMessageId,
+        modelAlias: "localllm-vision",
+      }) }, { status: 202 });
+    },
+  }));
+
+  assert.deepEqual(await client.capabilities(), {
+    visionInput: true,
+    visionMediaTypes: ["image/jpeg", "image/png"],
+    maximumImageBytes: 4 * 1024 * 1024,
+  });
+  const request = client.prepareRun({
+    threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+    content: "Describe this image.",
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: "image_0000000000000001",
+      mediaType: "image/png",
+      byteLength: bytes.byteLength,
+      width: 192,
+      height: 192,
+      bytes,
+    },
+  });
+  await client.startRun(request);
+  await client.retryRun(request);
+  assert.equal(calls[1].options.body, calls[2].options.body);
+  assert.equal(calls[1].options.headers.get("idempotency-key"), calls[2].options.headers.get("idempotency-key"));
+  const runBody = JSON.parse(calls[1].options.body);
+  assert.deepEqual(runBody.attachment, {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/png",
+    data: bytes.toString("base64"),
+  });
+  assert.equal(Object.hasOwn(runBody.attachment, "bytes"), false);
+  assert.equal(Object.hasOwn(runBody.attachment, "sha256"), false);
+
+  const descriptor = {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    sha256: digest,
+  };
+  const preview = await client.getAttachment({
+    threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+    attachment: descriptor,
+  });
+  assert.deepEqual(preview.descriptor, descriptor);
+  assert.deepEqual(Buffer.from(preview.bytes), bytes);
+  assert.deepEqual(JSON.parse(calls[3].options.body), {
+    threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+    attachmentId: "image_0000000000000001",
+  });
+  assert.equal(calls[3].options.cache, "no-store");
+  assert.equal(calls[3].options.headers.get("x-csrf-token"), CSRF);
+});
+
+test("attachment previews reject dishonest metadata, digest changes, and oversized streams", async () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  const descriptor = {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  let responseBytes = Buffer.from(bytes);
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => new Response(responseBytes, {
+      headers: { "content-type": "image/png", "cache-control": "no-store" },
+    }),
+  }));
+  responseBytes[responseBytes.byteLength - 1] ^= 1;
+  await assert.rejects(
+    () => client.getAttachment({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      attachment: descriptor,
+    }),
+    /digest/u,
+  );
+  await assert.rejects(
+    () => client.getAttachment({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      attachment: { ...descriptor, width: 9_999 },
+    }),
+    /width|descriptor/u,
+  );
+
+  let pulls = 0;
+  let cancelled = false;
+  const oversized = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(256 * 1024));
+      },
+      cancel() { cancelled = true; },
+    }), { headers: { "content-type": "image/png", "cache-control": "no-store" } }),
+  }));
+  await assert.rejects(
+    () => oversized.getAttachment({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      attachment: { ...descriptor, byteLength: 4 * 1024 * 1024 },
+    }),
+    /size limit/u,
+  );
+  assert.equal(cancelled, true);
+  assert.ok(pulls <= 18, `oversized preview pulled ${pulls} chunks`);
 });
 
 test("read routes validate public owner-free thread and message envelopes", async () => {

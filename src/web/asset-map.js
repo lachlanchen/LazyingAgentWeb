@@ -21,7 +21,7 @@ import {
 } from "./pwa-assets.js";
 
 export const AGENT_WEB_ESM_LEXER_VERSION = "2.3.1";
-export const STANDALONE_ROOT_CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; worker-src 'self'";
+export const STANDALONE_ROOT_CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; font-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; worker-src 'self'";
 export const STANDALONE_SHELL_SECURITY_HEADERS = Object.freeze({
   "x-content-type-options": "nosniff",
   "referrer-policy": "same-origin",
@@ -51,6 +51,7 @@ const LOCAL_MODULES = Object.freeze({
   "/assets/browser-app.js": new URL("./browser-app.js", import.meta.url),
   "/assets/cloud-session-client.js": new URL("./cloud-session-client.js", import.meta.url),
   "/assets/direct-chat-client.js": new URL("./direct-chat-client.js", import.meta.url),
+  "/assets/vision-image-client.js": new URL("./vision-image-client.js", import.meta.url),
   "/assets/aginti-client.js": new URL("./aginti-client.js", import.meta.url),
   "/assets/aginti-protocol.js": new URL("./aginti-protocol.js", import.meta.url),
   "/assets/presentation-state.js": new URL("./presentation-state.js", import.meta.url),

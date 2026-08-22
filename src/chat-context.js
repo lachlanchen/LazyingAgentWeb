@@ -97,6 +97,7 @@ function exactMessage(message, accountId, threadId, expectedRevision, previousHa
   }
   let messageId;
   let generationId;
+  let attachment;
   try {
     if (message.accountId !== accountId || message.threadId !== threadId) {
       throw new ValidationError('The message owner does not match the requested ledger.');
@@ -110,6 +111,25 @@ function exactMessage(message, accountId, threadId, expectedRevision, previousHa
       generationId = null;
     } else {
       generationId = assertIdentifier(message.generationId, 'message.generationId');
+    }
+    if (message.attachment !== undefined) {
+      if (message.role !== 'user') throw new ValidationError('An assistant message has a vision attachment.');
+      assertExactKeys(message.attachment, {
+        required: ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256']
+      }, 'message.attachment');
+      if (!['image/jpeg', 'image/png'].includes(message.attachment.mediaType)
+          || !Number.isSafeInteger(message.attachment.byteLength)
+          || message.attachment.byteLength < 1 || message.attachment.byteLength > 4 * 1024 * 1024
+          || !Number.isSafeInteger(message.attachment.width) || message.attachment.width < 1
+          || message.attachment.width > 4_096
+          || !Number.isSafeInteger(message.attachment.height) || message.attachment.height < 1
+          || message.attachment.height > 4_096
+          || message.attachment.width * message.attachment.height > 16 * 1024 * 1024
+          || typeof message.attachment.sha256 !== 'string'
+          || !HASH_PATTERN.test(message.attachment.sha256)) {
+        throw new ValidationError('message.attachment is invalid.');
+      }
+      attachment = Object.freeze({ ...message.attachment });
     }
     assertScalarString(message.content, 'message.content', { maxBytes: 64 * 1024 });
   } catch (error) {
@@ -135,7 +155,8 @@ function exactMessage(message, accountId, threadId, expectedRevision, previousHa
     contentBytes,
     previousHash,
     generationId,
-    createdAt: message.createdAt
+    createdAt: message.createdAt,
+    ...(attachment === undefined ? {} : { attachment })
   }));
   if (calculatedHash !== message.messageHash) {
     throw new StorageCorruptionError('The direct-chat context ledger hash chain is inconsistent.');

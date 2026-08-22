@@ -27,6 +27,7 @@ import {
   validateTransportAgentRequest
 } from './http-contract.js';
 import { ControlPlaneError } from './errors.js';
+import { VISION_MODEL_ALIAS } from './vision-attachment.js';
 import {
   AGINTI_RPC_PATHS,
   FAIL_CLOSED_AGENT_CAPABILITIES,
@@ -372,7 +373,20 @@ function publicThread(value, accountId) {
 }
 
 function publicMessage(value, accountId) {
-  return publicOwnedRecord(value, accountId, PUBLIC_MESSAGE_FIELDS, 'chat message');
+  const message = publicOwnedRecord(value, accountId, PUBLIC_MESSAGE_FIELDS, 'chat message');
+  if (value.attachment === undefined) return message;
+  const attachment = value.attachment;
+  if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) {
+    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(attachment);
+  const expected = ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256'];
+  if (Reflect.ownKeys(descriptors).length !== expected.length
+      || expected.some((field) => !descriptors[field]?.enumerable
+        || !Object.hasOwn(descriptors[field], 'value'))) {
+    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+  }
+  return Object.freeze({ ...message, attachment: Object.freeze({ ...attachment }) });
 }
 
 function publicGeneration(value, accountId) {
@@ -796,6 +810,8 @@ export function createCloudRequestHandler({
   directChatStore,
   directChatContext,
   directChatConnector,
+  visionEnabled = false,
+  visionModelAlias = VISION_MODEL_ALIAS,
   agintiAdapter,
   clock = () => new Date(),
   limits: limitOverrides = {}
@@ -813,11 +829,16 @@ export function createCloudRequestHandler({
     'createThread', 'getThread', 'listThreads', 'startTurn',
     'appendGenerationDelta', 'finalizeGeneration', 'cancelGeneration', 'failGeneration',
     'getGeneration', 'replayGeneration', 'listMessages',
+    'getVisionAttachment', 'getLatestVisionAttachment',
     'claimGenerationLease', 'markGenerationDispatchStarted', 'renewGenerationLease',
     'releaseGenerationLease', 'getGenerationLease'
   ]);
   if (directChatConnector !== undefined && directChatConnector !== null && typeof directChatConnector.generate !== 'function') {
     throw new TypeError('directChatConnector must provide generate()');
+  }
+  if (typeof visionEnabled !== 'boolean' || typeof visionModelAlias !== 'string'
+      || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(visionModelAlias)) {
+    throw new TypeError('Direct Chat vision configuration is invalid');
   }
   const contextCoordinator = directChatContext === undefined || directChatContext === null
     ? null
@@ -1029,6 +1050,16 @@ export function createCloudRequestHandler({
           sourceHash: persisted.generation.sourceHash,
           ...(preparation === undefined ? {} : { preparation })
         });
+        const visionAttachment = chat.getLatestVisionAttachment({
+          accountId,
+          threadId,
+          sourceRevision: persisted.generation.sourceRevision
+        });
+        if ((persisted.generation.modelAlias === visionModelAlias) !== (visionAttachment !== null)) {
+          const error = new Error('persisted vision inference authority is inconsistent');
+          error.failureCode = 'content_rejected';
+          throw error;
+        }
         while (true) {
           if (controller.signal.aborted) throw controller.signal.reason;
           const marker = chat.markGenerationDispatchStarted({
@@ -1047,8 +1078,20 @@ export function createCloudRequestHandler({
           await delay(GLOBAL_DISPATCH_RETRY_MS, controller.signal);
         }
         const output = await valueWithAbort(directChatConnector.generate({
-          modelAlias: thread.modelAlias,
+          modelAlias: persisted.generation.modelAlias,
           context: context.payload,
+          ...(visionAttachment === null ? {} : {
+            visionAttachment: Object.freeze({
+              attachmentId: visionAttachment.attachmentId,
+              messageId: visionAttachment.messageId,
+              mediaType: visionAttachment.mediaType,
+              byteLength: visionAttachment.byteLength,
+              width: visionAttachment.width,
+              height: visionAttachment.height,
+              contentSha256: visionAttachment.contentSha256,
+              content: visionAttachment.content
+            })
+          }),
           replay: Object.freeze({
             deltaCount: persisted.generation.deltaCount,
             lastDeltaHash: persisted.generation.lastDeltaHash
@@ -1144,10 +1187,23 @@ export function createCloudRequestHandler({
 
   async function handleChat(req, res, route, body, session, requestSignal) {
     const accountId = configuredAccount.principalId;
+    if (route.pathname === CLOUD_ROUTES.chatRunsStart && !visionEnabled
+        && body !== null && typeof body === 'object' && !Array.isArray(body)
+        && Object.hasOwn(body, 'attachment')) {
+      throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
+    }
     const input = validateChatRequest(route.pathname, body);
     const idempotencyKey = routeRequiresIdempotency(route.pathname)
       ? requestIdempotency(req)
       : undefined;
+    if (route.pathname === CLOUD_ROUTES.chatCapabilities) {
+      sendJson(req, res, 200, {
+        visionInput: visionEnabled,
+        visionMediaTypes: visionEnabled ? ['image/jpeg', 'image/png'] : [],
+        maximumImageBytes: visionEnabled ? 4 * 1024 * 1024 : 0
+      });
+      return;
+    }
     if (route.pathname === CLOUD_ROUTES.chatThreadsList) {
       const threads = chat.listThreads({ accountId, limit: input.limit })
         .map((thread) => publicThread(thread, accountId));
@@ -1172,9 +1228,30 @@ export function createCloudRequestHandler({
       sendJson(req, res, 200, { messages: messages.map((message) => publicMessage(message, accountId)) });
       return;
     }
+    if (route.pathname === CLOUD_ROUTES.chatAttachmentsGet) {
+      const attachment = chat.getVisionAttachment({ accountId, ...input });
+      if (!attachment) throw new CloudHttpError(404, 'not_found', 'The chat attachment does not exist.');
+      sendBuffer(req, res, 200, attachment.content, dynamicHeaders({
+        'content-type': attachment.mediaType,
+        'content-disposition': 'inline',
+        'x-content-type-options': 'nosniff'
+      }));
+      return;
+    }
     if (route.pathname === CLOUD_ROUTES.chatRunsStart) {
       if (!directChatConnector) throw new CloudHttpError(503, 'localllm_unavailable', 'Direct LocalLLM chat is unavailable.');
       const existing = chat.getGeneration({ accountId, threadId: input.threadId, generationId: input.generationId });
+      if (!existing && input.attachment !== undefined && !visionEnabled) {
+        throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
+      }
+      if (!existing && !visionEnabled && input.expectedRevision > 0
+          && chat.getLatestVisionAttachment({
+            accountId,
+            threadId: input.threadId,
+            sourceRevision: input.expectedRevision
+          }) !== null) {
+        throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
+      }
       if (!existing && jobs.size >= limits.directChatJobs) {
         throw new CloudHttpError(503, 'chat_busy', 'Direct chat is temporarily busy.', { retryAfter: 2 });
       }
@@ -1195,7 +1272,8 @@ export function createCloudRequestHandler({
         assistantMessageId: input.assistantMessageId,
         expectedRevision: input.expectedRevision,
         expectedHash: input.expectedHash,
-        idempotencyKey
+        idempotencyKey,
+        ...(input.attachment === undefined ? {} : { attachment: input.attachment })
       });
       const { generation } = turn;
       if (generation.status === 'in_progress' && !scheduleGeneration(
@@ -1399,7 +1477,7 @@ export function createCloudRequestHandler({
           'content-type': asset.contentType,
           'cache-control': cacheControl,
           ...(route.target === '/' ? {
-            'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; worker-src 'self'"
+            'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; font-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; worker-src 'self'"
           } : {}),
           ...(route.target === '/sw.js' ? { pragma: 'no-cache', expires: '0', 'service-worker-allowed': '/' } : {})
         });
@@ -1418,7 +1496,10 @@ export function createCloudRequestHandler({
         : clientAddress;
       releaseBody = bodyGate.enter(admissionKey);
       if (!releaseBody) throw new CloudHttpError(503, 'request_busy', 'The request service is temporarily busy.', { retryAfter: 1 });
-      const body = await readJsonBody(req, bodyLimitForRoute(route.pathname), limits.bodyTimeoutMs);
+      const maximumBodyBytes = route.pathname === CLOUD_ROUTES.chatRunsStart && !visionEnabled
+        ? CLOUD_HTTP_LIMITS.chatBodyBytes
+        : bodyLimitForRoute(route.pathname);
+      const body = await readJsonBody(req, maximumBodyBytes, limits.bodyTimeoutMs);
       releaseBody();
       releaseBody = null;
       const streamRoute = route.pathname === CLOUD_ROUTES.chatRunsEvents

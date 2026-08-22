@@ -9,6 +9,8 @@ const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const JSON_RESPONSE_LIMIT = 512 * 1024;
 const ERROR_RESPONSE_LIMIT = 16 * 1024;
 const STREAM_RESPONSE_LIMIT = 256 * 1024;
+const VISION_IMAGE_LIMIT = 4 * 1024 * 1024;
+const VISION_BASE64_LIMIT = Math.ceil(VISION_IMAGE_LIMIT / 3) * 4;
 const SSE_BLOCK_LIMIT = 32 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STREAM_TIMEOUT_MS = 45_000;
@@ -29,10 +31,12 @@ const FAILURE_CODES = new Set([
 const encoder = new TextEncoder();
 
 export const DIRECT_CHAT_ROUTES = Object.freeze({
+  capabilities: "/api/chat/capabilities",
   threadsList: "/api/chat/threads/list",
   threadsCreate: "/api/chat/threads/create",
   threadsGet: "/api/chat/threads/get",
   messagesList: "/api/chat/messages/list",
+  attachmentsGet: "/api/chat/attachments/get",
   runsStart: "/api/chat/runs/start",
   runsStatus: "/api/chat/runs/status",
   runsEvents: "/api/chat/runs/events",
@@ -222,7 +226,7 @@ function responseThread(value, expectedThreadId) {
 function responseMessage(value, expectedThreadId) {
   const message = exactObject(value, [
     "threadId", "messageId", "revision", "role", "content", "contentBytes", "previousHash",
-    "messageHash", "generationId", "createdAt",
+    "messageHash", "generationId", "createdAt", "attachment",
   ], [
     "threadId", "messageId", "revision", "role", "content", "contentBytes", "previousHash",
     "messageHash", "generationId", "createdAt",
@@ -245,6 +249,29 @@ function responseMessage(value, expectedThreadId) {
   if ((message.role === "user" && generationId !== null) || (message.role === "assistant" && generationId === null)) {
     throw new DirectChatProtocolError("message generation ownership is inconsistent");
   }
+  let attachment;
+  if (message.attachment !== undefined) {
+    const descriptor = exactObject(message.attachment, [
+      "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
+    ], [
+      "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
+    ], "message.attachment");
+    if (!['image/jpeg', 'image/png'].includes(descriptor.mediaType)
+        || typeof descriptor.sha256 !== "string" || !HASH.test(descriptor.sha256)) {
+      throw new DirectChatProtocolError("message attachment descriptor is invalid");
+    }
+    attachment = Object.freeze({
+      attachmentId: identifier(descriptor.attachmentId, "message.attachment.attachmentId"),
+      mediaType: descriptor.mediaType,
+      byteLength: integer(descriptor.byteLength, "message.attachment.byteLength", { minimum: 1, maximum: VISION_IMAGE_LIMIT }),
+      width: integer(descriptor.width, "message.attachment.width", { minimum: 1, maximum: 4_096 }),
+      height: integer(descriptor.height, "message.attachment.height", { minimum: 1, maximum: 4_096 }),
+      sha256: descriptor.sha256,
+    });
+    if (attachment.width * attachment.height > 16 * 1024 * 1024 || message.role !== "user") {
+      throw new DirectChatProtocolError("message attachment descriptor is invalid");
+    }
+  }
   return Object.freeze({
     threadId,
     messageId: identifier(message.messageId, "message.messageId"),
@@ -256,6 +283,64 @@ function responseMessage(value, expectedThreadId) {
     messageHash: hash(message.messageHash, "message.messageHash"),
     generationId,
     createdAt: timestamp(message.createdAt, "message.createdAt"),
+    ...(attachment === undefined ? {} : { attachment }),
+  });
+}
+
+function requestAttachment(value) {
+  const attachment = exactObject(value, ["attachmentId", "mediaType", "data"], [
+    "attachmentId", "mediaType", "data",
+  ], "prepared run attachment", { input: true });
+  if (!['image/jpeg', 'image/png'].includes(attachment.mediaType)
+      || typeof attachment.data !== "string" || attachment.data.length < 4
+      || attachment.data.length > VISION_BASE64_LIMIT || attachment.data.length % 4 !== 0
+      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(attachment.data)) {
+    throw new TypeError("prepared run attachment is invalid");
+  }
+  return Object.freeze({
+    attachmentId: identifier(attachment.attachmentId, "attachmentId", { input: true, opaque: true }),
+    mediaType: attachment.mediaType,
+    data: attachment.data,
+  });
+}
+
+function bytesToBase64(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > VISION_IMAGE_LIMIT) {
+    throw new TypeError("attachment bytes are invalid");
+  }
+  const chunks = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += 32 * 1024) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32 * 1024)));
+  }
+  return btoa(chunks.join(""));
+}
+
+async function sha256Bytes(bytes) {
+  if (typeof globalThis.crypto?.subtle?.digest !== "function") {
+    throw new DirectChatProtocolError("secure attachment verification is unavailable");
+  }
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function canonicalAttachment(value) {
+  const attachment = exactObject(value, [
+    "attachmentId", "mediaType", "byteLength", "width", "height", "bytes",
+  ], [
+    "attachmentId", "mediaType", "byteLength", "width", "height", "bytes",
+  ], "canonical image attachment", { input: true });
+  if (!['image/jpeg', 'image/png'].includes(attachment.mediaType)
+      || !(attachment.bytes instanceof Uint8Array)
+      || attachment.byteLength !== attachment.bytes.byteLength
+      || !Number.isSafeInteger(attachment.width) || attachment.width < 1 || attachment.width > 4_096
+      || !Number.isSafeInteger(attachment.height) || attachment.height < 1 || attachment.height > 4_096
+      || attachment.width * attachment.height > 16 * 1024 * 1024) {
+    throw new TypeError("canonical image attachment is invalid");
+  }
+  return requestAttachment({
+    attachmentId: attachment.attachmentId,
+    mediaType: attachment.mediaType,
+    data: bytesToBase64(attachment.bytes),
   });
 }
 
@@ -389,7 +474,7 @@ function threadTicket(value) {
 function runTicket(value) {
   const request = exactObject(value, [
     "threadId", "messageId", "generationId", "assistantMessageId", "content",
-    "expectedRevision", "expectedHash", "idempotencyKey",
+    "expectedRevision", "expectedHash", "idempotencyKey", "attachment",
   ], [
     "threadId", "messageId", "generationId", "assistantMessageId", "content",
     "expectedRevision", "expectedHash", "idempotencyKey",
@@ -408,6 +493,7 @@ function runTicket(value) {
     expectedRevision,
     expectedHash: request.expectedHash,
     idempotencyKey: idempotencyKey(request.idempotencyKey, { input: true }),
+    ...(request.attachment === undefined ? {} : { attachment: requestAttachment(request.attachment) }),
   };
   if (!result.content) throw new TypeError("content must contain non-whitespace text");
   if (new Set([result.messageId, result.generationId, result.assistantMessageId]).size !== 3) {
@@ -496,6 +582,51 @@ async function readBoundedText(response, maximum) {
     if (error instanceof DirectChatProtocolError) throw error;
     throw new DirectChatProtocolError("Direct Chat response is not valid UTF-8");
   } finally {
+    reader.releaseLock?.();
+  }
+}
+
+async function readBoundedBytes(response, maximum) {
+  const advertised = response.headers?.get?.("content-length");
+  if (advertised !== null && advertised !== undefined
+      && (!/^\d+$/u.test(advertised) || Number(advertised) < 1 || Number(advertised) > maximum)) {
+    throw new DirectChatProtocolError("Direct Chat attachment exceeded its size limit");
+  }
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength < 1 || bytes.byteLength > maximum) {
+      throw new DirectChatProtocolError("Direct Chat attachment exceeded its size limit");
+    }
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
+      if (!(value instanceof Uint8Array)) throw new DirectChatProtocolError("Direct Chat attachment returned a non-byte chunk");
+      size += value.byteLength;
+      if (size > maximum) throw new DirectChatProtocolError("Direct Chat attachment exceeded its size limit");
+      chunks.push(value);
+    }
+    if (size < 1) throw new DirectChatProtocolError("Direct Chat attachment is empty");
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  } finally {
+    if (!completed) {
+      try { await reader.cancel(); } catch { /* The validation failure is authoritative. */ }
+    }
     reader.releaseLock?.();
   }
 }
@@ -716,6 +847,34 @@ export class DirectChatBrowserClient {
     }
   }
 
+  async #postAttachment(body, expected, { signal } = {}) {
+    const endpoint = `${this.baseOrigin}${DIRECT_CHAT_ROUTES.attachmentsGet}`;
+    const deadline = timeoutSignal(signal, this.timeoutMs);
+    try {
+      const response = requireResponse(await this.fetch(endpoint, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        referrerPolicy: "same-origin",
+        headers: requestHeaders(this.#csrf()),
+        body: JSON.stringify(body),
+        signal: deadline.signal,
+      }));
+      if (!responseMatchesRoute(response, endpoint)) throw new DirectChatProtocolError("Direct Chat attachment came from an unexpected URL");
+      requireNoStore(response);
+      if (response.status !== 200) throw await responseFailure(response);
+      if (mediaType(response) !== expected.mediaType) throw new DirectChatProtocolError("Direct Chat attachment content type is invalid");
+      const bytes = await readBoundedBytes(response, VISION_IMAGE_LIMIT);
+      if (bytes.byteLength !== expected.byteLength) throw new DirectChatProtocolError("Direct Chat attachment size is inconsistent");
+      return bytes;
+    } catch (error) {
+      throw transportFailure(error, deadline.signal);
+    } finally {
+      deadline.dispose();
+    }
+  }
+
   prepareThread(value = {}) {
     const request = exactObject(value, ["title"], [], "new thread", { input: true });
     const title = request.title ?? "";
@@ -723,6 +882,31 @@ export class DirectChatBrowserClient {
       threadId: generated(this.makeOpaqueId, "chat"),
       title: unicodeScalar(title, "title", { maximum: 512, controls: false, input: true }),
       idempotencyKey: generated(this.makeOpaqueId, "thread_create", { idempotency: true }),
+    });
+  }
+
+  async capabilities(value = {}) {
+    const request = exactObject(value, ["signal"], [], "chat capabilities request", { input: true });
+    const response = exactObject(await this.#post(DIRECT_CHAT_ROUTES.capabilities, {}, {
+      signal: request.signal,
+    }), ["visionInput", "visionMediaTypes", "maximumImageBytes"], [
+      "visionInput", "visionMediaTypes", "maximumImageBytes",
+    ], "chat capabilities response");
+    if (typeof response.visionInput !== "boolean" || !Array.isArray(response.visionMediaTypes)
+        || Object.getPrototypeOf(response.visionMediaTypes) !== Array.prototype
+        || response.visionMediaTypes.some((type) => !['image/jpeg', 'image/png'].includes(type))
+        || new Set(response.visionMediaTypes).size !== response.visionMediaTypes.length
+        || !Number.isSafeInteger(response.maximumImageBytes)
+        || (response.visionInput
+          ? response.maximumImageBytes !== VISION_IMAGE_LIMIT
+            || response.visionMediaTypes.join(',') !== 'image/jpeg,image/png'
+          : response.maximumImageBytes !== 0 || response.visionMediaTypes.length !== 0)) {
+      throw new DirectChatProtocolError("chat capabilities response is invalid");
+    }
+    return Object.freeze({
+      visionInput: response.visionInput,
+      visionMediaTypes: Object.freeze([...response.visionMediaTypes]),
+      maximumImageBytes: response.maximumImageBytes,
     });
   }
 
@@ -796,10 +980,45 @@ export class DirectChatBrowserClient {
     return Object.freeze({ messages: Object.freeze(messages) });
   }
 
+  async getAttachment(value = {}) {
+    const request = exactObject(value, ["threadId", "attachment", "signal"], [
+      "threadId", "attachment",
+    ], "attachment request", { input: true });
+    const threadId = identifier(request.threadId, "threadId", { input: true });
+    const descriptor = exactObject(request.attachment, [
+      "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
+    ], [
+      "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
+    ], "attachment descriptor", { input: true });
+    const normalized = {
+      attachmentId: identifier(descriptor.attachmentId, "attachmentId", { input: true }),
+      mediaType: descriptor.mediaType,
+      byteLength: integer(descriptor.byteLength, "byteLength", { minimum: 1, maximum: VISION_IMAGE_LIMIT, input: true }),
+      width: integer(descriptor.width, "width", { minimum: 1, maximum: 4_096, input: true }),
+      height: integer(descriptor.height, "height", { minimum: 1, maximum: 4_096, input: true }),
+      sha256: descriptor.sha256,
+    };
+    if (!['image/jpeg', 'image/png'].includes(normalized.mediaType)
+        || normalized.width * normalized.height > 16 * 1024 * 1024
+        || typeof normalized.sha256 !== "string" || !HASH.test(normalized.sha256)) {
+      throw new TypeError("attachment descriptor is invalid");
+    }
+    const bytes = await this.#postAttachment({ threadId, attachmentId: normalized.attachmentId }, normalized, {
+      signal: request.signal,
+    });
+    if (await sha256Bytes(bytes) !== normalized.sha256) {
+      throw new DirectChatProtocolError("Direct Chat attachment digest is inconsistent");
+    }
+    return Object.freeze({
+      descriptor: Object.freeze(normalized),
+      bytes,
+    });
+  }
+
   prepareRun(value = {}) {
     const request = exactObject(
       value,
-      ["threadId", "content", "expectedRevision", "expectedHash"],
+      ["threadId", "content", "expectedRevision", "expectedHash", "attachment"],
       ["threadId", "content", "expectedRevision", "expectedHash"],
       "new run",
       { input: true },
@@ -817,6 +1036,7 @@ export class DirectChatBrowserClient {
       content,
       expectedRevision,
       expectedHash,
+      ...(request.attachment === undefined ? {} : { attachment: canonicalAttachment(request.attachment) }),
       idempotencyKey: generated(this.makeOpaqueId, "run_start", { idempotency: true }),
     });
   }

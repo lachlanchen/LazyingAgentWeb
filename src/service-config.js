@@ -10,6 +10,8 @@ import {
 import { isAbsolute, join, resolve } from 'node:path';
 import { TextDecoder } from 'node:util';
 
+import { VISION_MODEL_ALIAS } from './vision-attachment.js';
+
 const SERVICE_SCHEMA = 'lazying-agent-service/v1';
 const CREDENTIAL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/u;
 const SYSTEMD_UNIT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/u;
@@ -393,7 +395,7 @@ function validateConfig(value) {
   const localLlm = plainObject(
     root.localLlm,
     ['baseUrl', 'allowedModelAliases', 'defaultModelAlias'],
-    [],
+    ['vision'],
     'localLlm'
   );
   const aliases = modelAliases(localLlm.allowedModelAliases);
@@ -403,6 +405,15 @@ function validateConfig(value) {
   });
   if (!aliases.includes(defaultModelAlias)) {
     throw new TypeError('localLlm.defaultModelAlias must be in allowedModelAliases');
+  }
+  const visionInput = localLlm.vision ?? { enabled: false };
+  const vision = plainObject(visionInput, ['enabled'], [], 'localLlm.vision');
+  if (typeof vision.enabled !== 'boolean') throw new TypeError('localLlm.vision.enabled must be boolean');
+  if (vision.enabled && !aliases.includes(VISION_MODEL_ALIAS)) {
+    throw new TypeError(`localLlm.allowedModelAliases must include ${VISION_MODEL_ALIAS} when vision is enabled`);
+  }
+  if (vision.enabled && defaultModelAlias === VISION_MODEL_ALIAS) {
+    throw new TypeError('localLlm.defaultModelAlias must remain the text alias when vision is enabled');
   }
 
   const aginti = plainObject(root.aginti, ['enabled'], ['baseUrl'], 'aginti');
@@ -452,7 +463,8 @@ function validateConfig(value) {
     localLlm: {
       baseUrl: localLlmBaseUrl(localLlm.baseUrl),
       allowedModelAliases: aliases,
-      defaultModelAlias
+      defaultModelAlias,
+      vision: { enabled: vision.enabled, modelAlias: VISION_MODEL_ALIAS }
     },
     aginti: {
       enabled: aginti.enabled,

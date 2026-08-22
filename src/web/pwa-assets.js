@@ -318,6 +318,9 @@ export function createServiceWorkerSource({
     + `});\n\n`
     + `self.addEventListener("message", (event) => {\n`
     + `  if (event.data && event.data.type === "SKIP_WAITING") self.skipWaiting();\n`
+    + `  if (event.data && event.data.type === "GET_LAZYING_AGENT_RELEASE" && event.source && typeof event.source.postMessage === "function") {\n`
+    + `    event.source.postMessage({ type: "LAZYING_AGENT_RELEASE", releaseId: VERSION });\n`
+    + `  }\n`
     + `});\n\n`
     + `async function cacheRecord(name) {\n`
     + `  if (!name.startsWith(CACHE_SCOPE_PREFIX)) return null;\n`
@@ -398,6 +401,7 @@ export function createAppShellHtml({
   <link rel="stylesheet" href="${base}${versionedAgentWebAsset("/assets/app.css", version)}">
 </head>
 <body>
+  <div id="update-banner" class="notice update-notice" role="status" hidden>A safe app update is ready. <button id="apply-update" type="button">Update</button> <button id="defer-update" type="button">Later</button></div>
   <main id="login-view" class="login-view" aria-labelledby="login-title">
     <form id="login-form" class="login-card" method="post" action="${safeLoginPath}" autocomplete="on" aria-busy="true">
       <p class="eyebrow">Private cloud workspace</p>
@@ -445,7 +449,6 @@ export function createAppShellHtml({
       </header>
 
       <div id="offline-banner" class="notice" role="status" hidden>You are offline. Messages stay in the composer until the connection returns.</div>
-      <div id="update-banner" class="notice" role="status" hidden>A safe app update is ready. <button id="apply-update" type="button">Update</button> <button id="defer-update" type="button">Later</button></div>
       <div id="context-indicator" class="context-indicator" data-testid="context-compaction" hidden><span id="context-indicator-text"></span></div>
 
       <div id="chat-scroll" class="chat-scroll">
@@ -564,6 +567,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .theme-label { display: flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .8rem; }
 .theme-label select { padding: .42rem; }
 .notice, .context-indicator { margin: .65rem 1rem 0; padding: .65rem .8rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); color: var(--muted); }
+.update-notice { position: fixed; z-index: 10; top: max(.4rem, env(safe-area-inset-top)); left: 50%; width: min(calc(100% - 1rem), 620px); margin: 0; transform: translateX(-50%); box-shadow: var(--shadow); }
 .chat-scroll { overflow-y: auto; padding: clamp(1rem, 4vw, 3rem) max(1rem, calc((100% - 850px) / 2)); }
 .welcome { margin: 11vh auto 2rem; max-width: 680px; text-align: center; }
 .welcome p:last-child { color: var(--muted); }

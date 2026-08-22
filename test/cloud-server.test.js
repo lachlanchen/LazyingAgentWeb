@@ -349,6 +349,10 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   assert.equal(root.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
   assert.equal(rootHead.headers.get('content-length'), root.headers.get('content-length'));
   assert.equal(await rootHead.text(), '');
+  const versionedRoot = await fetch(`${baseUrl}/?v=${RELEASE_ID}`, { headers: publicBoundary(baseUrl) });
+  assert.equal(versionedRoot.status, 200);
+  assert.equal(versionedRoot.headers.get('cache-control'), 'no-store');
+  assert.equal(await versionedRoot.text(), await root.clone().text());
 
   const worker = await fetch(`${baseUrl}/sw.js`, { headers: publicBoundary(baseUrl) });
   const workerHead = await fetch(`${baseUrl}/sw.js`, { method: 'HEAD', headers: publicBoundary(baseUrl) });
@@ -408,6 +412,8 @@ test('rejects non-exact routes, encoded paths, dynamic queries, and authority by
   const method = await fetch(`${baseUrl}/api/chat/threads/list`, { headers: publicBoundary(baseUrl) });
   assert.equal(method.status, 405);
   assert.equal(method.headers.get('allow'), 'POST');
+  const wrongRootVersion = await fetch(`${baseUrl}/?v=release-wrong`, { headers: publicBoundary(baseUrl) });
+  assert.equal(wrongRootVersion.status, 400);
 });
 
 test('requires exact public authority and one loopback-Caddy client-address assertion', async (t) => {

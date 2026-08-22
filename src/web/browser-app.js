@@ -144,6 +144,10 @@ function metaContent(document, name) {
   } catch { return undefined; }
 }
 
+function validAgentRelease(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._~-]{0,95}$/u.test(value);
+}
+
 function safeRunStatus(value) {
   return ["starting", "running", "completed", "failed", "cancelled"].includes(value) ? value : "running";
 }
@@ -294,6 +298,7 @@ export function createBrowserApp({
     imageRenderEpoch: 0,
     messageImageUrls: new Set(),
     runId: null,
+    agentRunStatus: null,
     presentation: null,
     assistantNode: null,
     streamAbort: null,
@@ -309,6 +314,12 @@ export function createBrowserApp({
     showUpdatePrompt: null,
     updateConfirmed: false,
     updateConfirmedWorker: null,
+    updateControllerChanged: false,
+    updateController: null,
+    updateTargetRelease: null,
+    updateReleaseTimer: null,
+    updateSafetyTimer: null,
+    updatePollTimer: null,
     updateReloaded: false,
     updateCheckAt: Number.NEGATIVE_INFINITY,
     updateFailureAt: Number.NEGATIVE_INFINITY,
@@ -535,6 +546,7 @@ export function createBrowserApp({
   }
 
   function renderPresentation(snapshot) {
+    state.agentRunStatus = safeRunStatus(snapshot.status);
     elements.workspace.dataset.status = snapshot.status;
     elements.run_state.textContent = statusLabel(snapshot.status);
     if (!state.assistantNode) state.assistantNode = messageNode("assistant", "", { runId: snapshot.runId });
@@ -576,6 +588,7 @@ export function createBrowserApp({
 
   async function streamAgentRun(run, { cursor } = {}) {
     state.runId = run.id;
+    state.agentRunStatus = safeRunStatus(run.status);
     state.presentation = createRunPresentation({ runId: run.id, threadId: run.threadId, cursor });
     state.assistantNode = null;
     state.streamAbort?.abort();
@@ -620,6 +633,7 @@ export function createBrowserApp({
           if (error instanceof AgintiProtocolError || error?.retryable === false) throw error;
         }
         if (authoritativeRun && TERMINAL.has(authoritativeRun.status)) {
+          state.agentRunStatus = authoritativeRun.status;
           elements.workspace.dataset.status = authoritativeRun.status;
           elements.run_state.textContent = statusLabel(authoritativeRun.status);
           if (!state.assistantNode) state.assistantNode = messageNode("assistant", "", { runId: authoritativeRun.id });
@@ -657,6 +671,7 @@ export function createBrowserApp({
       clearConversation();
       state.agentThreadId = thread.id;
       state.runId = null;
+      state.agentRunStatus = null;
       elements.conversation_title.textContent = thread.title;
       thread.messages.forEach((message) => messageNode(message.role, message.content, { runId: message.runId }));
       renderThreads();
@@ -1266,6 +1281,7 @@ export function createBrowserApp({
       state.chatGeneration = null;
       state.chatPendingSend = null;
       state.runId = null;
+      state.agentRunStatus = null;
       clearConversation();
       state.agent = createAgentClient(state.session);
       state.chat = createChatClient(state.session);
@@ -1376,6 +1392,7 @@ export function createBrowserApp({
     clearSelectedImage();
     updateImageControl();
     state.runId = null;
+    state.agentRunStatus = null;
     clearConversation();
     showLogin();
     loginControl({ ready: true, label: "Sign in" });
@@ -1386,8 +1403,10 @@ export function createBrowserApp({
 
   async function stop() {
     if (state.mode === "agent" && state.runId && state.capabilities.actions.cancel) {
-      try { await state.agent.cancelRun(state.runId); }
-      catch { showToast("AgInTi cancellation could not be confirmed."); return; }
+      try {
+        const { run } = await state.agent.cancelRun(state.runId);
+        state.agentRunStatus = safeRunStatus(run.status);
+      } catch { showToast("AgInTi cancellation could not be confirmed."); return; }
       state.streamAbort?.abort();
       return;
     }
@@ -1458,6 +1477,7 @@ export function createBrowserApp({
     if (state.mode === "agent") {
       state.agentThreadId = null;
       state.runId = null;
+      state.agentRunStatus = null;
     } else {
       state.chatThreadId = null;
       state.chatThread = null;
@@ -1471,6 +1491,96 @@ export function createBrowserApp({
     elements.conversation_title.textContent = "New conversation";
     clearConversation();
     renderThreads();
+  }
+
+  function updateReloadSafe() {
+    if (state.loginPending || state.logoutPending || state.busy || state.imagePreparing
+        || state.selectedImage || state.chatPendingSend
+        || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
+        || (state.runId && !TERMINAL.has(state.agentRunStatus))
+        || state.streamAbort || String(elements.message_input.value ?? "").length > 0) return false;
+    if (!state.session.authenticated && String(elements.password.value ?? "").length > 0) return false;
+    return true;
+  }
+
+  function clearUpdateReloadTimers() {
+    for (const key of ["updateReleaseTimer", "updateSafetyTimer"]) {
+      if (state[key] !== null) window?.clearTimeout?.(state[key]);
+      state[key] = null;
+    }
+  }
+
+  function reloadForActiveUpdate() {
+    if (!state.updateControllerChanged || state.updateReloaded || !updateReloadSafe()) return false;
+    if (state.updateTargetRelease === null && state.updateReleaseTimer !== null) return false;
+    state.updateReloaded = true;
+    clearUpdateReloadTimers();
+    const releaseId = state.updateTargetRelease;
+    const target = new URL(workerScope, window.location.href);
+    if (validAgentRelease(releaseId)) {
+      target.search = `?v=${encodeURIComponent(releaseId)}`;
+    }
+    target.hash = "";
+    if (typeof window?.location?.replace === "function") window.location.replace(target.href);
+    else if (window?.location) window.location.href = target.href;
+    return true;
+  }
+
+  function scheduleSafeUpdateReload() {
+    if (!state.updateControllerChanged || state.updateReloaded || state.updateSafetyTimer !== null) return;
+    if (reloadForActiveUpdate()) return;
+    state.updateSafetyTimer = window?.setTimeout?.(() => {
+      state.updateSafetyTimer = null;
+      scheduleSafeUpdateReload();
+    }, 1_000) ?? null;
+  }
+
+  function activateWaitingUpdate() {
+    if (state.updateControllerChanged) {
+      if (!updateReloadSafe()) {
+        elements.update_banner.hidden = false;
+        showToast("Finish the current draft or response before reloading the updated app.");
+        scheduleSafeUpdateReload();
+        return false;
+      }
+      return reloadForActiveUpdate();
+    }
+    const worker = state.updateRegistration?.waiting;
+    if (!worker || state.updateConfirmed) return false;
+    if (!updateReloadSafe()) {
+      elements.update_banner.hidden = false;
+      showToast("Finish the current draft or response before activating the update.");
+      return false;
+    }
+    state.updateConfirmed = true;
+    state.updateConfirmedWorker = worker;
+    state.updateDeferredUntil = Number.NEGATIVE_INFINITY;
+    state.updateDeferredWorker = null;
+    elements.apply_update.disabled = true;
+    elements.defer_update.disabled = true;
+    try {
+      worker.postMessage({ type: "SKIP_WAITING" });
+    } catch {
+      state.updateConfirmed = false;
+      state.updateConfirmedWorker = null;
+      elements.apply_update.disabled = false;
+      elements.defer_update.disabled = false;
+      elements.update_banner.hidden = false;
+      showToast("The update could not be activated. You can retry safely.");
+      return false;
+    }
+    if (state.updateActivationTimer !== null) window?.clearTimeout?.(state.updateActivationTimer);
+    state.updateActivationTimer = window?.setTimeout?.(() => {
+      if (state.updateControllerChanged || state.updateReloaded) return;
+      state.updateConfirmed = false;
+      state.updateConfirmedWorker = null;
+      state.updateActivationTimer = null;
+      elements.apply_update.disabled = false;
+      elements.defer_update.disabled = false;
+      elements.update_banner.hidden = !state.updateRegistration?.waiting;
+      showToast("The update is still waiting. You can retry or choose Later.");
+    }, activationTimeoutMs) ?? null;
+    return true;
   }
 
   function bind() {
@@ -1494,38 +1604,7 @@ export function createBrowserApp({
     elements.theme_picker.addEventListener("change", () => applyTheme(elements.theme_picker.value, { document }));
     elements.open_sidebar.addEventListener("click", () => { elements.sidebar.dataset.open = "true"; elements.sidebar_scrim.hidden = false; });
     elements.sidebar_scrim.addEventListener("click", () => { elements.sidebar.dataset.open = "false"; elements.sidebar_scrim.hidden = true; });
-    elements.apply_update.addEventListener("click", () => {
-      const worker = state.updateRegistration?.waiting;
-      if (!worker || state.updateConfirmed) return;
-      state.updateConfirmed = true;
-      state.updateConfirmedWorker = worker;
-      state.updateDeferredUntil = Number.NEGATIVE_INFINITY;
-      state.updateDeferredWorker = null;
-      elements.apply_update.disabled = true;
-      elements.defer_update.disabled = true;
-      try {
-        worker.postMessage({ type: "SKIP_WAITING" });
-      } catch {
-        state.updateConfirmed = false;
-        state.updateConfirmedWorker = null;
-        elements.apply_update.disabled = false;
-        elements.defer_update.disabled = false;
-        elements.update_banner.hidden = false;
-        showToast("The update could not be activated. You can retry safely.");
-        return;
-      }
-      if (state.updateActivationTimer !== null) window?.clearTimeout?.(state.updateActivationTimer);
-      state.updateActivationTimer = window?.setTimeout?.(() => {
-        if (state.updateReloaded) return;
-        state.updateConfirmed = false;
-        state.updateConfirmedWorker = null;
-        state.updateActivationTimer = null;
-        elements.apply_update.disabled = false;
-        elements.defer_update.disabled = false;
-        elements.update_banner.hidden = !state.updateRegistration?.waiting;
-        showToast("The update is still waiting. You can retry or choose Later.");
-      }, activationTimeoutMs) ?? null;
-    });
+    elements.apply_update.addEventListener("click", activateWaitingUpdate);
     elements.defer_update.addEventListener("click", () => {
       const worker = state.updateRegistration?.waiting;
       if (!worker || state.updateConfirmed) return;
@@ -1552,22 +1631,62 @@ export function createBrowserApp({
       state.installPrompt = event;
       elements.install_app.hidden = false;
     });
+    for (const input of [elements.username, elements.password, elements.message_input]) {
+      input.addEventListener("input", () => {
+        if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+        state.updateSafetyTimer = null;
+        scheduleSafeUpdateReload();
+      });
+    }
   }
 
   async function registerPwa() {
     if (!navigator?.serviceWorker?.register || window?.location?.protocol !== "https:") return;
     try {
-      let hadController = Boolean(navigator.serviceWorker.controller);
+      let observedController = navigator.serviceWorker.controller ?? null;
+      let hadController = observedController !== null;
+      state.updateController = observedController;
+      navigator.serviceWorker.addEventListener?.("message", (event) => {
+        const value = event?.data;
+        if (!state.updateControllerChanged || !value || typeof value !== "object" || Array.isArray(value)
+            || Object.keys(value).sort().join(",") !== "releaseId,type"
+            || value.type !== "LAZYING_AGENT_RELEASE" || !validAgentRelease(value.releaseId)
+            || event.source !== state.updateController) return;
+        state.updateTargetRelease = value.releaseId;
+        if (state.updateReleaseTimer !== null) window?.clearTimeout?.(state.updateReleaseTimer);
+        state.updateReleaseTimer = null;
+        if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+        state.updateSafetyTimer = null;
+        scheduleSafeUpdateReload();
+      });
       navigator.serviceWorker.addEventListener?.("controllerchange", () => {
+        const nextController = navigator.serviceWorker.controller ?? null;
+        if (nextController === observedController) return;
+        observedController = nextController;
+        state.updateController = nextController;
+        state.updateTargetRelease = null;
+        clearUpdateReloadTimers();
         if (!hadController) {
-          hadController = true;
+          hadController = nextController !== null;
           return;
         }
-        if (state.updateReloaded) return;
-        state.updateReloaded = true;
+        if (nextController === null || state.updateReloaded) return;
+        state.updateControllerChanged = true;
         if (state.updateActivationTimer !== null) window?.clearTimeout?.(state.updateActivationTimer);
         state.updateActivationTimer = null;
-        window.location.reload();
+        state.updateConfirmed = false;
+        state.updateConfirmedWorker = null;
+        elements.apply_update.disabled = false;
+        elements.defer_update.disabled = false;
+        elements.update_banner.hidden = false;
+        try { nextController.postMessage?.({ type: "GET_LAZYING_AGENT_RELEASE" }); } catch { /* Fallback below. */ }
+        const expectedController = nextController;
+        state.updateReleaseTimer = window?.setTimeout?.(() => {
+          if (state.updateController !== expectedController || state.updateReloaded) return;
+          state.updateReleaseTimer = null;
+          scheduleSafeUpdateReload();
+        }, 1_000) ?? null;
+        scheduleSafeUpdateReload();
       });
       const registration = await navigator.serviceWorker.register(workerPath, { scope: workerScope, updateViaCache: "none" });
       const ready = () => {
@@ -1611,9 +1730,18 @@ export function createBrowserApp({
         finally { state.updateCheckInFlight = false; }
         return true;
       };
+      const scheduleUpdateCheck = () => {
+        if (state.updatePollTimer !== null) return;
+        state.updatePollTimer = window?.setTimeout?.(async () => {
+          state.updatePollTimer = null;
+          await checkForUpdate();
+          scheduleUpdateCheck();
+        }, updateCheckIntervalMs) ?? null;
+      };
       document?.addEventListener?.("visibilitychange", () => { void checkForUpdate(); });
       window?.addEventListener?.("online", () => { void checkForUpdate({ onlineTransition: true }); });
       void checkForUpdate({ force: true });
+      scheduleUpdateCheck();
     } catch { /* PWA installation is optional; chat remains usable. */ }
   }
 

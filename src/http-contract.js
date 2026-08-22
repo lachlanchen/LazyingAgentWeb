@@ -304,23 +304,31 @@ export function snapshotAndValidateAssetMap(assetMap, releaseIdInput) {
 
   const routeSet = new Set();
   const descriptors = new Map();
+  const versionedRootTarget = `/?v=${releaseId}`;
+  const manifestTarget = `/manifest.webmanifest?v=${releaseId}`;
   for (const route of assetMap.routes) {
     const normalized = validateStaticTarget(route);
     if (routeSet.has(route)) throw new TypeError(`asset route ${route} is duplicated`);
-    if (normalized.hasQuery && normalized.pathname !== '/manifest.webmanifest') {
-      throw new TypeError('only an exact allowlisted manifest query may be a static asset target');
+    if (normalized.hasQuery && route !== manifestTarget && route !== versionedRootTarget) {
+      throw new TypeError('only the exact release-bound root and manifest queries may be static asset targets');
     }
     routeSet.add(route);
     descriptors.set(route, validateDescriptor(route, assetMap.get(route)));
   }
-  for (const required of ['/', '/sw.js']) {
+  for (const required of ['/', versionedRootTarget, manifestTarget, '/sw.js']) {
     if (!descriptors.has(required)) throw new TypeError(`assetMap is missing ${required}`);
   }
   const root = descriptors.get('/');
+  const versionedRoot = descriptors.get(versionedRootTarget);
   const worker = descriptors.get('/sw.js');
   if (!root.contentType.toLowerCase().startsWith('text/html')
       || !sourceProvesRelease(root.body.toString('utf8'), releaseId, 'html')) {
     throw new TypeError('root HTML does not prove releaseId');
+  }
+  if (versionedRoot.contentType !== root.contentType || versionedRoot.cacheControl !== root.cacheControl
+      || JSON.stringify(versionedRoot.headers) !== JSON.stringify(root.headers)
+      || !versionedRoot.body.equals(root.body)) {
+    throw new TypeError('versioned root must exactly mirror the stable no-store shell');
   }
   if (!worker.contentType.toLowerCase().startsWith('text/javascript')
       || !sourceProvesRelease(worker.body.toString('utf8'), releaseId, 'worker')) {

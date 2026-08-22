@@ -178,7 +178,7 @@ test('edge route manifest binds the proxy allowlist to the exact candidate PWA',
   assert.deepEqual(manifest.paths, [...manifest.paths].sort());
   assert.equal(new Set(manifest.paths).size, manifest.paths.length);
   assert.equal(manifest.paths.every((pathname) => pathname.startsWith('/') && !pathname.includes('?')), true);
-  assert.equal(manifest.requestTargets.length, manifest.paths.length);
+  assert.equal(manifest.requestTargets.length, manifest.paths.length + 1);
   assert.equal(manifest.paths.includes('/'), true);
   assert.equal(manifest.paths.includes('/manifest.webmanifest'), true);
   assert.equal(manifest.paths.includes('/sw.js'), true);
@@ -186,6 +186,7 @@ test('edge route manifest binds the proxy allowlist to the exact candidate PWA',
     manifest.requestTargets.includes(`/manifest.webmanifest?v=${manifest.releaseId}`),
     true
   );
+  assert.equal(manifest.requestTargets.includes(`/?v=${manifest.releaseId}`), true);
   const immutablePaths = manifest.paths.filter((pathname) => pathname.startsWith('/assets/'));
   assert.equal(immutablePaths.length, manifest.paths.length - 3);
   assert.equal(

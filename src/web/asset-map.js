@@ -246,10 +246,12 @@ function buildShellEntries({
   const secured = (contentType, body, headers = {}) => descriptor(contentType, body, {
     headers: { ...STANDALONE_SHELL_SECURITY_HEADERS, ...headers },
   });
+  const root = secured("text/html; charset=utf-8", createAppShellHtml({ basePath: scope, title, loginPath, version: releaseVersion }), {
+    "content-security-policy": STANDALONE_ROOT_CONTENT_SECURITY_POLICY,
+  });
   return [
-    [scope, secured("text/html; charset=utf-8", createAppShellHtml({ basePath: scope, title, loginPath, version: releaseVersion }), {
-      "content-security-policy": STANDALONE_ROOT_CONTENT_SECURITY_POLICY,
-    })],
+    [scope, root],
+    [`${scope}${agentWebBuildQuery(releaseVersion)}`, root],
     [`${base}/manifest.webmanifest${agentWebBuildQuery(releaseVersion)}`, secured("application/manifest+json; charset=utf-8", `${JSON.stringify(manifest)}\n`)],
     [versioned("/assets/app.css"), secured("text/css; charset=utf-8", BRIGHT_APP_CSS)],
     [versioned("/assets/app.js"), secured("text/javascript; charset=utf-8", bootstrap)],
@@ -341,6 +343,8 @@ export function verifyStandaloneAssetMap(assetMap) {
       || assetMap.cacheName !== agentWebCacheName(assetMap.releaseVersion, { basePath: assetMap.basePath })) {
     throw new TypeError("PWA cache identity is not bound to its normalized scope");
   }
+  const versionedRoot = `${assetMap.basePath}${agentWebBuildQuery(assetMap.releaseVersion)}`;
+  if (!assetMap.has(versionedRoot)) throw new TypeError("PWA versioned navigation route is missing");
   for (const route of assetMap.shellRoutes) if (!assetMap.has(route)) throw new TypeError(`PWA shell route is missing: ${route}`);
   const worker = assetMap.get(assetMap.serviceWorkerRoute);
   if (!worker || worker.cacheControl !== "no-store, no-cache, must-revalidate"

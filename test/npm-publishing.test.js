@@ -11,6 +11,10 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
     new URL('../.github/workflows/npm-publish.yml', import.meta.url),
     'utf8',
   );
+  const verificationWorkflow = await readFile(
+    new URL('../.github/workflows/ci.yml', import.meta.url),
+    'utf8',
+  );
 
   assert.deepEqual(packageJson.repository, { type: 'git', url: repositoryUrl });
   assert.equal(packageJson.homepage, 'https://llm.lazying.art');
@@ -31,4 +35,10 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
   }
 
   assert.doesNotMatch(workflow, /(?:NODE_AUTH_TOKEN|NPM_TOKEN|pull_request_target|pull_request:)/u);
+  assert.match(verificationWorkflow, /node: \['22\.21\.0', '24'\]/u);
+  assert.match(verificationWorkflow, /permissions:\n  contents: read/u);
+  assert.match(verificationWorkflow, /npm ci --ignore-scripts/u);
+  assert.match(verificationWorkflow, /npm pack --dry-run --json --ignore-scripts/u);
+  assert.match(verificationWorkflow, /git diff --exit-code/u);
+  assert.doesNotMatch(verificationWorkflow, /(?:id-token: write|NODE_AUTH_TOKEN|NPM_TOKEN|pull_request_target)/u);
 });

@@ -1,0 +1,50 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.21.0', '24']
+    steps:
+      - name: Check out source without retained credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Install exact dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Verify source and behavior
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+
+      - name: Verify package boundary and clean checkout
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json --ignore-scripts > "$RUNNER_TEMP/npm-pack.json"
+          node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const m=require('./package.json');const x=p[0];const allowed=(f)=>f==='LICENSE'||f==='README.md'||f==='package.json'||f.startsWith('docs/')||f.startsWith('src/');if(p.length!==1||x.name!==m.name||x.version!==m.version||x.filename!=='lazyingart-agent-web-'+m.version+'.tgz'||x.files.length!==x.entryCount||x.files.some(({path})=>!allowed(path)))process.exit(1)" "$RUNNER_TEMP/npm-pack.json"
+          git diff --exit-code

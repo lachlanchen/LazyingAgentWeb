@@ -309,7 +309,15 @@ function parseChunkData(source) {
   } catch (cause) {
     fail('LOCALLLM_STREAM_INVALID', 'LocalLLM returned malformed streaming JSON.', { cause });
   }
-  const root = exactKeys(value, [], ['id', 'object', 'created', 'model', 'choices', 'usage'], 'stream event');
+  const root = exactKeys(value, [], [
+    'id', 'object', 'created', 'model', 'choices', 'usage', 'system_fingerprint'
+  ], 'stream event');
+  if (Object.hasOwn(root, 'system_fingerprint')
+      && root.system_fingerprint !== null
+      && (typeof root.system_fingerprint !== 'string'
+        || !/^[\x20-\x7e]{1,256}$/u.test(root.system_fingerprint))) {
+    throw new TypeError('stream event system fingerprint is invalid');
+  }
   if (!Object.hasOwn(root, 'choices')) throw new TypeError('stream event choices are missing');
   denseArray(root.choices, 'stream event choices', 8);
   if (root.choices.length === 0) return '';

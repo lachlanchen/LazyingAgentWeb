@@ -100,7 +100,7 @@ test('streams only bounded assistant text through the exact authenticated route'
   const value = connector(async (url, init) => {
     calls.push({ url, init });
     return streamResponse([
-      'data: {"id":"one","object":"chat.completion.chunk","created":1,"model":"local","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\r',
+      'data: {"id":"one","object":"chat.completion.chunk","created":1,"model":"local","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\r',
       '\n\r\ndata: {"id":"two","object":"chat.completion.chunk","created":1,"model":"local","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n',
       'data: {"id":"three","object":"chat.completion.chunk","created":1,"model":"local","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
       'data: [DONE]\n\n'
@@ -127,6 +127,28 @@ test('streams only bounded assistant text through the exact authenticated route'
     stream_options: { include_usage: false }
   });
   assert.doesNotMatch(JSON.stringify(value), /local-test-token/u);
+});
+
+test('accepts only bounded printable optional stream fingerprints', async () => {
+  const accepted = connector(async () => streamResponse([
+    'data: {"system_fingerprint":null,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
+    'data: [DONE]\n\n'
+  ]));
+  assert.deepEqual(await collect(await accepted.generate(generationInput())), ['ok']);
+
+  for (const systemFingerprint of [42, {}, '', 'bad\nfingerprint', 'x'.repeat(257)]) {
+    const rejected = connector(async () => streamResponse([
+      `data: ${JSON.stringify({
+        system_fingerprint: systemFingerprint,
+        choices: [{ index: 0, delta: { content: 'no' }, finish_reason: null }]
+      })}\n\n`,
+      'data: [DONE]\n\n'
+    ]));
+    await assert.rejects(
+      collect(await rejected.generate(generationInput())),
+      (error) => error instanceof LocalLlmConnectorError && error.code === 'LOCALLLM_STREAM_INVALID'
+    );
+  }
 });
 
 test('sends the latest private canonical image only to the fixed vision alias as OpenAI image content', async () => {

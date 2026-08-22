@@ -29,6 +29,7 @@ const FAILURE_CODES = new Set([
   "response_limit",
   "content_rejected",
 ]);
+const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const encoder = new TextEncoder();
 
 export const DIRECT_CHAT_ROUTES = Object.freeze({
@@ -485,18 +486,26 @@ function runTicket(value) {
       || (expectedRevision > 0 && (typeof request.expectedHash !== "string" || !HASH.test(request.expectedHash)))) {
     throw new TypeError("expectedHash is inconsistent with expectedRevision");
   }
+  const content = unicodeScalar(request.content, "content", {
+    minimum: 1,
+    maximum: 64 * 1024,
+    controls: true,
+    input: true,
+  }).trim();
+  if (!content || UNSAFE_MESSAGE_CONTROL.test(content)) {
+    throw new TypeError("content is invalid");
+  }
   const result = {
     threadId: identifier(request.threadId, "threadId", { input: true }),
     messageId: identifier(request.messageId, "messageId", { input: true, opaque: true }),
     generationId: identifier(request.generationId, "generationId", { input: true, opaque: true }),
     assistantMessageId: identifier(request.assistantMessageId, "assistantMessageId", { input: true, opaque: true }),
-    content: unicodeScalar(request.content, "content", { minimum: 1, maximum: 64 * 1024, controls: false, input: true }).trim(),
+    content,
     expectedRevision,
     expectedHash: request.expectedHash,
     idempotencyKey: idempotencyKey(request.idempotencyKey, { input: true }),
     ...(request.attachment === undefined ? {} : { attachment: requestAttachment(request.attachment) }),
   };
-  if (!result.content) throw new TypeError("content must contain non-whitespace text");
   if (new Set([result.messageId, result.generationId, result.assistantMessageId]).size !== 3) {
     throw new TypeError("prepared run identifiers must be distinct");
   }

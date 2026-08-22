@@ -11,6 +11,15 @@ import {
 import { canonicalizeVisionImage } from "./vision-image-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
+
+class LocalChatPreparationError extends Error {
+  constructor(stage, cause) {
+    super("The LocalLLM request could not be prepared in this browser.", { cause });
+    this.name = "LocalChatPreparationError";
+    this.stage = stage;
+  }
+}
 
 function exactObject(value, allowed, required, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
@@ -69,12 +78,41 @@ function requiredMethod(value, name, owner) {
 }
 
 function boundedMessage(value) {
-  if (typeof value !== "string" || value.length < 1 || value.length > 32_000 || /\u0000/u.test(value)) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 32_000
+      || UNSAFE_MESSAGE_CONTROL.test(value)) {
     throw new TypeError("message is invalid");
   }
   const text = value.trim();
   if (!text) throw new TypeError("message must contain non-whitespace text");
   return text;
+}
+
+function conversationTitle(value) {
+  let title = "";
+  let pendingSpace = false;
+  let scalars = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint <= 0x1f || codePoint === 0x7f) {
+      pendingSpace = title.length > 0;
+      continue;
+    }
+    const scalar = codePoint >= 0xd800 && codePoint <= 0xdfff ? "\ufffd" : character;
+    if (pendingSpace && scalars < 80) {
+      title += " ";
+      scalars += 1;
+    }
+    pendingSpace = false;
+    if (scalars >= 80) break;
+    title += scalar;
+    scalars += 1;
+  }
+  return title.trim();
+}
+
+function prepareLocalChat(stage, operation) {
+  try { return operation(); }
+  catch (error) { throw new LocalChatPreparationError(stage, error); }
 }
 
 function normalizedBrowserPath(value, name, { trailingSlash = false } = {}) {
@@ -299,16 +337,44 @@ export function createBrowserApp({
     elements.login_error.hidden = true;
   }
 
-  function clearSelectedImage() {
+  function detachSelectedImage() {
     state.imageSelectionEpoch += 1;
     state.imagePreparing = false;
-    if (state.selectedImageUrl !== null) revokeObjectUrl(state.selectedImageUrl);
+    const detached = state.selectedImage === null ? null : Object.freeze({
+      selected: state.selectedImage,
+      previewUrl: state.selectedImageUrl,
+    });
     state.selectedImage = null;
     state.selectedImageUrl = null;
     elements.image_input.value = "";
     elements.image_preview_thumbnail.src = "";
     elements.image_preview_label.textContent = "";
     elements.image_preview.hidden = true;
+    return detached;
+  }
+
+  function disposeDetachedImage(detached) {
+    if (detached?.previewUrl !== null && detached?.previewUrl !== undefined) {
+      revokeObjectUrl(detached.previewUrl);
+    }
+  }
+
+  function clearSelectedImage() {
+    disposeDetachedImage(detachSelectedImage());
+  }
+
+  function restoreDetachedImage(detached) {
+    if (!detached || state.selectedImage !== null || !state.session.authenticated
+        || state.mode !== "chat" || state.chatCapabilities.visionInput !== true) {
+      disposeDetachedImage(detached);
+      return false;
+    }
+    state.selectedImage = detached.selected;
+    state.selectedImageUrl = detached.previewUrl;
+    elements.image_preview_thumbnail.src = detached.previewUrl;
+    elements.image_preview_label.textContent = `${detached.selected.width}×${detached.selected.height} · ${Math.ceil(detached.selected.byteLength / 1024)} KiB`;
+    elements.image_preview.hidden = false;
+    return true;
   }
 
   function updateImageControl() {
@@ -823,7 +889,7 @@ export function createBrowserApp({
     const current = () => state.session === session && state.agent === agent && state.session.authenticated;
     let threadId = state.agentThreadId;
     if (!threadId) {
-      const { thread } = await agent.createThread({ title: text.slice(0, 80) });
+      const { thread } = await agent.createThread({ title: conversationTitle(text) });
       if (!current()) return;
       state.agentThreadId = thread.id;
       threadId = thread.id;
@@ -847,7 +913,10 @@ export function createBrowserApp({
     };
     let thread = state.chatThread;
     if (!workflow.threadTicket && !state.chatThreadId) {
-      workflow.threadTicket = chat.prepareThread({ title: workflow.text.slice(0, 80) });
+      workflow.threadTicket = prepareLocalChat(
+        "thread",
+        () => chat.prepareThread({ title: conversationTitle(workflow.text) }),
+      );
     }
     if (workflow.threadTicket && !workflow.thread) {
       const firstDispatch = workflow.threadDispatched
@@ -895,13 +964,16 @@ export function createBrowserApp({
     }
     if (thread.currentGenerationId) throw new TypeError("the conversation already has a generation in progress");
     if (!workflow.runTicket) {
-      workflow.runTicket = chat.prepareRun({
-        threadId: thread.threadId,
-        content: workflow.text,
-        expectedRevision: thread.revision,
-        expectedHash: thread.ledgerHash,
-        ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
-      });
+      workflow.runTicket = prepareLocalChat(
+        "run",
+        () => chat.prepareRun({
+          threadId: thread.threadId,
+          content: workflow.text,
+          expectedRevision: thread.revision,
+          expectedHash: thread.ledgerHash,
+          ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
+        }),
+      );
     }
     workflow.runDispatched = true;
     const started = await exactMutation(
@@ -934,7 +1006,12 @@ export function createBrowserApp({
     state.chatPendingSend = workflow;
     try { await continueChatSend(workflow); }
     catch (error) {
-      elements.resume_run.hidden = false;
+      if (error instanceof LocalChatPreparationError) {
+        if (state.chatPendingSend === workflow) state.chatPendingSend = null;
+        elements.resume_run.hidden = true;
+      } else {
+        elements.resume_run.hidden = false;
+      }
       throw error;
     }
   }
@@ -986,10 +1063,12 @@ export function createBrowserApp({
       updateImageControl();
       return;
     }
+    const draft = elements.message_input.value;
     let text;
-    try { text = boundedMessage(elements.message_input.value); }
+    try { text = boundedMessage(draft); }
     catch { return; }
-    const selected = state.mode === "chat" ? state.selectedImage : null;
+    let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
+    const selected = detachedImage?.selected ?? null;
     const attachment = selected === null ? null : Object.freeze({
       attachmentId: selected.attachmentId,
       mediaType: selected.mediaType,
@@ -998,7 +1077,6 @@ export function createBrowserApp({
       height: selected.height,
       bytes: selected.bytes,
     });
-    clearSelectedImage();
     elements.message_input.value = "";
     state.busy = true;
     elements.send_message.disabled = true;
@@ -1007,12 +1085,23 @@ export function createBrowserApp({
       if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text);
       else await sendChat(text, attachment);
       connection("Connected");
-    } catch {
-      connection("Request interrupted", false);
-      showToast(state.mode === "agent"
-        ? "AgInTi did not accept or complete this request. Existing server work was not replaced."
-        : "LocalLLM chat was interrupted.");
+    } catch (error) {
+      if (state.mode === "chat" && error instanceof LocalChatPreparationError) {
+        elements.message_input.value = draft;
+        const imageRestored = restoreDetachedImage(detachedImage);
+        detachedImage = null;
+        connection("Request not sent", false);
+        showToast(imageRestored
+          ? "This image message was not sent. Your prompt and image are still ready; edit or retry them."
+          : "This message was not sent. Your prompt is still in the composer; edit it and try again.");
+      } else {
+        connection("Request interrupted", false);
+        showToast(state.mode === "agent"
+          ? "AgInTi did not accept or complete this request. Existing server work was not replaced."
+          : "LocalLLM chat was interrupted. Use Resume if this durable request remains pending.");
+      }
     } finally {
+      disposeDetachedImage(detachedImage);
       state.busy = false;
       updateImageControl();
     }

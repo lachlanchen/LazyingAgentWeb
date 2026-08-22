@@ -479,6 +479,19 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   }
 });
 
+test("the conversation sidebar gives the thread list one bounded scroll region", () => {
+  assert.match(
+    BRIGHT_APP_CSS,
+    /\.sidebar \{[^}]*height: 100dvh;[^}]*min-height: 0;[^}]*overflow: hidden;/u,
+  );
+  assert.match(
+    BRIGHT_APP_CSS,
+    /\.thread-list \{[^}]*min-height: 0;[^}]*flex: 1 1 0;[^}]*align-content: start;[^}]*overflow-y: auto;/u,
+  );
+  assert.match(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*flex: 0 0 auto;/u);
+  assert.doesNotMatch(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*margin-top: auto;/u);
+});
+
 test("content digest deterministically owns release, cache, routes, and final-map verification", async () => {
   const first = await productionMap({ label: "stable", marker: "same" });
   const repeated = await productionMap({ label: "stable", marker: "same" });

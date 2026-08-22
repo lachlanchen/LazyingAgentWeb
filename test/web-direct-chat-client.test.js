@@ -167,11 +167,11 @@ test("prepared create/start requests carry browser IDs and remain byte-identical
 
   const runRequest = client.prepareRun({
     threadId: threadRequest.threadId,
-    content: "  hello  ",
+    content: "  hello\nworld\tagain\r\n  ",
     expectedRevision: 0,
     expectedHash: null,
   });
-  assert.equal(runRequest.content, "hello");
+  assert.equal(runRequest.content, "hello\nworld\tagain");
   assert.equal(Object.isFrozen(runRequest), true);
   const generatedBeforeDispatch = makeOpaqueId.count();
   await client.startRun(runRequest);
@@ -585,6 +585,14 @@ test("request validators reject browser provider controls and a missing authenti
     expectedHash: null,
     provider: "browser-choice",
   }), /unsupported field/u);
+  for (const content of ["unsafe\u000bcontrol", "unsafe\u001fcontrol", "unsafe\u007fcontrol"]) {
+    assert.throws(() => authenticated.prepareRun({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      content,
+      expectedRevision: 0,
+      expectedHash: null,
+    }), /content is invalid/u);
+  }
   await assert.rejects(() => authenticated.listThreads({ accountId: "private" }), /unsupported field/u);
   assert.throws(() => new DirectChatBrowserClient({ ...clientOptions(), endpoint: "/v1/chat/completions" }), /unsupported field/u);
 });

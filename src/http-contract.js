@@ -20,6 +20,7 @@ const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9._~-]{16,160}$/u;
 const EVENT_HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTENT_DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
+const UNSAFE_MESSAGE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ENCODED_PATH_PATTERN = /%(?:2e|2f|5c)/iu;
 
 export const CLOUD_HTTP_LIMITS = Object.freeze({
@@ -150,11 +151,19 @@ function integer(value, name, limits) {
   }
 }
 
-function text(value, name, { minimum = 1, maximum, trim = false, allowControl = false } = {}) {
+function text(value, name, {
+  minimum = 1,
+  maximum,
+  trim = false,
+  allowControl = false,
+  allowMessageFormatting = false
+} = {}) {
   if (typeof value !== 'string' || utf8Bytes(value) < minimum || utf8Bytes(value) > maximum) {
     invalid(`${name} is invalid.`);
   }
-  if (!allowControl && CONTROL_PATTERN.test(value)) invalid(`${name} is invalid.`);
+  if (!allowControl && (allowMessageFormatting
+    ? UNSAFE_MESSAGE_CONTROL_PATTERN.test(value)
+    : CONTROL_PATTERN.test(value))) invalid(`${name} is invalid.`);
   const result = trim ? value.trim() : value;
   if (trim && utf8Bytes(result) < minimum) invalid(`${name} is invalid.`);
   return result;
@@ -451,7 +460,11 @@ export function validateChatRequest(pathname, value) {
         messageId: identifier(body.messageId, 'messageId'),
         generationId: identifier(body.generationId, 'generationId'),
         assistantMessageId: identifier(body.assistantMessageId, 'assistantMessageId'),
-        content: text(body.content, 'content', { maximum: 64 * 1024, trim: true }),
+        content: text(body.content, 'content', {
+          maximum: 64 * 1024,
+          trim: true,
+          allowMessageFormatting: true
+        }),
         expectedRevision: expected.revision,
         expectedHash: expected.hash
       };

@@ -786,10 +786,22 @@ test('starts a user turn and generation through the one atomic store mutation', 
     messageId: 'message-recoverable-user',
     generationId: 'generation-recoverable',
     assistantMessageId: 'message-recoverable-assistant',
-    content: 'Please recover',
+    content: 'Please recover\nwith\tnormal formatting.\r\nExactly once.',
     expectedRevision: 0,
     expectedHash: null
   };
+  const rejectedControl = await post(baseUrl, '/api/chat/runs/start', {
+    ...body,
+    content: 'Please recover\u000bwith an unsafe control.'
+  }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'start-chat-recoverable-bad-control'
+  });
+  assert.equal(rejectedControl.status, 400);
+  assert.equal(connectorDispatches, 0);
+  assert.deepEqual(state.directChatStore.listMessages({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-recoverable'
+  }), []);
   const first = await post(baseUrl, '/api/chat/runs/start', body, {
     cookie: auth.cookie, csrf: auth.csrf, idempotency: 'start-chat-recoverable-01'
   });
@@ -804,7 +816,7 @@ test('starts a user turn and generation through the one atomic store mutation', 
   assert.deepEqual(state.directChatStore.listMessages({
     accountId: PRINCIPAL_ID,
     threadId: 'chat-recoverable'
-  }).map((message) => message.content), ['Please recover', 'Recovered']);
+  }).map((message) => message.content), [body.content, 'Recovered']);
 
   const retry = await post(baseUrl, '/api/chat/runs/start', body, {
     cookie: auth.cookie, csrf: auth.csrf, idempotency: 'start-chat-recoverable-01'

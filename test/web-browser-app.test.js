@@ -527,6 +527,7 @@ test("Direct Chat creates and starts with exact retry tickets, then reconnects S
 
 test("PWA image control canonicalizes exactly one file, sends it once, and renders only authenticated previews", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const imagePrompt = "Describe the private image.\nFocus\ton its colors.";
   const descriptor = {
     attachmentId: "image_0000000000000001",
     mediaType: "image/png",
@@ -551,6 +552,7 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
       };
     },
     prepareThread({ title }) {
+      assert.equal(title, "Describe the private image. Focus on its colors.");
       return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_image_xxxxxxxxx" });
     },
     async createThread(ticket) {
@@ -635,9 +637,10 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.equal(browser.document.getElementById("image-preview").hidden, false);
   assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:vision-1");
 
-  browser.document.getElementById("message-input").value = "Describe the private image.";
+  browser.document.getElementById("message-input").value = imagePrompt;
   await browser.app.submitMessage({ preventDefault() {} });
   await Promise.resolve();
+  assert.equal(preparedRun.content, imagePrompt, "normal multiline formatting reaches the durable image run unchanged");
   assert.deepEqual(preparedRun.attachment, {
     attachmentId: descriptor.attachmentId,
     mediaType: descriptor.mediaType,
@@ -649,8 +652,117 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.equal(browser.document.getElementById("image-preview").hidden, true);
   assert.ok(revokedUrls.includes("blob:vision-1"), "the local selection preview is revoked after dispatch");
   assert.ok(previewReads >= 1, "rendering retrieves bytes through the authenticated attachment client");
-  assert.match(browser.document.getElementById("messages").textContent, /Describe the private image.Authenticated vision answer/u);
+  assert.match(browser.document.getElementById("messages").textContent, /Describe the private image\.\s+Focus\s+on its colors\.Authenticated vision answer/u);
   assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
+});
+
+test("a local image-message preparation failure restores the exact draft for a safe retry", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const prompt = `${"a".repeat(79)}😀 private image`;
+  const draft = `  ${prompt}\n  `;
+  const safeTitle = `${"a".repeat(79)}😀`;
+  let thread = null;
+  let messages = [];
+  let preparationCalls = 0;
+  let createCalls = 0;
+  let preparedRun = null;
+  const revokedUrls = [];
+  const chat = baseChat({
+    async capabilities() {
+      return {
+        visionInput: true,
+        visionMediaTypes: ["image/jpeg", "image/png"],
+        maximumImageBytes: 4 * 1024 * 1024,
+      };
+    },
+    prepareThread({ title }) {
+      preparationCalls += 1;
+      assert.equal(title, safeTitle, "the generated title ends on a complete Unicode scalar");
+      if (preparationCalls === 1) throw new TypeError("synthetic local ticket failure");
+      return Object.freeze({
+        threadId: CHAT_THREAD_ID,
+        title,
+        idempotencyKey: "thread_create_image_retry_xxxxxx",
+      });
+    },
+    async createThread(ticket) {
+      createCalls += 1;
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparedRun = request;
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_image_retry_xxxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [
+        chatMessage(1, "user", ticket.content),
+        chatMessage(2, "assistant", "Retried safely"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000004",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:retry-image"; },
+    revokeObjectUrl(value) { revokedUrls.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "retry.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = draft;
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(createCalls, 0, "a synchronous preparation failure cannot create a durable thread");
+  assert.equal(messageInput.value, draft, "local failure restores the exact pre-trim textarea draft");
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:retry-image");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.match(browser.document.getElementById("toast").textContent, /image message was not sent[\s\S]*still ready/iu);
+  assert.deepEqual(revokedUrls, [], "the restored preview keeps its original live object URL");
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(createCalls, 1);
+  assert.equal(preparedRun.content, prompt, "retry preserves the original prompt exactly");
+  assert.equal(preparedRun.attachment.attachmentId, "image_0000000000000004");
+  assert.equal(preparedRun.attachment.bytes, bytes, "retry preserves the canonical private image bytes");
+  assert.equal(messageInput.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.deepEqual(revokedUrls, ["blob:retry-image"]);
+  assert.match(browser.document.getElementById("messages").textContent, /Retried safely/u);
 });
 
 test("PWA submit blocks and invalidates an image preparation race without consuming the prompt", async () => {

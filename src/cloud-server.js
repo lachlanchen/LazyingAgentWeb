@@ -82,6 +82,7 @@ function exactLimitOverrides(input = {}) {
   }
   const bounds = Object.freeze({
     bodyTimeoutMs: [50, 15_000],
+    visionBodyTimeoutMs: [1_000, 120_000],
     dependencyTimeoutMs: [50, 120_000],
     jobTimeoutMs: [50, 600_000],
     sseLifetimeMs: [100, 120_000],
@@ -1363,10 +1364,14 @@ export function createCloudRequestHandler({
       streamDeadline.cleanup();
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-      // A reader that stopped consuming data must not retain a stream slot or
-      // socket beyond the hard lifetime. EOF/network reconnect is already a
-      // resumable cursor path in the browser client.
-      res.destroy();
+      // Give a healthy reader an authenticated cursor before the bounded
+      // reconnect. A stalled reader has already applied backpressure, so keep
+      // the hard socket cutoff instead of buffering more data for it.
+      if (res.writableNeedDrain) {
+        res.destroy();
+      } else {
+        res.end(jsonSseEvent({ event: 'reconnect', data: { afterSequence } }));
+      }
     }
   }
 
@@ -1491,7 +1496,13 @@ export function createCloudRequestHandler({
         : clientAddress;
       releaseBody = bodyGate.enter(admissionKey);
       if (!releaseBody) throw new CloudHttpError(503, 'request_busy', 'The request service is temporarily busy.', { retryAfter: 1 });
-      const body = await readJsonBody(req, bodyLimitForRoute(route.pathname), limits.bodyTimeoutMs);
+      const body = await readJsonBody(
+        req,
+        bodyLimitForRoute(route.pathname),
+        route.pathname === CLOUD_ROUTES.chatRunsStart
+          ? limits.visionBodyTimeoutMs
+          : limits.bodyTimeoutMs
+      );
       releaseBody();
       releaseBody = null;
       const streamRoute = route.pathname === CLOUD_ROUTES.chatRunsEvents

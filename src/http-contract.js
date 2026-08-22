@@ -34,6 +34,7 @@ export const CLOUD_HTTP_LIMITS = Object.freeze({
   connectorDeltaBytes: 16 * 1024,
   connectorOutputBytes: 64 * 1024,
   bodyTimeoutMs: 5_000,
+  visionBodyTimeoutMs: 90_000,
   dependencyTimeoutMs: 30_000,
   jobTimeoutMs: 120_000,
   sseLifetimeMs: 30_000,

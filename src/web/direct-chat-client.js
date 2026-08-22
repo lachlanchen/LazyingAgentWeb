@@ -13,6 +13,7 @@ const VISION_IMAGE_LIMIT = 4 * 1024 * 1024;
 const VISION_BASE64_LIMIT = Math.ceil(VISION_IMAGE_LIMIT / 3) * 4;
 const SSE_BLOCK_LIMIT = 32 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const VISION_MUTATION_TIMEOUT_MS = 105_000;
 const DEFAULT_STREAM_TIMEOUT_MS = 45_000;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._~-]{16,160}$/u;
@@ -815,9 +816,9 @@ export class DirectChatBrowserClient {
     return token;
   }
 
-  async #post(route, body, { signal, idempotency, expectedStatus = 200 } = {}) {
+  async #post(route, body, { signal, idempotency, expectedStatus = 200, timeoutMs = this.timeoutMs } = {}) {
     const endpoint = `${this.baseOrigin}${route}`;
-    const deadline = timeoutSignal(signal, this.timeoutMs);
+    const deadline = timeoutSignal(signal, timeoutMs);
     try {
       const response = requireResponse(await this.fetch(endpoint, {
         method: "POST",
@@ -1049,6 +1050,9 @@ export class DirectChatBrowserClient {
       signal,
       idempotency: key,
       expectedStatus: 202,
+      timeoutMs: ticket.attachment === undefined
+        ? this.timeoutMs
+        : Math.max(this.timeoutMs, VISION_MUTATION_TIMEOUT_MS),
     }), ["generation"], ["generation"], "run start response");
     return Object.freeze({
       request: ticket,

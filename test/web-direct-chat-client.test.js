@@ -463,6 +463,32 @@ test("stream resumes from the persisted sequence across a bounded reconnect and 
   assert.equal(events.at(-1).generation.status, "completed");
 });
 
+test("an explicit reconnect boundary is retryable when the app owns recovery", async () => {
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => sseResponse('event: reconnect\ndata: {"afterSequence":0}\n\n'),
+  }));
+  await assert.rejects(async () => {
+    for await (const _event of client.streamRunEvents({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      generationId: "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx",
+      maxReconnects: 0,
+    })) { /* consume */ }
+  }, (error) => error instanceof DirectChatTransportError
+    && error.code === "stream_interrupted"
+    && error.retryable === true);
+
+  const incomplete = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => sseResponse(`id: 1\nevent: delta\ndata: ${JSON.stringify(publicDelta(1, "A"))}\n\n`),
+  }));
+  await assert.rejects(async () => {
+    for await (const _event of incomplete.streamRunEvents({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      generationId: "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx",
+      maxReconnects: 0,
+    })) { /* consume */ }
+  }, DirectChatProtocolError);
+});
+
 test("ending event delivery detaches only; durable cancellation requires its explicit route", async () => {
   let streamCancelled = false;
   const routes = [];

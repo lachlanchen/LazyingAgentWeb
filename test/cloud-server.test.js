@@ -960,6 +960,73 @@ test('validates, stores, dispatches, and previews one private image through the 
   assert.deepEqual(dispatches[1].visionAttachment.content, image);
 });
 
+test('gives an authenticated vision upload a longer bounded body deadline', async (t) => {
+  const state = testState(t, {
+    visionEnabled: true,
+    connector: {
+      async generate() { return (async function* () { yield 'accepted'; })(); }
+    },
+    limits: { bodyTimeoutMs: 50, visionBodyTimeoutMs: 1_000 }
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'chat-slow-vision-upload', title: ''
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-slow-vision-01'
+  });
+  const image = Buffer.from(createPwaIcon(192));
+  const body = JSON.stringify({
+    threadId: 'chat-slow-vision-upload',
+    messageId: 'message-slow-vision-user',
+    generationId: 'generation-slow-vision',
+    assistantMessageId: 'message-slow-vision-assistant',
+    content: 'Inspect this image.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: 'image-slow-vision-00000001',
+      mediaType: 'image/png',
+      data: image.toString('base64')
+    }
+  });
+  const target = new URL(baseUrl);
+  const result = await new Promise((resolve, reject) => {
+    const request = httpRequest({
+      host: target.hostname,
+      port: target.port,
+      path: '/api/chat/runs/start',
+      method: 'POST',
+      headers: fetchMetadata(baseUrl, {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(body, 'utf8')),
+        cookie: auth.cookie,
+        'x-csrf-token': auth.csrf,
+        'idempotency-key': 'start-chat-slow-vision-01'
+      })
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.once('end', () => resolve({
+        status: response.statusCode,
+        body: Buffer.concat(chunks).toString('utf8')
+      }));
+    });
+    request.once('error', reject);
+    const split = Math.floor(body.length / 2);
+    request.write(body.slice(0, split));
+    setTimeout(() => request.end(body.slice(split)), 100);
+  });
+  assert.equal(result.status, 202, result.body);
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-slow-vision-upload',
+    generationId: 'generation-slow-vision'
+  })?.status === 'completed');
+});
+
 test('keeps vision capability and new image persistence fail-closed when disabled', async (t) => {
   let dispatches = 0;
   const state = testState(t, {
@@ -1714,6 +1781,59 @@ test('SSE disconnect stops only delivery; cancellation stops the durable generat
   const cancelledBody = await cancelled.json();
   assertNoOwnerIdentity(cancelledBody);
   assert.equal(cancelledBody.generation.status, 'cancelled');
+  await waitFor(() => connectorAborted);
+});
+
+test('hard SSE lifetime gives a healthy reader an exact reconnect cursor', async (t) => {
+  let connectorAborted = false;
+  const connector = {
+    async generate({ signal }) {
+      signal.addEventListener('abort', () => { connectorAborted = true; }, { once: true });
+      return (async function* () {
+        yield 'vision';
+        await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      })();
+    }
+  };
+  const state = testState(t, { connector, limits: { ssePollMs: 5, sseLifetimeMs: 100 } });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  await post(baseUrl, '/api/chat/threads/create', { threadId: 'chat-sse-reconnect', title: '' }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'create-chat-sse-reconnect-01'
+  });
+  await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-sse-reconnect',
+    messageId: 'message-sse-reconnect-user',
+    generationId: 'generation-sse-reconnect',
+    assistantMessageId: 'message-sse-reconnect-assistant',
+    content: 'Inspect',
+    expectedRevision: 0,
+    expectedHash: null
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'start-chat-sse-reconnect-01' });
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-sse-reconnect',
+    generationId: 'generation-sse-reconnect'
+  })?.deltaCount === 1);
+
+  const events = await post(baseUrl, '/api/chat/runs/events', {
+    threadId: 'chat-sse-reconnect', generationId: 'generation-sse-reconnect', afterSequence: 0
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(events.status, 200);
+  const body = await events.text();
+  assert.match(body, /id: 1\nevent: delta\n/u);
+  assert.match(body, /event: reconnect\ndata: \{"afterSequence":1\}\n\n$/u);
+  assertNoOwnerIdentity(body);
+  assert.equal(state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-sse-reconnect',
+    generationId: 'generation-sse-reconnect'
+  }).status, 'in_progress');
+  assert.equal(connectorAborted, false);
+
+  await post(baseUrl, '/api/chat/runs/cancel', {
+    threadId: 'chat-sse-reconnect', generationId: 'generation-sse-reconnect'
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'cancel-chat-sse-reconnect-01' });
   await waitFor(() => connectorAborted);
 });
 

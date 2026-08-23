@@ -1344,6 +1344,7 @@ export function createBrowserApp({
 
   async function restoreMessageAttachment({
     article, image, status, job, threadId, attachment,
+    readyAlt = "Attached image",
     expectedEpoch = state.viewEpoch,
     expectedImageEpoch = state.imageRenderEpoch,
     chat = state.chat,
@@ -1401,7 +1402,7 @@ export function createBrowserApp({
         forgetRenderedAttachmentPreview(cacheKey, { defer: false, expectedUrl: url });
         return "stale";
       }
-      image.alt = "Attached image";
+      image.alt = readyAlt;
       image.hidden = false;
       image.dataset.previewState = "ready";
       status.hidden = true;
@@ -1443,7 +1444,8 @@ export function createBrowserApp({
         }
         const image = document.createElement("img");
         image.className = "message-attachment";
-        image.alt = displayImages.length === 1 ? "Attached image" : `Attached image ${index + 1}`;
+        const readyAlt = displayImages.length === 1 ? "Attached image" : `Attached image ${index + 1}`;
+        image.alt = readyAlt;
         image.loading = "lazy";
         image.decoding = "async";
         imageParent.appendChild(image);
@@ -1485,6 +1487,7 @@ export function createBrowserApp({
               job,
               threadId,
               attachment: displayedAttachment,
+              readyAlt,
               signal,
               expectedImageEpoch: state.imageRenderEpoch,
               ...restorationOwner,

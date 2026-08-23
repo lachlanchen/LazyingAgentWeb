@@ -1704,6 +1704,7 @@ test("every image in one historical gallery gets its own viewport restoration jo
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(attachmentReads, descriptors.map((attachment) => attachment.attachmentId));
   assert.deepEqual(images.map((image) => image.dataset.previewState), ["ready", "ready"]);
+  assert.deepEqual(images.map((image) => image.alt), ["Attached image 1", "Attached image 2"]);
 });
 
 async function sameThreadAttachmentMemoryCase({ blobLimit, decodedLimit }) {

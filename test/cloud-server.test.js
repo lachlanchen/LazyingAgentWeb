@@ -994,6 +994,93 @@ test('validates, stores, dispatches, and previews one private image through the 
   assert.deepEqual(dispatches[1].visionAttachment.content, image);
 });
 
+test('persists and dispatches one ordered multi-image message atomically', async (t) => {
+  const image = Buffer.from(createPwaIcon(192));
+  const dispatches = [];
+  const state = testState(t, {
+    visionEnabled: true,
+    connector: {
+      async generate(input) {
+        dispatches.push(input);
+        assert.equal(input.visionAttachment, undefined);
+        assert.deepEqual(
+          input.visionAttachments.map((attachment) => attachment.attachmentId),
+          ['image-multi-first-00000001', 'image-multi-second-0000001']
+        );
+        return (async function* () { yield 'Compared both images'; })();
+      }
+    }
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  assert.equal((await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'chat-multi-vision', title: 'Multi vision'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-multi-vision-01'
+  })).status, 201);
+  const attachments = [
+    { attachmentId: 'image-multi-first-00000001', mediaType: 'image/png', data: image.toString('base64') },
+    { attachmentId: 'image-multi-second-0000001', mediaType: 'image/png', data: image.toString('base64') }
+  ];
+  const started = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-multi-vision',
+    messageId: 'message-multi-vision-user',
+    generationId: 'generation-multi-vision',
+    assistantMessageId: 'message-multi-vision-assistant',
+    content: 'Compare these two images in order.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachments
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-multi-vision-01'
+  });
+  assert.equal(started.status, 202);
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-multi-vision',
+    generationId: 'generation-multi-vision'
+  })?.status === 'completed');
+  assert.equal(dispatches.length, 1);
+  const listed = await post(baseUrl, '/api/chat/messages/list', {
+    threadId: 'chat-multi-vision', afterRevision: 0, limit: 20, attachmentSchema: 2
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  const messages = (await listed.json()).messages;
+  assert.deepEqual(
+    messages[0].attachments.map((attachment) => attachment.attachmentId),
+    attachments.map((attachment) => attachment.attachmentId)
+  );
+  assert.equal(Object.hasOwn(messages[0], 'attachment'), false);
+
+  const legacyListed = await post(baseUrl, '/api/chat/messages/list', {
+    threadId: 'chat-multi-vision', afterRevision: 0, limit: 20
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  const legacyMessage = (await legacyListed.json()).messages[0];
+  assert.equal(legacyMessage.attachment.attachmentId, attachments[0].attachmentId);
+  assert.equal(Object.hasOwn(legacyMessage, 'attachments'), false);
+
+  const ambiguous = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-multi-vision',
+    messageId: 'message-multi-ambiguous-user',
+    generationId: 'generation-multi-ambiguous',
+    assistantMessageId: 'message-multi-ambiguous-assistant',
+    content: 'Reject ambiguous attachment shapes.',
+    expectedRevision: 2,
+    expectedHash: state.directChatStore.getThread(PRINCIPAL_ID, 'chat-multi-vision').ledgerHash,
+    attachment: attachments[0],
+    attachments
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-multi-ambiguous-01'
+  });
+  assert.equal(ambiguous.status, 400);
+  assert.equal((await ambiguous.json()).error.code, 'invalid_attachment');
+});
+
 test('gives an authenticated vision upload a longer bounded body deadline', async (t) => {
   const state = testState(t, {
     visionEnabled: true,
@@ -2052,6 +2139,54 @@ test('fails a non-cooperative Direct Chat connector at the bounded job timeout',
     return value?.status === 'failed' ? value : null;
   });
   assert.equal(generation.failureCode, 'timeout');
+});
+
+test('gives accepted vision inference its separate bounded job timeout', async (t) => {
+  const image = Buffer.from(createPwaIcon(192));
+  const connector = {
+    generate() { return new Promise(() => {}); }
+  };
+  const state = testState(t, {
+    visionEnabled: true,
+    connector,
+    limits: { jobTimeoutMs: 50, visionJobTimeoutMs: 250 }
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  await post(baseUrl, '/api/chat/threads/create', { threadId: 'chat-vision-timeout', title: '' }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'create-chat-vision-timeout-01'
+  });
+  const started = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-vision-timeout',
+    messageId: 'message-vision-timeout-user',
+    generationId: 'generation-vision-timeout',
+    assistantMessageId: 'message-vision-timeout-assistant',
+    content: 'Inspect this image without using the text deadline.',
+    expectedRevision: 0,
+    expectedHash: null,
+    attachment: {
+      attachmentId: 'image-vision-timeout-000001',
+      mediaType: 'image/png',
+      data: image.toString('base64')
+    }
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'start-chat-vision-timeout-001' });
+  assert.equal(started.status, 202);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const active = state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-vision-timeout',
+    generationId: 'generation-vision-timeout'
+  });
+  assert.equal(active.status, 'in_progress', 'the shorter text deadline does not interrupt accepted vision work');
+  const failed = await waitFor(() => {
+    const value = state.directChatStore.getGeneration({
+      accountId: PRINCIPAL_ID,
+      threadId: 'chat-vision-timeout',
+      generationId: 'generation-vision-timeout'
+    });
+    return value?.status === 'failed' ? value : null;
+  });
+  assert.equal(failed.failureCode, 'timeout');
 });
 
 test('graceful shutdown aborts and drains background generation work before store handoff', async (t) => {

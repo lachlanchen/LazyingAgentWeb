@@ -42,6 +42,8 @@ const DEFAULT_ATTACHMENT_MEMORY_LIMIT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
 const ATTACHMENT_RENDERED_PREVIEW_LIMIT = 4;
 const ATTACHMENT_RESTORE_CONCURRENCY = 1;
+const COMPOSER_IMAGE_COUNT_LIMIT = 4;
+const COMPOSER_IMAGE_BYTES_LIMIT = 16 * 1024 * 1024;
 const updateHandoffEncoder = new TextEncoder();
 const updateHandoffDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -791,8 +793,8 @@ export function createBrowserApp({
     authRecoveryUsername: null,
     authRecoveryWorkflow: null,
     authRecoveryGeneration: null,
-    selectedImage: null,
-    selectedImageUrl: null,
+    selectedImages: Object.freeze([]),
+    selectedImageUrls: Object.freeze([]),
     imagePreparing: false,
     imageSelectionEpoch: 0,
     imageRenderEpoch: 0,
@@ -965,16 +967,31 @@ export function createBrowserApp({
       && requireFreshAuthentication({ workflow: null, generationRecovery: recovery });
   }
 
+  function renderSelectedImages() {
+    const first = state.selectedImages[0];
+    elements.image_preview_thumbnail.src = state.selectedImageUrls[0] ?? "";
+    if (first === undefined) {
+      elements.image_preview_label.textContent = "";
+      elements.image_preview.hidden = true;
+      return;
+    }
+    const bytes = state.selectedImages.reduce((total, image) => total + image.byteLength, 0);
+    elements.image_preview_label.textContent = state.selectedImages.length === 1
+      ? `${first.width}×${first.height} · ${Math.ceil(bytes / 1024)} KiB`
+      : `${state.selectedImages.length} images · ${Math.ceil(bytes / 1024)} KiB total`;
+    elements.image_preview.hidden = false;
+  }
+
   function detachSelectedImage() {
     invalidatePreparedUpdateHandoff();
     state.imageSelectionEpoch += 1;
     state.imagePreparing = false;
-    const detached = state.selectedImage === null ? null : Object.freeze({
-      selected: state.selectedImage,
-      previewUrl: state.selectedImageUrl,
+    const detached = state.selectedImages.length === 0 ? null : Object.freeze({
+      selected: state.selectedImages,
+      previewUrls: state.selectedImageUrls,
     });
-    state.selectedImage = null;
-    state.selectedImageUrl = null;
+    state.selectedImages = Object.freeze([]);
+    state.selectedImageUrls = Object.freeze([]);
     elements.image_input.value = "";
     elements.image_preview_thumbnail.src = "";
     elements.image_preview_label.textContent = "";
@@ -983,9 +1000,7 @@ export function createBrowserApp({
   }
 
   function disposeDetachedImage(detached) {
-    if (detached?.previewUrl !== null && detached?.previewUrl !== undefined) {
-      revokeObjectUrl(detached.previewUrl);
-    }
+    for (const previewUrl of detached?.previewUrls ?? []) revokeObjectUrl(previewUrl);
   }
 
   function clearSelectedImage() {
@@ -993,16 +1008,14 @@ export function createBrowserApp({
   }
 
   function restoreDetachedImage(detached) {
-    if (!detached || state.selectedImage !== null || !state.session.authenticated
+    if (!detached || state.selectedImages.length !== 0 || !state.session.authenticated
         || state.mode !== "chat" || state.chatCapabilities.visionInput !== true) {
       disposeDetachedImage(detached);
       return false;
     }
-    state.selectedImage = detached.selected;
-    state.selectedImageUrl = detached.previewUrl;
-    elements.image_preview_thumbnail.src = detached.previewUrl;
-    elements.image_preview_label.textContent = `${detached.selected.width}×${detached.selected.height} · ${Math.ceil(detached.selected.byteLength / 1024)} KiB`;
-    elements.image_preview.hidden = false;
+    state.selectedImages = detached.selected;
+    state.selectedImageUrls = detached.previewUrls;
+    renderSelectedImages();
     return true;
   }
 
@@ -1016,16 +1029,17 @@ export function createBrowserApp({
       && state.chatCapabilities.visionInput === true;
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const locked = interactionLocked();
-    const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImage !== null;
+    const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
     const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
       && state.chatPendingSend?.ambiguousMutation !== undefined
-      && state.selectedImage !== null;
+      && state.selectedImages.length > 0;
     const fencedImage = preservingAuthenticationDraft || preservingAmbiguousImage;
-    if (!available && !fencedImage && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
+    if (!available && !fencedImage && (state.imagePreparing || state.selectedImages.length > 0)) clearSelectedImage();
     elements.add_image.hidden = !available;
-    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend;
+    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend
+      || state.selectedImages.length >= COMPOSER_IMAGE_COUNT_LIMIT;
     elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
-      || (state.selectedImage === null && !state.imagePreparing);
+      || (state.selectedImages.length === 0 && !state.imagePreparing);
     elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
       || preservingAuthenticationDraft;
     elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
@@ -1220,8 +1234,8 @@ export function createBrowserApp({
   function startAttachmentRestoration(job) {
     if (job.started || state.chatPendingSend !== null) return;
     job.started = true;
-    state.attachmentRestoreObserver?.unobserve?.(job.article);
-    state.attachmentRestoreObserved.delete(job.article);
+    state.attachmentRestoreObserver?.unobserve?.(job.observedTarget);
+    state.attachmentRestoreObserved.delete(job.observedTarget);
     job.image.dataset.previewState = "loading";
     job.article.dataset.attachmentState = "loading";
     job.status.textContent = "Loading attached image…";
@@ -1259,8 +1273,8 @@ export function createBrowserApp({
       startAttachmentRestoration(job);
       return;
     }
-    state.attachmentRestoreObserved.set(job.article, job);
-    try { observer.observe(job.article); }
+    state.attachmentRestoreObserved.set(job.observedTarget, job);
+    try { observer.observe(job.observedTarget); }
     catch { startAttachmentRestoration(job); }
   }
 
@@ -1376,6 +1390,11 @@ export function createBrowserApp({
         url = null;
         throw new TypeError("attached image exceeds the decoded preview memory limit");
       }
+      // Viewport admission and the one-at-a-time restoration queue already
+      // provide the lazy-loading bound. Chrome can indefinitely defer decode()
+      // for a hidden loading="lazy" image, especially in iOS-sized PWA views,
+      // so make the admitted private Blob eager before waiting for its decode.
+      image.loading = "eager";
       image.src = url;
       await waitForImageDecode(image, signal);
       if (!current()) {
@@ -1400,61 +1419,81 @@ export function createBrowserApp({
   }
 
   function messageNode(role, content, {
-    runId, attachment, threadId, localAttachment, attachmentReadyTasks,
+    runId, attachment, attachments, threadId, localAttachment, localAttachments, attachmentReadyTasks,
   } = {}) {
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.role = role;
     if (runId) article.dataset.runId = runId;
-    if (role === "user" && (localAttachment !== undefined || (attachment !== undefined && threadId && state.chat))) {
-      const image = document.createElement("img");
-      image.className = "message-attachment";
-      image.alt = "Attached image";
-      image.loading = "lazy";
-      image.decoding = "async";
-      article.appendChild(image);
-      if (localAttachment !== undefined) {
-        const url = createObjectUrl(new Blob([localAttachment.bytes], { type: localAttachment.mediaType }));
-        state.messageImageUrls.add(url);
-        state.localMessageImageUrls.add(url);
-        image.src = url;
-        image.dataset.previewState = "local";
-        article.dataset.attachmentState = "local";
-      } else {
-        image.hidden = true;
-        image.alt = "Attached image preview not loaded";
-        image.dataset.previewState = "deferred";
-        article.dataset.attachmentState = "deferred";
-        const status = document.createElement("button");
-        status.type = "button";
-        status.className = "message-attachment-status muted";
-        status.textContent = "Load attached image preview";
-        status.setAttribute("aria-label", "Load attached image preview");
-        article.appendChild(status);
-        const restorationOwner = Object.freeze({
-          expectedEpoch: state.viewEpoch,
-          chat: state.chat,
-        });
-        const job = {
-          article,
-          image,
-          status,
-          started: false,
-          restore: (signal) => restoreMessageAttachment({
+    const localImages = localAttachments ?? (localAttachment === undefined ? [] : [localAttachment]);
+    const storedImages = attachments ?? (attachment === undefined ? [] : [attachment]);
+    const displayImages = localImages.length > 0 ? localImages : storedImages;
+    if (role === "user" && displayImages.length > 0
+        && (localImages.length > 0 || (threadId && state.chat))) {
+      const gallery = displayImages.length > 1 ? document.createElement("div") : null;
+      if (gallery !== null) {
+        gallery.className = "message-attachments";
+        article.appendChild(gallery);
+      }
+      for (const [index, displayedAttachment] of displayImages.entries()) {
+        const imageParent = gallery === null ? article : document.createElement("div");
+        if (gallery !== null) {
+          imageParent.className = "message-attachment-item";
+          gallery.appendChild(imageParent);
+        }
+        const image = document.createElement("img");
+        image.className = "message-attachment";
+        image.alt = displayImages.length === 1 ? "Attached image" : `Attached image ${index + 1}`;
+        image.loading = "lazy";
+        image.decoding = "async";
+        imageParent.appendChild(image);
+        if (localImages.length > 0) {
+          const previewBlob = displayedAttachment.previewBlob instanceof Blob
+            ? displayedAttachment.previewBlob
+            : new Blob([displayedAttachment.bytes], { type: displayedAttachment.mediaType });
+          const url = createObjectUrl(previewBlob);
+          state.messageImageUrls.add(url);
+          state.localMessageImageUrls.add(url);
+          image.src = url;
+          image.dataset.previewState = "local";
+          article.dataset.attachmentState = "local";
+        } else {
+          image.hidden = true;
+          image.alt = "Attached image preview not loaded";
+          image.dataset.previewState = "deferred";
+          article.dataset.attachmentState = "deferred";
+          const status = document.createElement("button");
+          status.type = "button";
+          status.className = "message-attachment-status muted";
+          status.textContent = "Load attached image preview";
+          status.setAttribute("aria-label", "Load attached image preview");
+          imageParent.appendChild(status);
+          const restorationOwner = Object.freeze({
+            expectedEpoch: state.viewEpoch,
+            chat: state.chat,
+          });
+          const job = {
             article,
+            observedTarget: imageParent,
             image,
             status,
-            job,
-            threadId,
-            attachment,
-            signal,
-            expectedImageEpoch: state.imageRenderEpoch,
-            ...restorationOwner,
-          }),
-        };
-        const restoration = (options) => scheduleAttachmentRestoration(job, options);
-        if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(restoration);
-        else void restoration();
+            started: false,
+            restore: (signal) => restoreMessageAttachment({
+              article,
+              image,
+              status,
+              job,
+              threadId,
+              attachment: displayedAttachment,
+              signal,
+              expectedImageEpoch: state.imageRenderEpoch,
+              ...restorationOwner,
+            }),
+          };
+          const restoration = (options) => scheduleAttachmentRestoration(job, options);
+          if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(restoration);
+          else void restoration();
+        }
       }
     }
     const body = document.createElement("div");
@@ -1689,11 +1728,11 @@ export function createBrowserApp({
           || elements.message_input.value === composer.draft) {
         elements.message_input.value = composer.draft;
       }
-      if (composer.image !== null && state.selectedImage === null) {
+      if (composer.images.length > 0 && state.selectedImages.length === 0) {
         try {
           restoreDetachedImage(Object.freeze({
-            selected: composer.image,
-            previewUrl: createObjectUrl(composer.image.previewBlob),
+            selected: composer.images,
+            previewUrls: Object.freeze(composer.images.map((image) => createObjectUrl(image.previewBlob))),
           }));
         } catch { /* The exact text remains recoverable even if a local preview cannot be recreated. */ }
       }
@@ -1708,8 +1747,8 @@ export function createBrowserApp({
       workflow.failureStage ?? "before_run_dispatch",
       error,
     ));
-    showToast(composer?.image
-      ? "The image message was rejected before it ran. Its prompt and image are ready to edit or retry."
+    showToast(composer?.images?.length > 0
+      ? "The image message was rejected before it ran. Its prompt and images are ready to edit or retry."
       : "The message was rejected before it ran. Its prompt is ready to edit or retry.");
     if (diagnostic.reauthenticate) requireFreshAuthentication();
   }
@@ -1897,6 +1936,7 @@ export function createBrowserApp({
     snapshot.messages.forEach((message) => messageNode(message.role, message.content, {
       runId: message.generationId ?? undefined,
       attachment: message.attachment,
+      attachments: message.attachments,
       threadId: snapshot.thread.threadId,
       attachmentReadyTasks,
     }));
@@ -2236,6 +2276,49 @@ export function createBrowserApp({
     await streamAgentRun(run);
   }
 
+  function workflowAttachmentFields(attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return {};
+    return attachments.length === 1
+      ? { attachment: attachments[0] }
+      : { attachments };
+  }
+
+  async function exactRunMutation(chat, workflow, dispatch, retry) {
+    try {
+      const result = await dispatch();
+      if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
+      return result;
+    } catch (error) {
+      if (error?.retryable !== true) throw error;
+      workflow.ambiguousMutation = "run_dispatch";
+      const hasImages = workflow.runTicket?.attachment !== undefined
+        || workflow.runTicket?.attachments !== undefined;
+      if (hasImages) {
+        connection("Confirming the accepted image upload", false);
+        try {
+          const authoritative = await chat.getRunStatus({
+            threadId: workflow.runTicket.threadId,
+            generationId: workflow.runTicket.generationId,
+          });
+          workflow.ambiguousMutation = null;
+          return authoritative;
+        } catch (probeError) {
+          const definitelyAbsent = probeError instanceof DirectChatTransportError
+            && probeError.retryable === false && probeError.status === 404;
+          if (!definitelyAbsent) {
+            if (isChatAuthenticationAfterAmbiguousDispatch(probeError)) throw probeError;
+            throw error;
+          }
+        }
+      }
+      connection("Retrying the same durable request", false);
+      await wait(250);
+      const result = await retry();
+      workflow.ambiguousMutation = null;
+      return result;
+    }
+  }
+
   async function continueChatSend(workflow) {
     const session = state.session;
     const chat = state.chat;
@@ -2259,7 +2342,7 @@ export function createBrowserApp({
           content: workflow.text,
           expectedRevision: 0,
           expectedHash: null,
-          ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
+          ...workflowAttachmentFields(workflow.attachments),
         }),
       );
     }
@@ -2292,15 +2375,11 @@ export function createBrowserApp({
     thread = workflow.thread ?? thread;
     let started;
     if (workflow.runTicket && workflow.runDispatched) {
-      started = await exactMutation(
+      started = await exactRunMutation(
+        chat,
+        workflow,
         () => chat.retryRun(workflow.runTicket),
         () => chat.retryRun(workflow.runTicket),
-        {
-          onAmbiguous() { workflow.ambiguousMutation = "run_dispatch"; },
-          onConfirmed() {
-            if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
-          },
-        },
       );
       ensureCurrentSession();
     } else {
@@ -2332,27 +2411,31 @@ export function createBrowserApp({
             content: workflow.text,
             expectedRevision: thread.revision,
             expectedHash: thread.ledgerHash,
-            ...(workflow.attachment === null ? {} : { attachment: workflow.attachment }),
+            ...workflowAttachmentFields(workflow.attachments),
           }),
         );
       }
       workflow.failureStage = "run_dispatch";
       workflow.runDispatched = true;
-      started = await exactMutation(
+      started = await exactRunMutation(
+        chat,
+        workflow,
         () => chat.startRun(workflow.runTicket),
         () => chat.retryRun(workflow.runTicket),
-        {
-          onAmbiguous() { workflow.ambiguousMutation = "run_dispatch"; },
-          onConfirmed() {
-            if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
-          },
-        },
       );
       ensureCurrentSession();
     }
+    const acceptedGeneration = started.generation;
+    // startRun() also returns its immutable request for callers that need an
+    // audit receipt. Do not keep that request (and its image bytes) in this
+    // long-lived async frame while LocalLLM is generating.
+    started = null;
+    workflow.runTicket = null;
+    workflow.attachments = Object.freeze([]);
     if (workflow.lockedComposer !== null) {
       if (elements.message_input.value === workflow.lockedComposer.draft) elements.message_input.value = "";
-      if (workflow.lockedComposer.image !== null && state.selectedImage === workflow.lockedComposer.image) {
+      if (workflow.lockedComposer.images.length > 0
+          && state.selectedImages === workflow.lockedComposer.images) {
         clearSelectedImage();
       }
       workflow.lockedComposer = null;
@@ -2361,25 +2444,35 @@ export function createBrowserApp({
     state.chatPendingSend = null;
     clearChatFailureDiagnostic();
     renderThreads();
-    state.chatGeneration = started.generation;
+    state.chatGeneration = acceptedGeneration;
     state.chatAfterSequence = 0;
     state.chatOutput = "";
-    if (state.mode === "chat" && state.chatThreadId === started.generation.threadId) {
+    if (state.mode === "chat" && state.chatThreadId === acceptedGeneration.threadId) {
       messageNode("user", workflow.text, {
-        runId: started.generation.generationId,
-        ...(workflow.attachment === null ? {} : { localAttachment: workflow.attachment }),
+        runId: acceptedGeneration.generationId,
+        ...(workflow.localPreviews.length === 0 ? {} : { localAttachments: workflow.localPreviews }),
       });
     }
-    if (started.generation.terminal) await finishChatGeneration(started.generation, new AbortController());
-    else await streamChatGeneration(started.generation);
+    // The server now owns this exact turn. Release the canonical byte set and
+    // its pre-serialized retry body before waiting on LocalLLM output; only
+    // the bounded visible Blob previews remain in the conversation DOM.
+    workflow.localPreviews = Object.freeze([]);
+    const onAccepted = workflow.onAccepted;
+    workflow.onAccepted = null;
+    try { onAccepted?.(); } catch { /* Acceptance must not be undone by local cleanup. */ }
+    if (acceptedGeneration.terminal) await finishChatGeneration(acceptedGeneration, new AbortController());
+    else await streamChatGeneration(acceptedGeneration);
   }
 
-  async function sendChat(text, attachment = null) {
+  async function sendChat(text, attachments = Object.freeze([]), {
+    localPreviews = Object.freeze([]), onAccepted = null,
+  } = {}) {
     if (state.chatPendingSend) throw new TypeError("a durable chat request is already pending");
     if (state.chatGeneration?.status === "in_progress") throw new TypeError("the current generation must finish or be cancelled first");
     const workflow = {
       text,
-      attachment,
+      attachments,
+      localPreviews,
       threadTicket: null,
       threadDispatched: false,
       thread: null,
@@ -2389,7 +2482,13 @@ export function createBrowserApp({
       recoveryComposer: null,
       failureStage: "before_run_dispatch",
       ambiguousMutation: null,
+      onAccepted,
     };
+    // The workflow is the only owner until server acceptance. Clear the
+    // parameter bindings because this frame stays alive for the full stream.
+    attachments = Object.freeze([]);
+    localPreviews = Object.freeze([]);
+    onAccepted = null;
     state.chatPendingSend = workflow;
     renderThreads();
     try { await continueChatSend(workflow); }
@@ -2422,36 +2521,52 @@ export function createBrowserApp({
         || state.chatCapabilities.visionInput !== true || state.chatPendingSend !== null
         || state.logoutPending) return;
     const files = elements.image_input.files;
-    if (!files || files.length !== 1) {
-      clearSelectedImage();
+    if (!files || files.length < 1) {
+      elements.image_input.value = "";
       updateImageControl();
-      showToast("Choose exactly one JPEG or PNG image.");
       return;
     }
-    const file = files[0];
-    clearSelectedImage();
+    const selectedFiles = Array.from(files);
+    if (state.selectedImages.length + selectedFiles.length > COMPOSER_IMAGE_COUNT_LIMIT) {
+      elements.image_input.value = "";
+      showToast(`Choose up to ${COMPOSER_IMAGE_COUNT_LIMIT} JPEG or PNG images per message.`);
+      updateImageControl();
+      return;
+    }
     const selectionEpoch = state.imageSelectionEpoch;
     state.imagePreparing = true;
     updateImageControl();
+    const prepared = [];
+    const previewUrls = [];
     try {
-      const selected = await canonicalizeImage(file, {
-        document,
-        makeAttachmentId: createBrowserOpaqueId,
-      });
+      for (const file of selectedFiles) {
+        prepared.push(await canonicalizeImage(file, {
+          document,
+          makeAttachmentId: createBrowserOpaqueId,
+        }));
+      }
       if (selectionEpoch !== state.imageSelectionEpoch || !state.imagePreparing
           || !state.session.authenticated || state.mode !== "chat"
           || state.chatCapabilities.visionInput !== true || state.logoutPending) return;
-      const previewUrl = createObjectUrl(selected.previewBlob);
-      state.selectedImage = selected;
-      state.selectedImageUrl = previewUrl;
-      elements.image_preview_thumbnail.src = previewUrl;
-      elements.image_preview_label.textContent = `${selected.width}×${selected.height} · ${Math.ceil(selected.byteLength / 1024)} KiB`;
-      elements.image_preview.hidden = false;
+      const combined = [...state.selectedImages, ...prepared];
+      const totalBytes = combined.reduce((total, image) => total + image.byteLength, 0);
+      if (totalBytes > COMPOSER_IMAGE_BYTES_LIMIT
+          || new Set(combined.map((image) => image.attachmentId)).size !== combined.length) {
+        throw new TypeError("selected images exceed the aggregate limit");
+      }
+      for (const selected of prepared) previewUrls.push(createObjectUrl(selected.previewBlob));
+      invalidatePreparedUpdateHandoff();
+      state.selectedImages = Object.freeze(combined);
+      state.selectedImageUrls = Object.freeze([...state.selectedImageUrls, ...previewUrls]);
+      previewUrls.length = 0;
+      renderSelectedImages();
     } catch {
       if (selectionEpoch === state.imageSelectionEpoch && state.imagePreparing) {
-        showToast("That image could not be prepared safely. Use one JPEG or PNG under the displayed limits.");
+        showToast("Those images could not be prepared safely. Use up to four JPEG or PNG photos, each up to 24 MiB; the app will downscale them for sending.");
       }
     } finally {
+      for (const previewUrl of previewUrls) revokeObjectUrl(previewUrl);
+      elements.image_input.value = "";
       if (selectionEpoch === state.imageSelectionEpoch) state.imagePreparing = false;
       updateImageControl();
     }
@@ -2461,7 +2576,7 @@ export function createBrowserApp({
     event?.preventDefault?.();
     if (interactionLocked() || !state.session.authenticated) return;
     if (state.mode === "chat" && state.chatPendingSend) {
-      showToast("The previous durable send is awaiting confirmation. Use Resume; this draft and image were not changed.");
+      showToast("The previous durable send is awaiting confirmation. Use Resume; this draft and its images were not changed.");
       return;
     }
     if (state.imagePreparing) {
@@ -2479,22 +2594,37 @@ export function createBrowserApp({
     catch { return; }
     if (state.mode === "chat") fenceAttachmentRestorationsForSend();
     let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
-    const selected = detachedImage?.selected ?? null;
-    const attachment = selected === null ? null : Object.freeze({
-      attachmentId: selected.attachmentId,
-      mediaType: selected.mediaType,
-      byteLength: selected.byteLength,
-      width: selected.width,
-      height: selected.height,
-      bytes: selected.bytes,
-    });
+    let selected = detachedImage?.selected ?? Object.freeze([]);
+    let attachments = Object.freeze(selected.map((image) => Object.freeze({
+      attachmentId: image.attachmentId,
+      mediaType: image.mediaType,
+      byteLength: image.byteLength,
+      width: image.width,
+      height: image.height,
+      bytes: image.bytes,
+    })));
+    let localPreviews = Object.freeze(selected.map((image) => {
+      const previewBlob = image.previewBlob instanceof Blob
+        ? image.previewBlob
+        : new Blob([image.bytes], { type: image.mediaType });
+      return Object.freeze({ mediaType: previewBlob.type || image.mediaType, previewBlob });
+    }));
     elements.message_input.value = "";
     state.busy = true;
     elements.send_message.disabled = true;
     updateImageControl();
     try {
       if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text);
-      else await sendChat(text, attachment);
+      else await sendChat(text, attachments, {
+        localPreviews,
+        onAccepted() {
+          disposeDetachedImage(detachedImage);
+          detachedImage = null;
+          selected = Object.freeze([]);
+          attachments = Object.freeze([]);
+          localPreviews = Object.freeze([]);
+        },
+      });
     } catch (error) {
       const sameOwner = state.session === submissionSession
         && state.session.authenticated
@@ -2502,7 +2632,7 @@ export function createBrowserApp({
         && (submissionMode !== "chat" || state.chat === submissionChat);
       if (!sameOwner) return;
       if (state.mode === "chat" && state.chatPendingSend) {
-        state.chatPendingSend.recoveryComposer = Object.freeze({ draft, image: selected });
+        state.chatPendingSend.recoveryComposer = Object.freeze({ draft, images: selected });
       }
       const ambiguousAuthenticationWorkflow = state.mode === "chat"
         && state.chatPendingSend?.ambiguousMutation !== null
@@ -2516,7 +2646,7 @@ export function createBrowserApp({
         detachedImage = null;
         ambiguousAuthenticationWorkflow.lockedComposer = Object.freeze({
           draft,
-          image: imageRestored ? selected : null,
+          images: imageRestored ? selected : Object.freeze([]),
         });
         const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
           ambiguousAuthenticationWorkflow.ambiguousMutation,
@@ -2533,7 +2663,7 @@ export function createBrowserApp({
         detachedImage = null;
         const diagnostic = applyChatFailureDiagnostic(error);
         showToast(imageRestored
-          ? "This image message was not sent. Your prompt and image are still ready; edit or retry them."
+          ? `This image message was not sent. Your prompt and ${selected.length === 1 ? "image" : "images"} are still ready; edit or retry them.`
           : "This message was not sent. Your prompt is still in the composer; edit it and try again.");
         if (diagnostic.reauthenticate) requireFreshAuthentication();
       } else if (state.mode === "chat" && state.chatPendingSend && !state.chatPendingSend.runDispatched) {
@@ -2542,11 +2672,11 @@ export function createBrowserApp({
         detachedImage = null;
         state.chatPendingSend.lockedComposer = Object.freeze({
           draft,
-          image: imageRestored ? selected : null,
+          images: imageRestored ? selected : Object.freeze([]),
         });
         connection("Thread confirmation pending", false);
         showToast(imageRestored
-          ? "The thread may already exist. Your prompt and image remain visible and locked; Resume confirms the exact send."
+          ? `The thread may already exist. Your prompt and ${selected.length === 1 ? "image" : "images"} remain visible and locked; Resume confirms the exact send.`
           : "The thread may already exist. Your prompt remains visible and locked; Resume confirms the exact send.");
       } else {
         if (state.mode === "agent") {
@@ -2589,7 +2719,8 @@ export function createBrowserApp({
       clearSelectedImage();
       if (recoveryWorkflow !== null) {
         recoveryWorkflow.text = "";
-        recoveryWorkflow.attachment = null;
+        recoveryWorkflow.attachments = Object.freeze([]);
+        recoveryWorkflow.localPreviews = Object.freeze([]);
         recoveryWorkflow.threadTicket = null;
         recoveryWorkflow.runTicket = null;
         recoveryWorkflow.lockedComposer = null;
@@ -2683,7 +2814,7 @@ export function createBrowserApp({
         ? "chat"
         : selectDefaultMode(capability), { restoreView: false });
       const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
-        && state.selectedImage !== null && chatCapability.visionInput !== true
+        && state.selectedImages.length > 0 && chatCapability.visionInput !== true
         && sameAccountRecoveryWorkflow === null;
       state.authRecoveryPending = recoveryImageNeedsUserAction;
       state.authRecoveryUsername = recoveryImageNeedsUserAction
@@ -3019,7 +3150,7 @@ export function createBrowserApp({
   function updateComposerWork() {
     return Object.freeze({
       draft: String(elements.message_input.value ?? ""),
-      image: state.selectedImage,
+      images: state.selectedImages,
     });
   }
 
@@ -3035,15 +3166,16 @@ export function createBrowserApp({
     const work = updateComposerWork();
     return prepared !== null && prepared.targetRelease === targetRelease
       && prepared.session === state.session && prepared.threadId === state.chatThreadId
-      && prepared.draft === work.draft && prepared.image === work.image;
+      && prepared.draft === work.draft && prepared.images === work.images;
   }
 
   function updateHandoffEligible(targetRelease) {
     const work = updateComposerWork();
     return !updateHasUnsafeActivity() && state.session.authenticated && state.mode === "chat"
       && !state.authRecoveryPending && validAgentRelease(currentRelease) && validAgentRelease(targetRelease)
-      && (work.draft.length > 0 || work.image !== null)
-      && (work.image === null || state.chatCapabilities.visionInput === true)
+      && work.images.length <= 1
+      && (work.draft.length > 0 || work.images.length > 0)
+      && (work.images.length === 0 || state.chatCapabilities.visionInput === true)
       && (state.chatThreadId === null || UPDATE_HANDOFF_IDENTIFIER.test(state.chatThreadId));
   }
 
@@ -3059,7 +3191,8 @@ export function createBrowserApp({
     const epoch = state.updateHandoffEpoch;
     const session = state.session;
     const threadId = state.chatThreadId;
-    const { draft, image: selectedImage } = updateComposerWork();
+    const { draft, images: selectedImages } = updateComposerWork();
+    const selectedImage = selectedImages[0] ?? null;
     try {
       claim = createUpdateHandoffClaim();
       state.updateHandoffStagingClaim = claim;
@@ -3094,7 +3227,7 @@ export function createBrowserApp({
       await updateHandoffStore.save(await encryptUpdateHandoff(record, claim));
       if (epoch !== state.updateHandoffEpoch || state.session !== session
           || state.chatThreadId !== threadId || !updateHandoffEligible(targetRelease)
-          || elements.message_input.value !== draft || state.selectedImage !== selectedImage) {
+          || elements.message_input.value !== draft || state.selectedImages !== selectedImages) {
         await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
         return false;
       }
@@ -3103,7 +3236,7 @@ export function createBrowserApp({
         session,
         threadId,
         draft,
-        image: selectedImage,
+        images: selectedImages,
         claim,
       });
       return true;
@@ -3152,14 +3285,17 @@ export function createBrowserApp({
 
   function restoreUpdateHandoff(record) {
     if (record === null || !state.session.authenticated || state.mode !== "chat"
-        || state.chatPendingSend !== null || elements.message_input.value || state.selectedImage !== null) return false;
+        || state.chatPendingSend !== null || elements.message_input.value || state.selectedImages.length > 0) return false;
     let detached = null;
     try {
       if (record.image !== null) {
         if (state.chatCapabilities.visionInput !== true) return false;
         const previewBlob = new Blob([record.image.bytes], { type: record.image.mediaType });
         const selected = Object.freeze({ ...record.image, previewBlob });
-        detached = Object.freeze({ selected, previewUrl: createObjectUrl(previewBlob) });
+        detached = Object.freeze({
+          selected: Object.freeze([selected]),
+          previewUrls: Object.freeze([createObjectUrl(previewBlob)]),
+        });
         if (!restoreDetachedImage(detached)) return false;
         detached = null;
       }
@@ -3179,7 +3315,7 @@ export function createBrowserApp({
     if (state.updateHandoffInFlight || updateHasUnsafeActivity()) return false;
     if (!state.session.authenticated && String(elements.password.value ?? "").length > 0) return false;
     const work = updateComposerWork();
-    return (work.draft.length === 0 && work.image === null)
+    return (work.draft.length === 0 && work.images.length === 0)
       || (updateHandoffEligible(targetRelease) && updateHandoffMatchesComposer(targetRelease));
   }
 

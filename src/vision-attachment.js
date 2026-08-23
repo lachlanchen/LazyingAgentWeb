@@ -37,6 +37,8 @@ const CRC32_TABLE = (() => {
 export const VISION_ATTACHMENT_LIMITS = Object.freeze({
   bytes: 4 * 1024 * 1024,
   encodedBytes: Math.ceil((4 * 1024 * 1024) / 3) * 4,
+  attachmentsPerMessage: 4,
+  bytesPerMessage: 16 * 1024 * 1024,
   maximumEdge: 4_096,
   pixels: 16 * 1024 * 1024,
   attachmentsPerThread: 32,
@@ -338,6 +340,34 @@ export function validateVisionAttachmentRequest(value) {
     contentSha256,
     content
   });
+}
+
+export function validateVisionAttachmentsRequest(value) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
+      || value.length < 1 || value.length > VISION_ATTACHMENT_LIMITS.attachmentsPerMessage) {
+    invalid(`vision attachments must contain between 1 and ${VISION_ATTACHMENT_LIMITS.attachmentsPerMessage} images.`);
+  }
+  const attachments = [];
+  const identifiers = new Set();
+  let totalBytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) invalid('vision attachments must be a dense array.');
+    const attachment = validateVisionAttachmentRequest(value[index]);
+    if (identifiers.has(attachment.attachmentId)) invalid('vision attachment identifiers must be unique.');
+    identifiers.add(attachment.attachmentId);
+    totalBytes += attachment.byteLength;
+    if (totalBytes > VISION_ATTACHMENT_LIMITS.bytesPerMessage) {
+      invalid('vision attachments exceed the per-message byte limit.');
+    }
+    attachments.push(attachment);
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => key !== 'length'
+      && (typeof key !== 'string' || !/^(0|[1-9]\d*)$/u.test(key)
+        || Number(key) >= value.length))) {
+    invalid('vision attachments contain an unsupported property.');
+  }
+  return Object.freeze(attachments);
 }
 
 export function validateStoredVisionAttachment(value) {

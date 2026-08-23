@@ -215,6 +215,51 @@ test('sends the latest private canonical image only to the fixed vision alias as
   assert.equal(calls.length, 1);
 });
 
+test('sends a bounded ordered image set in one LocalLLM vision message', async () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  let requestBody;
+  const value = connector(async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return streamResponse(['data: [DONE]\n\n']);
+  }, { allowedModelAliases: ['localllm-fast', 'localllm-vision'] });
+  const attachment = (suffix) => ({
+    attachmentId: `image_${suffix}_0000000000000001`,
+    messageId: 'message-one',
+    mediaType: 'image/png',
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    contentSha256: createHash('sha256').update(bytes).digest('hex'),
+    content: bytes
+  });
+  const visionAttachments = [attachment('first'), attachment('second')];
+  const output = await value.generate(generationInput({
+    modelAlias: 'localllm-vision',
+    visionAttachments
+  }));
+  await collect(output);
+
+  assert.deepEqual(requestBody.messages.at(-1).content, [
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` } },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` } },
+    { type: 'text', text: 'Plot y = x².' }
+  ]);
+  await assert.rejects(
+    value.generate(generationInput({
+      modelAlias: 'localllm-vision',
+      visionAttachments: [...visionAttachments, attachment('third'), attachment('fourth'), attachment('fifth')]
+    })),
+    /bounded plain array/u
+  );
+  await assert.rejects(
+    value.generate(generationInput({
+      modelAlias: 'localllm-vision',
+      visionAttachments: [visionAttachments[0], visionAttachments[0]]
+    })),
+    /unique/u
+  );
+});
+
 test('lists models and reports readiness without exposing the credential', async () => {
   const calls = [];
   const value = connector(async (url, init) => {

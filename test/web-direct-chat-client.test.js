@@ -287,6 +287,140 @@ test("vision capabilities, canonical image retries, and authenticated previews s
   assert.equal(calls[3].options.headers.get("x-csrf-token"), CSRF);
 });
 
+test("multi-image run tickets preserve order and bytes across exact retries", async () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  const calls = [];
+  const originalStringify = JSON.stringify;
+  let runBodySerializations = 0;
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async (_url, options) => {
+      calls.push(options);
+      const body = JSON.parse(options.body);
+      return jsonResponse({ generation: publicGeneration({
+        threadId: body.threadId,
+        generationId: body.generationId,
+        assistantMessageId: body.assistantMessageId,
+        modelAlias: "localllm-vision",
+      }) }, { status: 202 });
+    },
+  }));
+  const attachments = ["first", "second"].map((suffix) => ({
+    attachmentId: `image_${suffix}_0000000000000001`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    bytes,
+  }));
+  let request;
+  try {
+    JSON.stringify = (value, ...rest) => {
+      if (value?.attachments !== undefined) runBodySerializations += 1;
+      return originalStringify(value, ...rest);
+    };
+    request = client.prepareRun({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      content: "Compare these images in order.",
+      expectedRevision: 0,
+      expectedHash: null,
+      attachments,
+    });
+    await client.startRun(request);
+    await client.retryRun(request);
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+  assert.equal(runBodySerializations, 1, "the exact large JSON upload body is serialized once before dispatch");
+  assert.equal(calls[0].body, calls[1].body);
+  assert.deepEqual(JSON.parse(calls[0].body).attachments, attachments.map((attachment) => ({
+    attachmentId: attachment.attachmentId,
+    mediaType: attachment.mediaType,
+    data: bytes.toString("base64"),
+  })));
+  assert.throws(() => client.prepareRun({
+    threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+    content: "Too many.",
+    expectedRevision: 0,
+    expectedHash: null,
+    attachments: [...attachments, attachments[0], attachments[1], attachments[0]],
+  }), /invalid/u);
+  assert.throws(() => client.prepareRun({
+    threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+    content: "Reject duplicate identities.",
+    expectedRevision: 0,
+    expectedHash: null,
+    attachments: [attachments[0], { ...attachments[1], attachmentId: attachments[0].attachmentId }],
+  }), /unique/u);
+
+  const encodedBeyondFourMiB = "A".repeat(Math.ceil((4 * 1024 * 1024) / 3) * 4);
+  await assert.rejects(client.startRun({
+    ...request,
+    attachments: Array.from({ length: 4 }, (_, index) => ({
+      attachmentId: `image_aggregate_${index}_xxxxxxxxxxxx`,
+      mediaType: "image/png",
+      data: encodedBeyondFourMiB,
+    })),
+  }), /aggregate/u);
+
+  const sparseAttachments = new Array(2);
+  sparseAttachments[0] = request.attachments[0];
+  await assert.rejects(client.startRun({
+    ...request,
+    attachments: sparseAttachments,
+  }), /dense/u);
+
+  let getterCalls = 0;
+  const accessorAttachments = [request.attachments[0], request.attachments[1]];
+  Object.defineProperty(accessorAttachments, 1, {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return request.attachments[1];
+    },
+  });
+  await assert.rejects(client.startRun({
+    ...request,
+    attachments: accessorAttachments,
+  }), /dense/u);
+  assert.equal(getterCalls, 0);
+});
+
+test("a local large-body serialization failure occurs before any ambiguous network dispatch", () => {
+  const bytes = Buffer.from(createPwaIcon(192));
+  let fetchCalls = 0;
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      throw new Error("fetch must not run");
+    },
+  }));
+  const attachments = [0, 1].map((index) => ({
+    attachmentId: `image_serialize_${index}_xxxxxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192,
+    height: 192,
+    bytes,
+  }));
+  const originalStringify = JSON.stringify;
+  try {
+    JSON.stringify = (value, ...rest) => {
+      if (value?.attachments !== undefined) throw new RangeError("simulated mobile allocation failure");
+      return originalStringify(value, ...rest);
+    };
+    assert.throws(() => client.prepareRun({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      content: "Preserve this unsent image draft.",
+      expectedRevision: 0,
+      expectedHash: null,
+      attachments,
+    }), /allocation failure/u);
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+  assert.equal(fetchCalls, 0);
+});
+
 test("maximum-size image base64 uses bounded mobile intermediates and stays canonical", () => {
   const bytes = new Uint8Array(4 * 1024 * 1024);
   Object.defineProperty(bytes, "toBase64", { value: undefined });
@@ -461,9 +595,40 @@ test("read routes validate public owner-free thread and message envelopes", asyn
   assert.deepEqual(calls.map((call) => call.body), [
     { limit: 5 },
     { threadId: thread.threadId },
-    { threadId: thread.threadId, afterRevision: 0, limit: 100 },
+    { threadId: thread.threadId, afterRevision: 0, limit: 100, attachmentSchema: 2 },
     { threadId: thread.threadId, generationId: "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx" },
   ]);
+});
+
+test("message reads accept an ordered bounded attachment array without private bytes", async () => {
+  const thread = publicThread({ revision: 1, ledgerHash: HASH_A, messageCount: 1, ledgerBytes: 5 });
+  const attachments = [HASH_B, HASH_C].map((digest, index) => ({
+    attachmentId: `image_read_${index}_xxxxxxxxxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: index + 1,
+    width: 1,
+    height: 1,
+    sha256: digest,
+  }));
+  const message = {
+    threadId: thread.threadId,
+    messageId: "message_multi_read_xxxxxxxxxxxxxxxx",
+    revision: 1,
+    role: "user",
+    content: "hello",
+    contentBytes: 5,
+    previousHash: null,
+    messageHash: HASH_A,
+    generationId: null,
+    createdAt: NOW,
+    attachments,
+  };
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => jsonResponse({ messages: [message] }),
+  }));
+  const response = await client.listMessages({ threadId: thread.threadId });
+  assert.deepEqual(response.messages[0].attachments, attachments);
+  assert.equal(Object.hasOwn(response.messages[0], "attachment"), false);
 });
 
 test("the default Direct Chat fetch keeps the global browser receiver", async () => {

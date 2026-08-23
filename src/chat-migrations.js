@@ -490,6 +490,61 @@ BEGIN
 END;
 `;
 
+const MULTI_VISION_ATTACHMENT_SCHEMA = `
+DROP TRIGGER direct_chat_attachments_no_update;
+DROP TRIGGER direct_chat_attachments_no_delete;
+DROP INDEX direct_chat_attachments_owner_latest;
+
+ALTER TABLE direct_chat_attachments RENAME TO direct_chat_attachments_v3;
+
+CREATE TABLE direct_chat_attachments (
+  account_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL CHECK (length(attachment_id) BETWEEN 1 AND 128),
+  message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128),
+  position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 3),
+  media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png')),
+  byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 4194304),
+  width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+  height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+  content_sha256 TEXT NOT NULL CHECK (
+    length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+  ),
+  content BLOB NOT NULL CHECK (length(content) = byte_length),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, thread_id, attachment_id),
+  UNIQUE (account_id, thread_id, message_id, position),
+  FOREIGN KEY (account_id, thread_id, message_id)
+    REFERENCES direct_chat_messages(account_id, thread_id, message_id) ON DELETE RESTRICT,
+  CHECK (width * height <= 16777216)
+) STRICT;
+
+INSERT INTO direct_chat_attachments(
+  account_id, thread_id, attachment_id, message_id, position, media_type,
+  byte_length, width, height, content_sha256, content, created_at
+)
+SELECT account_id, thread_id, attachment_id, message_id, 0, media_type,
+       byte_length, width, height, content_sha256, content, created_at
+FROM direct_chat_attachments_v3;
+
+DROP TABLE direct_chat_attachments_v3;
+
+CREATE INDEX direct_chat_attachments_owner_latest
+  ON direct_chat_attachments(account_id, thread_id, created_at DESC, attachment_id DESC);
+
+CREATE TRIGGER direct_chat_attachments_no_update
+BEFORE UPDATE ON direct_chat_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat attachments are immutable');
+END;
+
+CREATE TRIGGER direct_chat_attachments_no_delete
+BEFORE DELETE ON direct_chat_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat attachments are durable');
+END;
+`;
+
 function checksum(sql) {
   return createHash('sha256').update(sql, 'utf8').digest('hex');
 }
@@ -512,6 +567,12 @@ export const CHAT_MIGRATIONS = Object.freeze([
     name: 'private_vision_attachments',
     sql: VISION_ATTACHMENT_SCHEMA,
     checksum: checksum(VISION_ATTACHMENT_SCHEMA)
+  }),
+  Object.freeze({
+    version: 4,
+    name: 'bounded_multi_vision_attachments',
+    sql: MULTI_VISION_ATTACHMENT_SCHEMA,
+    checksum: checksum(MULTI_VISION_ATTACHMENT_SCHEMA)
   })
 ]);
 
@@ -563,9 +624,12 @@ const EXPECTED_SCHEMA_OBJECTS_V3 = Object.freeze([
   ...EXPECTED_SCHEMA_OBJECTS_V2.slice(24)
 ]);
 
+const EXPECTED_SCHEMA_OBJECTS_V4 = EXPECTED_SCHEMA_OBJECTS_V3;
+
 const EXPECTED_SCHEMA_FINGERPRINTS = Object.freeze({
   2: 'ad84514c28ac6762061439579862853249f6c87b613f81b79a20947d5c52d4d5',
-  3: '1707c8971cd41ed0fe3743af381528ff176dc91c2ed398b2e74ffb0d17b5d0bb'
+  3: '1707c8971cd41ed0fe3743af381528ff176dc91c2ed398b2e74ffb0d17b5d0bb',
+  4: '4c8475d7a9aa7052733d27f514adfb539266a58c629f7eccf6522bbd70d9a256'
 });
 
 function pragmaInteger(database, pragma) {
@@ -634,7 +698,9 @@ function verifySchemaObjects(database, currentVersion) {
   const actual = rows.map((row) => `${row.type}:${row.name}:${row.tbl_name}`);
   const expectedObjects = currentVersion === 2
     ? EXPECTED_SCHEMA_OBJECTS_V2
-    : (currentVersion === 3 ? EXPECTED_SCHEMA_OBJECTS_V3 : null);
+    : (currentVersion === 3
+      ? EXPECTED_SCHEMA_OBJECTS_V3
+      : (currentVersion === 4 ? EXPECTED_SCHEMA_OBJECTS_V4 : null));
   if (expectedObjects === null || JSON.stringify(actual) !== JSON.stringify(expectedObjects)) {
     throw new StorageCorruptionError('The direct-chat schema object set is missing, altered, or extended.');
   }
@@ -668,9 +734,9 @@ export function applyChatMigrations(database, appliedAt, { enableVisionAttachmen
   }
 
   // Disabled deployments deliberately remain on v2 until the feature is
-  // enabled. Once a database reaches v3, this v3-aware build continues
-  // accepting it with vision disabled; a pre-v3 binary is not a rollback
-  // target after first enablement.
+  // enabled. Once a database reaches v3, this v4-aware build completes the
+  // ordered-attachment expansion and continues accepting it with vision
+  // disabled; a pre-v4 binary is not a rollback target after migration.
   const targetVersion = enableVisionAttachments || currentVersion >= 3
     ? LATEST_CHAT_SCHEMA_VERSION
     : DEFAULT_CHAT_SCHEMA_VERSION;

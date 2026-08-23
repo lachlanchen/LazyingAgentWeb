@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createPwaIcon } from '../src/web/pwa-assets.js';
+import { createAppShellHtml, createPwaIcon } from '../src/web/pwa-assets.js';
 import { validateVisionAttachmentRequest } from '../src/vision-attachment.js';
 import {
   BROWSER_VISION_IMAGE_LIMITS,
@@ -55,6 +55,26 @@ function insertJpegSegment(bytes, marker, data) {
   return Buffer.concat([bytes.subarray(0, 2), segment, bytes.subarray(2)]);
 }
 
+function rewriteJpegDimensions(bytes, width, height) {
+  const result = Buffer.from(bytes);
+  let offset = 2;
+  while (offset < result.byteLength) {
+    while (offset < result.byteLength && result[offset] === 0xff) offset += 1;
+    const marker = result[offset];
+    offset += 1;
+    if (marker === 0xd9 || marker === 0xda || offset + 2 > result.byteLength) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    const length = result.readUInt16BE(offset);
+    if (marker === 0xc0) {
+      result.writeUInt16BE(height, offset + 3);
+      result.writeUInt16BE(width, offset + 5);
+      return result;
+    }
+    offset += length;
+  }
+  throw new TypeError('test JPEG has no baseline frame');
+}
+
 function file(bytes, type) {
   return Object.freeze({
     size: bytes.byteLength,
@@ -84,7 +104,10 @@ function browserHarness(outputBytes, outputType, dimensions, calls) {
     },
     toBlob(callback, type, quality) {
       calls.push(['toBlob', type, quality]);
-      callback(new Blob([outputBytes], { type: outputType }));
+      const bytes = typeof outputBytes === 'function'
+        ? outputBytes({ width: canvas.width, height: canvas.height, type, quality })
+        : outputBytes;
+      callback(new Blob([bytes], { type: outputType }));
     }
   };
   return {
@@ -166,6 +189,121 @@ test('preserves browser-applied metadata orientation while stripping the source 
   assert.deepEqual(calls[1], ['drawImage', 0, 0, 240, 320]);
 });
 
+test('downscales a 48 MP iPhone-shaped JPEG and keeps its oriented preview independently bounded', async () => {
+  const source = rewriteJpegDimensions(JPEG_BYTES, 8064, 6048);
+  assert.throws(() => inspectVisionImageBytes(source, 'image/jpeg'), /safe vision limit/u,
+    'the durable canonical inspector must remain strict');
+  const calls = [];
+  const output = ({ width, height }) => rewriteJpegDimensions(JPEG_BYTES, width, height);
+  const harness = browserHarness(output, 'image/jpeg', { width: 6048, height: 8064 }, calls);
+  const result = await canonicalizeVisionImage(file(source, 'image/jpeg'), harness);
+
+  assert.deepEqual([result.mediaType, result.width, result.height], ['image/jpeg', 3072, 4096]);
+  assert.ok(result.byteLength <= BROWSER_VISION_IMAGE_LIMITS.canonicalBytes);
+  const previewBytes = new Uint8Array(await result.previewBlob.arrayBuffer());
+  const preview = inspectVisionImageBytes(previewBytes, result.previewBlob.type);
+  assert.deepEqual(preview, { width: 384, height: 512 });
+  assert.ok(result.previewBlob.size <= BROWSER_VISION_IMAGE_LIMITS.previewBytes);
+  assert.deepEqual(calls.filter(([name]) => name === 'drawImage'), [
+    ['drawImage', 0, 0, 3072, 4096],
+    ['drawImage', 0, 0, 384, 512]
+  ]);
+  assert.deepEqual(calls.at(-1), ['close']);
+});
+
+test('downscales a high-resolution PNG while preserving a bounded PNG thumbnail', async () => {
+  const icon = Buffer.from(createPwaIcon(192));
+  const source = rewritePngDimensions(icon, 8064, 6048);
+  const calls = [];
+  const output = ({ width, height }) => rewritePngDimensions(icon, width, height);
+  const result = await canonicalizeVisionImage(
+    file(source, 'image/png'),
+    browserHarness(output, 'image/png', { width: 8064, height: 6048 }, calls)
+  );
+
+  assert.deepEqual([result.mediaType, result.width, result.height], ['image/png', 4096, 3072]);
+  const previewBytes = new Uint8Array(await result.previewBlob.arrayBuffer());
+  assert.deepEqual(inspectVisionImageBytes(previewBytes, result.previewBlob.type), { width: 512, height: 384 });
+  assert.ok(result.previewBlob.size <= BROWSER_VISION_IMAGE_LIMITS.previewBytes);
+  assert.deepEqual(calls.filter(([name]) => name === 'drawImage'), [
+    ['drawImage', 0, 0, 4096, 3072],
+    ['drawImage', 0, 0, 512, 384]
+  ]);
+});
+
+test('sniffs an iOS JPEG export with an empty MIME type and exposes extension hints in the picker', async () => {
+  const calls = [];
+  const result = await canonicalizeVisionImage(
+    file(JPEG_BYTES, ''),
+    browserHarness(JPEG_BYTES, 'image/jpeg', { width: 1, height: 1 }, calls)
+  );
+  assert.equal(result.mediaType, 'image/jpeg');
+  assert.match(
+    createAppShellHtml({ version: 'release-1234567890abcdef' }),
+    /accept="image\/jpeg,image\/png,\.jpg,\.jpeg,\.png"/u
+  );
+});
+
+test('retries createImageBitmap without options for Safari implementations that reject the overload', async () => {
+  const calls = [];
+  const harness = browserHarness(JPEG_BYTES, 'image/jpeg', { width: 1, height: 1 }, calls);
+  const supportedDecode = harness.createImageBitmapImpl;
+  const arities = [];
+  harness.createImageBitmapImpl = async (...args) => {
+    arities.push(args.length);
+    if (args.length > 1) throw new TypeError('options overload unsupported');
+    return supportedDecode(...args);
+  };
+  const result = await canonicalizeVisionImage(file(JPEG_BYTES, 'image/jpeg'), harness);
+  assert.equal(result.mediaType, 'image/jpeg');
+  assert.deepEqual(arities, [2, 1]);
+  assert.deepEqual(calls.at(-1), ['close']);
+});
+
+test('uses and cleans up a Safari HTMLImageElement decoder when createImageBitmap is unavailable', async () => {
+  const png = Buffer.from(createPwaIcon(192));
+  const source = rewritePngDimensions(png, 320, 240);
+  const calls = [];
+  const harness = browserHarness(
+    ({ width, height }) => rewritePngDimensions(png, width, height),
+    'image/png',
+    { width: 320, height: 240 },
+    calls
+  );
+  const canvasDocument = harness.document;
+  const image = {
+    naturalWidth: 320,
+    naturalHeight: 240,
+    decoding: '',
+    src: '',
+    async decode() { calls.push(['imageDecode', this.src]); },
+    removeAttribute(name) { calls.push(['removeAttribute', name]); this.src = ''; }
+  };
+  harness.document = {
+    createElement(name) {
+      if (name === 'img') return image;
+      return canvasDocument.createElement(name);
+    }
+  };
+  harness.createImageBitmapImpl = null;
+  harness.createObjectUrl = () => {
+    calls.push(['createObjectUrl']);
+    return 'blob:safari-photo';
+  };
+  harness.revokeObjectUrl = (url) => calls.push(['revokeObjectUrl', url]);
+
+  const result = await canonicalizeVisionImage(file(source, 'image/png'), harness);
+  assert.deepEqual([result.width, result.height], [320, 240]);
+  assert.deepEqual(calls.slice(0, 2), [
+    ['createObjectUrl'],
+    ['imageDecode', 'blob:safari-photo']
+  ]);
+  assert.deepEqual(calls.slice(-2), [
+    ['removeAttribute', 'src'],
+    ['revokeObjectUrl', 'blob:safari-photo']
+  ]);
+});
+
 test('known Safari PNG and JPEG metadata sanitize deterministically before strict server validation', () => {
   const png = Buffer.from(createPwaIcon(192));
   const pngWithExif = insertPngChunk(png, 'eXIf', Buffer.from([0x4d, 0x4d, 0x00, 0x2a]));
@@ -223,14 +361,28 @@ test('C2PA caBX metadata strips with CRC validation, idempotence, and strict ser
 test('rejects unsupported, oversized, forged, changed, and over-cap canonical images', async () => {
   const png = Buffer.from(createPwaIcon(192));
   assert.throws(() => inspectVisionImageBytes(png, 'image/gif'), /JPEG or PNG/u);
-  await assert.rejects(() => canonicalizeVisionImage(file(png, 'image/gif'), {}), /one JPEG or PNG/u);
+  await assert.rejects(() => canonicalizeVisionImage(file(png, 'image/gif'), {}), /JPEG or PNG image up to 24 MiB/u);
 
   const oversized = {
     size: BROWSER_VISION_IMAGE_LIMITS.sourceBytes + 1,
     type: 'image/png',
     async arrayBuffer() { return new ArrayBuffer(0); }
   };
-  await assert.rejects(() => canonicalizeVisionImage(oversized, {}), /one JPEG or PNG/u);
+  await assert.rejects(() => canonicalizeVisionImage(oversized, {}), /JPEG or PNG image up to 24 MiB/u);
+
+  const heic = { ...file(png, 'image/heic') };
+  await assert.rejects(() => canonicalizeVisionImage(heic, {}), /HEIC\/HEIF.*safety checks/u);
+
+  const decodeBombHeader = rewritePngDimensions(png, BROWSER_VISION_IMAGE_LIMITS.sourceMaximumEdge + 1, 1);
+  const decodeBombCalls = [];
+  await assert.rejects(
+    () => canonicalizeVisionImage(
+      file(decodeBombHeader, 'image/png'),
+      browserHarness(png, 'image/png', { width: 192, height: 192 }, decodeBombCalls)
+    ),
+    /source image dimensions exceed the safe decode limit/u
+  );
+  assert.deepEqual(decodeBombCalls, [], 'unsafe source geometry is rejected before browser decode');
 
   const forged = Buffer.from(png);
   forged[0] = 0;

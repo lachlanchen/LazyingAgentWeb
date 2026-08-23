@@ -12,7 +12,9 @@ const MAX_STREAM_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_VISION_ATTACHMENT_BYTES = 4 * 1024 * 1024;
-const MAX_VISION_REQUEST_BYTES = 7 * 1024 * 1024;
+const MAX_VISION_ATTACHMENTS = 4;
+const MAX_VISION_ATTACHMENTS_BYTES = 16 * 1024 * 1024;
+const MAX_VISION_REQUEST_BYTES = 24 * 1024 * 1024;
 const CONTEXT_SCHEMA = 'lazying.direct-chat.context.v1';
 const DEFAULT_SYSTEM_PROMPT =
   'You are the direct LocalLLM chat assistant. Be accurate, capable, and concise. ' +
@@ -237,6 +239,25 @@ function validateVisionAttachment(value) {
     mediaType: attachment.mediaType,
     content: Buffer.from(attachment.content)
   });
+}
+
+function validateVisionAttachments(value) {
+  denseArray(value, 'visionAttachments', MAX_VISION_ATTACHMENTS);
+  if (value.length < 1) throw new TypeError('visionAttachments cannot be empty');
+  const identifiers = new Set();
+  let totalBytes = 0;
+  const attachments = value.map((entry) => {
+    const attachment = validateVisionAttachment(entry);
+    const identifier = entry.attachmentId;
+    if (identifiers.has(identifier)) throw new TypeError('visionAttachment identifiers must be unique');
+    identifiers.add(identifier);
+    totalBytes += attachment.content.byteLength;
+    if (totalBytes > MAX_VISION_ATTACHMENTS_BYTES) {
+      throw new TypeError('visionAttachments exceed the aggregate byte budget');
+    }
+    return attachment;
+  });
+  return Object.freeze(attachments);
 }
 
 function contentType(response) {
@@ -534,7 +555,7 @@ export function createLocalLlmConnector({
       const checked = exactKeys(
         input,
         ['modelAlias', 'context', 'replay', 'signal'],
-        ['visionAttachment'],
+        ['visionAttachment', 'visionAttachments'],
         'generate input'
       );
       const { modelAlias, context, signal } = checked;
@@ -543,7 +564,15 @@ export function createLocalLlmConnector({
           failureCode: 'content_rejected'
         });
       }
-      if ((checked.visionAttachment !== undefined) !== (modelAlias === VISION_MODEL_ALIAS)) {
+      if (checked.visionAttachment !== undefined && checked.visionAttachments !== undefined) {
+        throw new TypeError('generate input cannot contain both visionAttachment and visionAttachments');
+      }
+      const visionAttachments = checked.visionAttachments !== undefined
+        ? validateVisionAttachments(checked.visionAttachments)
+        : (checked.visionAttachment === undefined
+          ? Object.freeze([])
+          : Object.freeze([validateVisionAttachment(checked.visionAttachment)]));
+      if ((visionAttachments.length > 0) !== (modelAlias === VISION_MODEL_ALIAS)) {
         fail('LOCALLLM_MODEL_REJECTED', 'Vision input must use the fixed LocalLLM vision alias.', {
           failureCode: 'content_rejected'
         });
@@ -558,18 +587,17 @@ export function createLocalLlmConnector({
         );
       }
       const messages = [...validateContext(context)];
-      if (checked.visionAttachment !== undefined) {
-        const attachment = validateVisionAttachment(checked.visionAttachment);
+      if (visionAttachments.length > 0) {
         const last = messages.at(-1);
         messages[messages.length - 1] = Object.freeze({
           role: 'user',
           content: Object.freeze([
-            Object.freeze({
+            ...visionAttachments.map((attachment) => Object.freeze({
               type: 'image_url',
               image_url: Object.freeze({
                 url: `data:${attachment.mediaType};base64,${attachment.content.toString('base64')}`
               })
-            }),
+            })),
             Object.freeze({ type: 'text', text: last.content })
           ])
         });
@@ -584,7 +612,7 @@ export function createLocalLlmConnector({
         stream: true,
         stream_options: { include_usage: false }
       });
-      if (Buffer.byteLength(body, 'utf8') > (checked.visionAttachment === undefined
+      if (Buffer.byteLength(body, 'utf8') > (visionAttachments.length === 0
         ? 1024 * 1024
         : MAX_VISION_REQUEST_BYTES)) {
         fail('LOCALLLM_CONTEXT_LIMIT', 'The Direct Chat context exceeds the connector request bound.', {

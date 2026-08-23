@@ -13,6 +13,7 @@ import {
   sha256
 } from './validation.js';
 import { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from './direct-chat-contract.js';
+import { VISION_ATTACHMENT_LIMITS } from './vision-attachment.js';
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTEXT_SCHEMA = 'lazying.direct-chat.context.v1';
@@ -91,13 +92,72 @@ function assertScalarString(value, name, { minBytes = 1, maxBytes }) {
   return Object.freeze({ value, bytes });
 }
 
+function exactAttachmentDescriptor(value, name) {
+  assertExactKeys(value, {
+    required: ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256']
+  }, name);
+  if (!['image/jpeg', 'image/png'].includes(value.mediaType)
+      || !Number.isSafeInteger(value.byteLength)
+      || value.byteLength < 1 || value.byteLength > VISION_ATTACHMENT_LIMITS.bytes
+      || !Number.isSafeInteger(value.width) || value.width < 1
+      || value.width > VISION_ATTACHMENT_LIMITS.maximumEdge
+      || !Number.isSafeInteger(value.height) || value.height < 1
+      || value.height > VISION_ATTACHMENT_LIMITS.maximumEdge
+      || value.width * value.height > VISION_ATTACHMENT_LIMITS.pixels
+      || typeof value.sha256 !== 'string'
+      || !HASH_PATTERN.test(value.sha256)) {
+    throw new ValidationError(`${name} is invalid.`);
+  }
+  return Object.freeze({ ...value });
+}
+
+function exactAttachmentFields(message) {
+  if (message.attachment !== undefined && message.attachments !== undefined) {
+    throw new ValidationError('A message has ambiguous vision attachment fields.');
+  }
+  if (message.attachment !== undefined) {
+    return Object.freeze({
+      attachment: exactAttachmentDescriptor(message.attachment, 'message.attachment')
+    });
+  }
+  if (message.attachments === undefined) return Object.freeze({});
+  if (!Array.isArray(message.attachments)
+      || Object.getPrototypeOf(message.attachments) !== Array.prototype
+      || message.attachments.length < 2
+      || message.attachments.length > VISION_ATTACHMENT_LIMITS.attachmentsPerMessage) {
+    throw new ValidationError('message.attachments is invalid.');
+  }
+  const identifiers = new Set();
+  let bytes = 0;
+  const attachments = [];
+  for (let index = 0; index < message.attachments.length; index += 1) {
+    if (!Object.hasOwn(message.attachments, index)) {
+      throw new ValidationError('message.attachments must be dense.');
+    }
+    const attachment = exactAttachmentDescriptor(
+      message.attachments[index],
+      `message.attachments[${index}]`
+    );
+    if (identifiers.has(attachment.attachmentId)) {
+      throw new ValidationError('message attachment identifiers must be unique.');
+    }
+    identifiers.add(attachment.attachmentId);
+    bytes += attachment.byteLength;
+    if (bytes > VISION_ATTACHMENT_LIMITS.bytesPerMessage) {
+      throw new ValidationError('message attachments exceed their aggregate byte limit.');
+    }
+    attachments.push(attachment);
+  }
+  return Object.freeze({ attachments: Object.freeze(attachments) });
+}
+
 function exactMessage(message, accountId, threadId, expectedRevision, previousHash) {
   if (message === null || typeof message !== 'object' || Array.isArray(message)) {
     throw new StorageCorruptionError('A direct-chat context ledger row is invalid.');
   }
   let messageId;
   let generationId;
-  let attachment;
+  let attachmentFields;
   try {
     if (message.accountId !== accountId || message.threadId !== threadId) {
       throw new ValidationError('The message owner does not match the requested ledger.');
@@ -112,24 +172,9 @@ function exactMessage(message, accountId, threadId, expectedRevision, previousHa
     } else {
       generationId = assertIdentifier(message.generationId, 'message.generationId');
     }
-    if (message.attachment !== undefined) {
-      if (message.role !== 'user') throw new ValidationError('An assistant message has a vision attachment.');
-      assertExactKeys(message.attachment, {
-        required: ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256']
-      }, 'message.attachment');
-      if (!['image/jpeg', 'image/png'].includes(message.attachment.mediaType)
-          || !Number.isSafeInteger(message.attachment.byteLength)
-          || message.attachment.byteLength < 1 || message.attachment.byteLength > 4 * 1024 * 1024
-          || !Number.isSafeInteger(message.attachment.width) || message.attachment.width < 1
-          || message.attachment.width > 4_096
-          || !Number.isSafeInteger(message.attachment.height) || message.attachment.height < 1
-          || message.attachment.height > 4_096
-          || message.attachment.width * message.attachment.height > 16 * 1024 * 1024
-          || typeof message.attachment.sha256 !== 'string'
-          || !HASH_PATTERN.test(message.attachment.sha256)) {
-        throw new ValidationError('message.attachment is invalid.');
-      }
-      attachment = Object.freeze({ ...message.attachment });
+    attachmentFields = exactAttachmentFields(message);
+    if (Reflect.ownKeys(attachmentFields).length > 0 && message.role !== 'user') {
+      throw new ValidationError('An assistant message has a vision attachment.');
     }
     assertScalarString(message.content, 'message.content', { maxBytes: 64 * 1024 });
   } catch (error) {
@@ -156,7 +201,7 @@ function exactMessage(message, accountId, threadId, expectedRevision, previousHa
     previousHash,
     generationId,
     createdAt: message.createdAt,
-    ...(attachment === undefined ? {} : { attachment })
+    ...attachmentFields
   }));
   if (calculatedHash !== message.messageHash) {
     throw new StorageCorruptionError('The direct-chat context ledger hash chain is inconsistent.');

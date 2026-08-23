@@ -83,9 +83,10 @@ function exactLimitOverrides(input = {}) {
   }
   const bounds = Object.freeze({
     bodyTimeoutMs: [50, 15_000],
-    visionBodyTimeoutMs: [1_000, 120_000],
+    visionBodyTimeoutMs: [1_000, 300_000],
     dependencyTimeoutMs: [50, 120_000],
     jobTimeoutMs: [50, 600_000],
+    visionJobTimeoutMs: [50, 900_000],
     sseLifetimeMs: [100, 120_000],
     ssePollMs: [5, 5_000],
     concurrentBodies: [1, 256],
@@ -374,21 +375,43 @@ function publicThread(value, accountId) {
   return publicOwnedRecord(value, accountId, PUBLIC_THREAD_FIELDS, 'chat thread');
 }
 
-function publicMessage(value, accountId) {
+function publicMessage(value, accountId, { attachmentSchema = 2 } = {}) {
   const message = publicOwnedRecord(value, accountId, PUBLIC_MESSAGE_FIELDS, 'chat message');
-  if (value.attachment === undefined) return message;
-  const attachment = value.attachment;
-  if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) {
-    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+  if (value.attachment === undefined && value.attachments === undefined) return message;
+  if (value.attachment !== undefined && value.attachments !== undefined) {
+    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment shape is ambiguous.');
   }
-  const descriptors = Object.getOwnPropertyDescriptors(attachment);
-  const expected = ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256'];
-  if (Reflect.ownKeys(descriptors).length !== expected.length
-      || expected.some((field) => !descriptors[field]?.enumerable
-        || !Object.hasOwn(descriptors[field], 'value'))) {
-    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+  const values = value.attachments ?? [value.attachment];
+  if (!Array.isArray(values) || values.length < 1 || values.length > 4) {
+    throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment list is invalid.');
   }
-  return Object.freeze({ ...message, attachment: Object.freeze({ ...attachment }) });
+  const checked = [];
+  const identifiers = new Set();
+  let bytes = 0;
+  for (const attachment of values) {
+    if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(attachment);
+    const expected = ['attachmentId', 'mediaType', 'byteLength', 'width', 'height', 'sha256'];
+    if (Reflect.ownKeys(descriptors).length !== expected.length
+        || expected.some((field) => !descriptors[field]?.enumerable
+          || !Object.hasOwn(descriptors[field], 'value'))) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment descriptor is invalid.');
+    }
+    if (identifiers.has(attachment.attachmentId)) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment identifiers are not unique.');
+    }
+    identifiers.add(attachment.attachmentId);
+    bytes += attachment.byteLength;
+    if (bytes > 16 * 1024 * 1024) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The stored chat attachment list is too large.');
+    }
+    checked.push(Object.freeze({ ...attachment }));
+  }
+  return Object.freeze(checked.length === 1 || attachmentSchema === 1
+    ? { ...message, attachment: checked[0] }
+    : { ...message, attachments: Object.freeze(checked) });
 }
 
 function publicGeneration(value, accountId) {
@@ -831,7 +854,7 @@ export function createCloudRequestHandler({
     'createThread', 'getThread', 'listThreads', 'startTurn',
     'appendGenerationDelta', 'finalizeGeneration', 'cancelGeneration', 'failGeneration',
     'getGeneration', 'replayGeneration', 'listMessages',
-    'getVisionAttachment', 'getLatestVisionAttachment',
+    'getVisionAttachment', 'getLatestVisionAttachment', 'getLatestVisionAttachments',
     'claimGenerationLease', 'markGenerationDispatchStarted', 'renewGenerationLease',
     'releaseGenerationLease', 'getGenerationLease'
   ]);
@@ -980,6 +1003,10 @@ export function createCloudRequestHandler({
     const jobKey = `${threadId}:${generationId}`;
     if (jobs.has(jobKey)) return true;
     if (stopping || !directChatConnector || jobs.size >= limits.directChatJobs) return false;
+    const scheduled = chat.getGeneration({ accountId, threadId, generationId });
+    const jobTimeoutMs = scheduled?.modelAlias === visionModelAlias
+      ? limits.visionJobTimeoutMs
+      : limits.jobTimeoutMs;
     const controller = new AbortController();
     const job = { controller, timedOut: false, promise: null, lease: null };
     jobs.set(jobKey, job);
@@ -988,7 +1015,7 @@ export function createCloudRequestHandler({
       const error = new Error('direct chat generation timed out');
       error.name = 'TimeoutError';
       controller.abort(error);
-    }, limits.jobTimeoutMs);
+    }, jobTimeoutMs);
     timer.unref?.();
     job.promise = (async () => {
       try {
@@ -1052,12 +1079,12 @@ export function createCloudRequestHandler({
           sourceHash: persisted.generation.sourceHash,
           ...(preparation === undefined ? {} : { preparation })
         });
-        const visionAttachment = chat.getLatestVisionAttachment({
+        const visionAttachments = chat.getLatestVisionAttachments({
           accountId,
           threadId,
           sourceRevision: persisted.generation.sourceRevision
         });
-        if ((persisted.generation.modelAlias === visionModelAlias) !== (visionAttachment !== null)) {
+        if ((persisted.generation.modelAlias === visionModelAlias) !== (visionAttachments.length > 0)) {
           const error = new Error('persisted vision inference authority is inconsistent');
           error.failureCode = 'content_rejected';
           throw error;
@@ -1082,8 +1109,19 @@ export function createCloudRequestHandler({
         const output = await valueWithAbort(directChatConnector.generate({
           modelAlias: persisted.generation.modelAlias,
           context: context.payload,
-          ...(visionAttachment === null ? {} : {
+          ...(visionAttachments.length === 0 ? {} : (visionAttachments.length === 1 ? {
             visionAttachment: Object.freeze({
+              attachmentId: visionAttachments[0].attachmentId,
+              messageId: visionAttachments[0].messageId,
+              mediaType: visionAttachments[0].mediaType,
+              byteLength: visionAttachments[0].byteLength,
+              width: visionAttachments[0].width,
+              height: visionAttachments[0].height,
+              contentSha256: visionAttachments[0].contentSha256,
+              content: visionAttachments[0].content
+            })
+          } : {
+            visionAttachments: Object.freeze(visionAttachments.map((visionAttachment) => Object.freeze({
               attachmentId: visionAttachment.attachmentId,
               messageId: visionAttachment.messageId,
               mediaType: visionAttachment.mediaType,
@@ -1092,8 +1130,8 @@ export function createCloudRequestHandler({
               height: visionAttachment.height,
               contentSha256: visionAttachment.contentSha256,
               content: visionAttachment.content
-            })
-          }),
+            })))
+          })),
           replay: Object.freeze({
             deltaCount: persisted.generation.deltaCount,
             lastDeltaHash: persisted.generation.lastDeltaHash
@@ -1221,8 +1259,11 @@ export function createCloudRequestHandler({
     if (route.pathname === CLOUD_ROUTES.chatMessagesList) {
       const thread = chat.getThread(accountId, input.threadId);
       if (!thread) throw new CloudHttpError(404, 'not_found', 'The chat thread does not exist.');
-      const messages = chat.listMessages({ accountId, ...input });
-      sendJson(req, res, 200, { messages: messages.map((message) => publicMessage(message, accountId)) });
+      const { attachmentSchema, ...messageQuery } = input;
+      const messages = chat.listMessages({ accountId, ...messageQuery });
+      sendJson(req, res, 200, {
+        messages: messages.map((message) => publicMessage(message, accountId, { attachmentSchema }))
+      });
       return;
     }
     if (route.pathname === CLOUD_ROUTES.chatAttachmentsGet) {
@@ -1238,15 +1279,15 @@ export function createCloudRequestHandler({
     if (route.pathname === CLOUD_ROUTES.chatRunsStart) {
       if (!directChatConnector) throw new CloudHttpError(503, 'localllm_unavailable', 'Direct LocalLLM chat is unavailable.');
       const existing = chat.getGeneration({ accountId, threadId: input.threadId, generationId: input.generationId });
-      if (!existing && input.attachment !== undefined && !visionEnabled) {
+      if (!existing && input.attachments !== undefined && !visionEnabled) {
         throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
       }
       if (!existing && !visionEnabled && input.expectedRevision > 0
-          && chat.getLatestVisionAttachment({
+          && chat.getLatestVisionAttachments({
             accountId,
             threadId: input.threadId,
             sourceRevision: input.expectedRevision
-          }) !== null) {
+          }).length > 0) {
         throw new CloudHttpError(503, 'vision_unavailable', 'Direct LocalLLM vision is not enabled.');
       }
       if (!existing && jobs.size >= limits.directChatJobs) {
@@ -1270,7 +1311,7 @@ export function createCloudRequestHandler({
         expectedRevision: input.expectedRevision,
         expectedHash: input.expectedHash,
         idempotencyKey,
-        ...(input.attachment === undefined ? {} : { attachment: input.attachment })
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments })
       });
       const { generation } = turn;
       if (generation.status === 'in_progress' && !scheduleGeneration(

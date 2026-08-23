@@ -1132,7 +1132,7 @@ test("completed generation finalization authentication expiry signs in and resto
   assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
 });
 
-test("PWA image control canonicalizes exactly one file, sends it once, and renders only authenticated previews", async () => {
+test("PWA image control bounds selection, sends one image once, and renders only authenticated previews", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const imagePrompt = "Describe the private image.\nFocus\ton its colors.";
   const descriptor = {
@@ -1242,11 +1242,11 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   add.dispatch("click");
   assert.equal(nativePickerClicks, 1, "the visible image action synchronously opens the native picker");
 
-  input.files = [{ name: "one.png" }, { name: "two.png" }];
+  input.files = [1, 2, 3, 4, 5].map((index) => ({ name: `${index}.png` }));
   input.dispatch("change");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(canonicalizations, 0);
-  assert.match(browser.document.getElementById("toast").textContent, /exactly one/u);
+  assert.match(browser.document.getElementById("toast").textContent, /up to 4/u);
 
   input.files = [{ name: "private.png" }];
   input.dispatch("change");
@@ -1273,6 +1273,198 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.ok(previewReads >= 1, "rendering retrieves bytes through the authenticated attachment client");
   assert.match(browser.document.getElementById("messages").textContent, /Describe the private image\.\s+Focus\s+on its colors\.Authenticated vision answer/u);
   assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
+});
+
+test("PWA image control sends an ordered multi-image turn and renders a bounded gallery", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptors = ["first", "second"].map((name, index) => ({
+    attachmentId: `image_${name}_0000000000000001`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 192 + index,
+    height: 192,
+    sha256: String(index + 1).repeat(64),
+  }));
+  let thread = null;
+  let messages = [];
+  let preparedRun = null;
+  const canonicalized = [];
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_multi_image_x" });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparedRun = request;
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_multi_image_xxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [
+        chatMessage(1, "user", ticket.content, { attachments: descriptors }),
+        chatMessage(2, "assistant", "Compared both images"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return { request: ticket, generation: chatGeneration({ status: "completed", terminal: true }) };
+    },
+    async getAttachment({ attachment }) {
+      return { descriptor: attachment, bytes };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage(file) {
+      const index = file.name === "first.png" ? 0 : 1;
+      canonicalized.push(file.name);
+      return Object.freeze({
+        ...descriptors[index],
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: (() => {
+      let sequence = 0;
+      return () => `blob:multi-${++sequence}`;
+    })(),
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("image-input");
+  input.files = [{ name: "first.png" }, { name: "second.png" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(canonicalized, ["first.png", "second.png"]);
+  assert.match(browser.document.getElementById("image-preview-label").textContent, /2 images/u);
+  browser.document.getElementById("message-input").value = "Compare these images in order.";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.deepEqual(
+    preparedRun.attachments.map((attachment) => attachment.attachmentId),
+    descriptors.map((attachment) => attachment.attachmentId),
+  );
+  const userMessage = browser.document.getElementById("messages").children[0];
+  assert.equal(userMessage.children[0].className, "message-attachments");
+  assert.equal(userMessage.children[0].children.length, 2);
+});
+
+test("accepted image upload status-probes before retry and releases composer memory before generation ends", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_accepted_memory_xxxxxxxxx",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 80,
+    height: 80,
+    sha256: "e".repeat(64),
+  };
+  const streamGate = Promise.withResolvers();
+  const streamStarted = Promise.withResolvers();
+  let thread = chatThread();
+  let messages = [];
+  let generation = chatGeneration();
+  let statusReads = 0;
+  let retries = 0;
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment }) { return { bytes, descriptor: attachment }; },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_accepted_memory_xxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [chatMessage(1, "user", ticket.content, { attachment: descriptor })];
+      thread = chatThread({
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+        currentGenerationId: CHAT_GENERATION_ID,
+      });
+      throw new DirectChatTransportError("accepted response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async getRunStatus() {
+      statusReads += 1;
+      return { generation };
+    },
+    async retryRun() {
+      retries += 1;
+      throw new Error("an accepted image upload must not be uploaded again");
+    },
+    async *streamRunEvents() {
+      streamStarted.resolve();
+      await streamGate.promise;
+      messages.push(chatMessage(2, "assistant", "Accepted exactly once"));
+      thread = chatThread({
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      generation = chatGeneration({ status: "completed", terminal: true });
+      yield { type: "generation", generation, afterSequence: 0 };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage() {
+      return Object.freeze({
+        ...descriptor,
+        bytes,
+        previewBlob: new Blob([bytes], { type: descriptor.mediaType }),
+      });
+    },
+    createObjectUrl: (() => { let value = 0; return () => `blob:accepted-memory-${value += 1}`; })(),
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("image-input");
+  input.files = [{ name: "accepted.png" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Describe this once";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await streamStarted.promise;
+  assert.equal(statusReads, 1);
+  assert.equal(retries, 0);
+  assert.deepEqual(revoked, ["blob:accepted-memory-1"], "the composer Blob is released before the stream finishes");
+  streamGate.resolve();
+  await submission;
+  assert.match(browser.document.getElementById("messages").textContent, /Accepted exactly once/u);
 });
 
 test("Completed becomes usable while its restored attachment decodes in the background", async () => {
@@ -1326,6 +1518,7 @@ test("Completed becomes usable while its restored attachment decodes in the back
   assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
   assert.equal(image.dataset.previewState, "loading");
   assert.equal(image.hidden, true);
+  assert.equal(image.loading, "eager", "an admitted hidden Blob must not deadlock behind native lazy loading");
 
   decodeGate.resolve();
   await new Promise((resolve) => setImmediate(resolve));
@@ -1462,6 +1655,57 @@ test("offscreen historical images wait for viewport entry and restore through on
   assert.deepEqual(images.map((image) => image.dataset.previewState), ["ready", "ready"]);
 });
 
+test("every image in one historical gallery gets its own viewport restoration job", async () => {
+  const observer = intersectionHarness();
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const descriptors = [1, 2].map((value) => ({
+    attachmentId: `image_gallery_${value}_xxxxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 2,
+    height: 2,
+    sha256: String(value).repeat(64),
+  }));
+  const messages = [
+    chatMessage(1, "user", "Compare both stored images", { attachments: descriptors }),
+    chatMessage(2, "assistant", "Both were compared"),
+  ];
+  const thread = chatThread({
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const attachmentReads = [];
+  const browser = harness({
+    chat: baseChat({
+      async listThreads() { return { threads: [thread] }; },
+      async getThread() { return { thread }; },
+      async listMessages({ afterRevision, limit }) {
+        return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+      },
+      async getAttachment({ attachment }) {
+        attachmentReads.push(attachment.attachmentId);
+        return { bytes, descriptor: attachment };
+      },
+    }),
+    IntersectionObserver: observer.IntersectionObserver,
+    createObjectUrl: (() => { let value = 0; return () => `blob:gallery-${value += 1}`; })(),
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  const observedItems = [...observer.latest().targets];
+  assert.equal(observedItems.length, 2);
+  const images = observedItems.map((item) => item.children[0]);
+  observer.latest().enter(observedItems[0]);
+  observer.latest().enter(observedItems[1]);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(attachmentReads, descriptors.map((attachment) => attachment.attachmentId));
+  assert.deepEqual(images.map((image) => image.dataset.previewState), ["ready", "ready"]);
+});
+
 async function sameThreadAttachmentMemoryCase({ blobLimit, decodedLimit }) {
   const observer = intersectionHarness();
   const hashes = ["5", "6", "7", "8"].map((value) => value.repeat(64));
@@ -1553,6 +1797,7 @@ test("repeated failed and cancelled image turns retain at most one local preview
   const observer = intersectionHarness();
   const bytes = new Uint8Array([1, 2, 3, 4]);
   const previewBlobs = new WeakSet();
+  const previewBlobUses = new WeakMap();
   const created = [];
   const revoked = [];
   const statuses = ["failed", "cancelled"];
@@ -1640,7 +1885,9 @@ test("repeated failed and cancelled image turns retain at most one local preview
       });
     },
     createObjectUrl(blob) {
-      const kind = previewBlobs.has(blob) ? "composer" : "local";
+      const priorUses = previewBlobUses.get(blob) ?? 0;
+      if (previewBlobs.has(blob)) previewBlobUses.set(blob, priorUses + 1);
+      const kind = previewBlobs.has(blob) ? (priorUses === 0 ? "composer" : "local") : "stored";
       const url = `blob:${kind}-${created.filter((value) => value.startsWith(`blob:${kind}-`)).length + 1}`;
       created.push(url);
       return url;
@@ -1763,6 +2010,13 @@ test("pre-send image reconciliation cannot race an accepted exact ticket with pr
         code: "request_timeout",
         status: 504,
         retryable: true,
+      });
+    },
+    async getRunStatus() {
+      throw new DirectChatTransportError("generation is not visible yet", {
+        code: "not_found",
+        status: 404,
+        retryable: false,
       });
     },
     async retryRun(ticket) {
@@ -2425,8 +2679,12 @@ test("a stale restored-image decode revokes its object URL even when replacement
   assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/iu);
 });
 
-test("a local image-run preparation failure cannot create an empty thread and restores the exact draft", async () => {
+test("a local multi-image-run preparation failure preserves both images and the exact prompt for retry", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const attachmentIds = [
+    "image_retry_first_0000000000001",
+    "image_retry_second_000000000001",
+  ];
   const prompt = `${"a".repeat(79)}😀 private image`;
   const draft = `  ${prompt}\n  `;
   const safeTitle = `${"a".repeat(79)}😀`;
@@ -2493,12 +2751,13 @@ test("a local image-run preparation failure cannot create an empty thread and re
   });
   const browser = harness({
     chat,
-    async canonicalizeImage() {
+    async canonicalizeImage(file) {
+      const index = file.name === "retry-first.png" ? 0 : 1;
       return Object.freeze({
-        attachmentId: "image_0000000000000004",
+        attachmentId: attachmentIds[index],
         mediaType: "image/png",
         byteLength: bytes.byteLength,
-        width: 64,
+        width: 64 + index,
         height: 64,
         bytes,
         previewBlob: new Blob([bytes], { type: "image/png" }),
@@ -2506,14 +2765,14 @@ test("a local image-run preparation failure cannot create an empty thread and re
     },
     createObjectUrl() {
       objectUrlCalls += 1;
-      return objectUrlCalls === 1 ? "blob:retry-image" : "blob:dispatched-image";
+      return `blob:retry-image-${objectUrlCalls}`;
     },
     revokeObjectUrl(value) { revokedUrls.push(value); },
   });
   await browser.app.initialize();
   const imageInput = browser.document.getElementById("image-input");
   const messageInput = browser.document.getElementById("message-input");
-  imageInput.files = [{ name: "retry.png" }];
+  imageInput.files = [{ name: "retry-first.png" }, { name: "retry-second.png" }];
   imageInput.dispatch("change");
   await new Promise((resolve) => setImmediate(resolve));
   messageInput.value = draft;
@@ -2522,7 +2781,8 @@ test("a local image-run preparation failure cannot create an empty thread and re
   assert.equal(createCalls, 0, "a synchronous preparation failure cannot create a durable thread");
   assert.equal(messageInput.value, draft, "local failure restores the exact pre-trim textarea draft");
   assert.equal(browser.document.getElementById("image-preview").hidden, false);
-  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:retry-image");
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:retry-image-1");
+  assert.match(browser.document.getElementById("image-preview-label").textContent, /2 images/u);
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.match(browser.document.getElementById("toast").textContent, /image message was not sent[\s\S]*still ready/iu);
   assert.deepEqual(browser.document.getElementById("workspace").dataset, {
@@ -2537,11 +2797,17 @@ test("a local image-run preparation failure cannot create an empty thread and re
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(createCalls, 1);
   assert.equal(preparedRun.content, prompt, "retry preserves the original prompt exactly");
-  assert.equal(preparedRun.attachment.attachmentId, "image_0000000000000004");
-  assert.equal(preparedRun.attachment.bytes, bytes, "retry preserves the canonical private image bytes");
+  assert.deepEqual(
+    preparedRun.attachments.map((attachment) => attachment.attachmentId),
+    attachmentIds,
+    "retry preserves both private images in their original order",
+  );
+  assert.equal(preparedRun.attachments[0].bytes, bytes);
+  assert.equal(preparedRun.attachments[1].bytes, bytes, "retry preserves both canonical byte objects");
   assert.equal(messageInput.value, "");
   assert.equal(browser.document.getElementById("image-preview").hidden, true);
-  assert.deepEqual([...revokedUrls].sort(), ["blob:dispatched-image", "blob:retry-image"]);
+  assert.ok(revokedUrls.includes("blob:retry-image-1"));
+  assert.ok(revokedUrls.includes("blob:retry-image-2"));
   assert.match(browser.document.getElementById("messages").textContent, /Retried safely/u);
 });
 
@@ -2751,7 +3017,7 @@ test("expired authentication restores the detached image first and never auto-re
   assert.equal(starts, 1);
   assert.equal(messageInput.value, "");
   assert.equal(browser.document.getElementById("image-preview").hidden, true);
-  assert.deepEqual(revoked, ["blob:auth-recovery-image-2", "blob:auth-recovery-image-1"]);
+  assert.deepEqual(revoked, ["blob:auth-recovery-image-1", "blob:auth-recovery-image-2"]);
 });
 
 test("same-account capability exhaustion keeps the recovered image visible, fenced, and removable", async () => {

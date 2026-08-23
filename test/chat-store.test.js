@@ -22,13 +22,14 @@ import {
   DirectChatStore
 } from '../src/chat-store.js';
 import {
+  CHAT_MIGRATIONS,
   CHAT_SQLITE_APPLICATION_ID,
   DEFAULT_CHAT_SCHEMA_VERSION,
   LATEST_CHAT_SCHEMA_VERSION
 } from '../src/chat-migrations.js';
 import { validateVisionAttachmentRequest, VISION_MODEL_ALIAS } from '../src/vision-attachment.js';
 import { createPwaIcon } from '../src/web/pwa-assets.js';
-import { sha256 } from '../src/validation.js';
+import { canonicalJson, sha256 } from '../src/validation.js';
 import {
   ConflictError,
   IdempotencyConflictError,
@@ -537,6 +538,71 @@ test('atomically stores private canonical image bytes while exposing only a hash
   }).content, attachment.content);
 });
 
+test('atomically stores and replays an ordered bounded image set on one user message', (t) => {
+  const { databasePath, store } = testState(t, {
+    modelAlias: 'localllm-fast',
+    enableVisionAttachments: true
+  });
+  const thread = createThread(store, 'multi-vision');
+  const attachments = Object.freeze([
+    visionAttachment('multi-first'),
+    visionAttachment('multi-second'),
+    visionAttachment('multi-third')
+  ]);
+  const request = {
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    messageId: 'user-multi-vision',
+    content: 'Compare these three images in their selected order.',
+    generationId: 'generation-multi-vision',
+    assistantMessageId: 'assistant-multi-vision',
+    expectedRevision: 0,
+    expectedHash: null,
+    idempotencyKey: 'start-turn-multi-vision-0001',
+    attachments
+  };
+  const committed = store.startTurn(request);
+
+  assert.equal(committed.generation.modelAlias, VISION_MODEL_ALIAS);
+  assert.deepEqual(
+    committed.message.attachments.map((attachment) => attachment.attachmentId),
+    attachments.map((attachment) => attachment.attachmentId)
+  );
+  assert.equal(Object.hasOwn(committed.message, 'attachment'), false);
+  assert.deepEqual(store.startTurn(request), committed);
+  assert.deepEqual(
+    store.getLatestVisionAttachments({
+      accountId: thread.accountId,
+      threadId: thread.threadId,
+      sourceRevision: 1
+    }).map((attachment) => attachment.attachmentId),
+    attachments.map((attachment) => attachment.attachmentId)
+  );
+  const inspection = new DatabaseSync(databasePath);
+  try {
+    assert.deepEqual(inspection.prepare(`
+      SELECT position, attachment_id FROM direct_chat_attachments
+      WHERE account_id = ? AND thread_id = ? AND message_id = ?
+      ORDER BY position
+    `).all(thread.accountId, thread.threadId, request.messageId).map((row) => ({
+      position: Number(row.position), attachmentId: row.attachment_id
+    })), attachments.map((attachment, position) => ({
+      position, attachmentId: attachment.attachmentId
+    })));
+  } finally {
+    inspection.close();
+  }
+
+  assert.throws(() => store.startTurn({
+    ...request,
+    messageId: 'user-too-many-images',
+    generationId: 'generation-too-many-images',
+    assistantMessageId: 'assistant-too-many-images',
+    idempotencyKey: 'start-turn-too-many-images-0001',
+    attachments: [...attachments, visionAttachment('multi-fourth'), visionAttachment('multi-fifth')]
+  }), /bounded/u);
+});
+
 test('gates v3 expansion but exactly replays committed image turns while vision is disabled for rollback', (t) => {
   const state = testState(t, { modelAlias: 'localllm-fast' });
   const thread = createThread(state.store, 'vision-migration');
@@ -613,6 +679,91 @@ test('gates v3 expansion but exactly replays committed image turns while vision 
     accountId: thread.accountId,
     threadId: thread.threadId
   }), [committed.message], 'replay and rejected new writes leave the image ledger unchanged');
+});
+
+test('migrates a populated v3 single-image ledger to ordered v4 position zero', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'lazying-direct-chat-v3-migration-'));
+  const privateRoot = join(root, 'private');
+  const databasePath = join(privateRoot, 'chat.sqlite');
+  mkdirSync(privateRoot, { mode: 0o700 });
+  let store = null;
+  t.after(() => {
+    store?.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const database = new DatabaseSync(databasePath);
+  database.exec('PRAGMA foreign_keys = ON');
+  const appliedAt = '2026-08-20T00:00:00.000Z';
+  for (const migration of CHAT_MIGRATIONS.slice(0, 3)) {
+    database.exec(migration.sql);
+    database.prepare(`
+      INSERT INTO chat_schema_migrations(version, name, checksum, applied_at)
+      VALUES (?, ?, ?, ?)
+    `).run(migration.version, migration.name, migration.checksum, appliedAt);
+    database.exec(`PRAGMA user_version = ${migration.version}`);
+  }
+  database.exec(`PRAGMA application_id = ${CHAT_SQLITE_APPLICATION_ID}`);
+  const attachment = visionAttachment('legacy-v3');
+  const accountId = 'account-legacy-v3';
+  const threadId = 'thread-legacy-v3';
+  const messageId = 'message-legacy-v3';
+  const content = 'Preserve this v3 image.';
+  const descriptor = {
+    attachmentId: attachment.attachmentId,
+    mediaType: attachment.mediaType,
+    byteLength: attachment.byteLength,
+    width: attachment.width,
+    height: attachment.height,
+    sha256: attachment.contentSha256
+  };
+  const messageHash = sha256(canonicalJson({
+    accountId,
+    threadId,
+    messageId,
+    revision: 1,
+    role: 'user',
+    content,
+    contentBytes: Buffer.byteLength(content),
+    previousHash: null,
+    generationId: null,
+    createdAt: appliedAt,
+    attachment: descriptor
+  }));
+  database.prepare(`
+    INSERT INTO direct_chat_threads(
+      account_id, thread_id, title, title_bytes, model_alias, ledger_revision,
+      ledger_hash, message_count, ledger_bytes, created_at, updated_at
+    ) VALUES (?, ?, '', 0, 'localllm-fast', 1, ?, 1, ?, ?, ?)
+  `).run(accountId, threadId, messageHash, Buffer.byteLength(content), appliedAt, appliedAt);
+  database.prepare(`
+    INSERT INTO direct_chat_messages(
+      account_id, thread_id, message_id, revision, role, content, content_bytes,
+      previous_hash, message_hash, generation_id, created_at
+    ) VALUES (?, ?, ?, 1, 'user', ?, ?, NULL, ?, NULL, ?)
+  `).run(accountId, threadId, messageId, content, Buffer.byteLength(content), messageHash, appliedAt);
+  database.prepare(`
+    INSERT INTO direct_chat_attachments(
+      account_id, thread_id, attachment_id, message_id, media_type,
+      byte_length, width, height, content_sha256, content, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    accountId, threadId, attachment.attachmentId, messageId, attachment.mediaType,
+    attachment.byteLength, attachment.width, attachment.height,
+    attachment.contentSha256, attachment.content, appliedAt
+  );
+  database.close();
+  chmodSync(databasePath, 0o600);
+
+  store = new DirectChatStore({
+    databasePath,
+    modelAlias: 'localllm-fast',
+    enableVisionAttachments: true
+  });
+  assert.equal(Number(scalar(databasePath, 'SELECT user_version AS value FROM pragma_user_version')), 4);
+  assert.equal(Number(scalar(databasePath, `
+    SELECT position AS value FROM direct_chat_attachments WHERE attachment_id = ?
+  `, attachment.attachmentId)), 0);
+  assert.deepEqual(store.listMessages({ accountId, threadId })[0].attachment, descriptor);
 });
 
 test('replays an atomic turn exactly after response loss and restart without duplicating either resource', (t) => {

@@ -8,6 +8,7 @@ import {
   VISION_ATTACHMENT_LIMITS,
   validateStoredVisionAttachment,
   validateVisionAttachmentRequest,
+  validateVisionAttachmentsRequest,
   visionAttachmentDescriptor
 } from '../src/vision-attachment.js';
 import { createPwaIcon } from '../src/web/pwa-assets.js';
@@ -78,6 +79,19 @@ test('accepts one canonical PNG or JPEG and returns a private byte record plus p
     data: JPEG_BASE64
   });
   assert.deepEqual([jpeg.width, jpeg.height, jpeg.byteLength], [1, 1, 160]);
+});
+
+test('accepts at most four unique canonical images in stable request order', () => {
+  const attachments = [1, 2, 3, 4].map((serial) => ({
+    ...pngRequest(),
+    attachmentId: `image_000000000000000${serial}`
+  }));
+  const checked = validateVisionAttachmentsRequest(attachments);
+  assert.deepEqual(checked.map((attachment) => attachment.attachmentId), attachments.map((attachment) => attachment.attachmentId));
+  assert.equal(Object.isFrozen(checked), true);
+  assert.throws(() => validateVisionAttachmentsRequest([...attachments, attachments[0]]), /between 1 and 4/u);
+  assert.throws(() => validateVisionAttachmentsRequest([attachments[0], attachments[0]]), /unique/u);
+  assert.throws(() => validateVisionAttachmentsRequest([]), /between 1 and 4/u);
 });
 
 test('rejects noncanonical base64, media mismatch, corruption, unknown data, and unsafe dimensions', () => {

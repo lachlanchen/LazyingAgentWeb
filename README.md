@@ -19,7 +19,7 @@ boundary, and replaceable-node contract are specified in
 
 - A bright-by-default installable PWA with persistent theme preference,
   browser-password-manager integration, durable thread restoration, resumable
-  streaming, explicit cancellation, optional single-image Direct Chat input,
+  streaming, explicit cancellation, optional one-to-four-image Direct Chat input,
   Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
@@ -87,15 +87,19 @@ only after the new worker controls the tab. Activation retains the current and
 immediately previous verified shell. An offline or failed update leaves the
 current app usable.
 
-If Update is confirmed while a definitively unsent Direct Chat prompt or image
-is still in the composer, the page stores one bounded AES-GCM ciphertext in a
-dedicated IndexedDB store. Its random key exists only in the replacement
+If Update is confirmed while a definitively unsent Direct Chat prompt or
+single image is still in the composer, the page stores one bounded AES-GCM
+ciphertext in a dedicated IndexedDB store. Its random key exists only in the replacement
 navigation fragment, which is scrubbed before asynchronous startup. The exact
 account, scope, source/target releases, expiry, digest, and canonical image
 contract are revalidated; the record is atomically consumed once and is never
 auto-sent. Expired, malformed, and excess orphan records are pruned. Passwords,
 active sends, generations, Agent runs, and ambiguous mutations cannot use this
 handoff.
+
+An unsent multi-image selection is intentionally ineligible for that handoff:
+the current page stays open and refuses activation rather than copying up to
+16 MiB of private image data into browser storage.
 
 Only immutable public shell assets enter Cache Storage. Login/session, Direct
 Chat, Agent, SSE, artifact, and upload traffic always bypasses it. Production
@@ -109,8 +113,8 @@ storage and is purged across authentication, account, and release boundaries.
 Historical rendered previews have a separate four-image / 64 MiB estimated
 decoded-pixel limit. Eviction revokes the object URL and leaves a tap-to-reload
 placeholder, so scrolling through a long image thread cannot retain every
-decoded surface. The one staged or just-sent composer image is transient rather
-than part of this history cache and is revoked at its existing send, view, and
+decoded surface. Up to four staged or just-sent composer images are transient
+rather than part of this history cache and are revoked at their existing send, view, and
 authentication boundaries.
 The server similarly caches only successful integrity-audit state, bounded by
 thread and invalidated by every local write or SQLite `data_version` change.
@@ -230,11 +234,15 @@ static shell.
 
 Direct Chat vision remains fail-closed when `localLlm.vision` is absent or
 disabled. Enabling it requires the fixed `localllm-vision` alias while keeping a
-different default text alias. The PWA accepts exactly one JPEG or PNG plus a
-non-empty prompt, redraws it through a browser canvas to remove source metadata,
-and enforces a 4 MiB canonical limit. The server independently validates MIME,
-framing, dimensions, metadata absence, and digest before committing the user
-message, private bytes, and generation atomically.
+different default text alias. The PWA accepts one to four JPEG or PNG images plus
+a non-empty prompt, accepts each source file up to 24 MiB, redraws and downscales
+them sequentially through a browser canvas to remove source metadata, and
+enforces 4 MiB per canonical image and 16 MiB per message. A separate preview is
+bounded to 512 pixels and 512 KiB so a visible mobile gallery never retains the
+full upload surfaces.
+The server independently validates MIME, framing, dimensions, metadata absence,
+digest, ordering, unique attachment IDs, count, and aggregate bytes before
+committing the user message, every private image, and the generation atomically.
 
 A minimal in-process storage-only probe is:
 
@@ -296,14 +304,28 @@ responses, and image data never enters Cache Storage, localStorage, or
 sessionStorage. IndexedDB is used only for the encrypted, expiring, one-shot
 confirmed-update handoff described above; it is not chat history or a retry
 queue. Base64 exists only transiently in the browser's exact in-memory retry
-ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies.
+ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies. The
+browser serializes a prepared image request once before entering the network
+ambiguity boundary, reuses those exact bytes only when a status probe proves
+the generation absent, and releases the raw images and serialized ticket as
+soon as the server accepts the durable turn.
 
-The attachment table is schema v3 and is created only when vision is enabled.
-A v3-aware build can reopen the database with vision disabled. It continues to
+Ordered attachment responses use an explicit message-list schema request. A
+previous PWA that omits it receives the first descriptor in the legacy singular
+shape, so a stale open tab keeps its text/history protocol valid until the
+content-versioned PWA refresh takes control.
+
+The ordered attachment table is schema v4 and is created only when vision is enabled.
+A v4-aware build can reopen the database with vision disabled. It continues to
 serve authenticated previews and exact retries of committed turns, while
 refusing new image turns and follow-ups that would reuse stored images. A
-pre-v3 binary cannot reopen a database after this migration. Take a private
-database backup or retain a v3-aware rollback build before first enablement.
+pre-v4 binary cannot reopen a database after this migration. Existing v3
+single-image rows migrate with position zero. Take a private database backup or
+retain a v4-aware rollback build before first enablement or v3-to-v4 expansion.
+That pre-v4 backup is a rollback source only while every dynamic API remains
+blocked. Once a durable write-authority marker is committed and the v4 API is
+opened, rollback must preserve the live database and use a v4-aware release;
+restoring the older snapshot could discard accepted messages.
 
 The production server is designed to bind on loopback behind Caddy. It trusts
 the configured public authority/client-address headers only from that local

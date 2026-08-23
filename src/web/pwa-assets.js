@@ -533,12 +533,12 @@ ${modulePreloads}
       </aside>
 
       <form id="composer" class="composer" autocomplete="off">
-        <input id="image-input" type="file" accept="image/jpeg,image/png" hidden>
-        <button id="add-image" class="image-button" type="button" aria-label="Add image" hidden>Image</button>
+        <input id="image-input" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple hidden>
+        <button id="add-image" class="image-button" type="button" aria-label="Add images" hidden>Images</button>
         <div id="image-preview" class="image-preview" hidden>
-          <img id="image-preview-thumbnail" alt="Selected image preview">
+          <img id="image-preview-thumbnail" alt="First selected image preview">
           <span id="image-preview-label"></span>
-          <button id="remove-image" type="button" aria-label="Remove selected image">Remove</button>
+          <button id="remove-image" type="button" aria-label="Remove all selected images">Remove</button>
         </div>
         <label class="sr-only" for="message-input">Message</label>
         <textarea id="message-input" name="message" rows="1" maxlength="32000" placeholder="Message LocalLLM" required></textarea>
@@ -670,7 +670,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .image-preview img { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; }
 .image-preview span { overflow: hidden; color: var(--muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
 .image-preview button { padding: .35rem .5rem; }
-.message-attachment { display: block; max-width: min(100%, 620px); max-height: 520px; margin-bottom: .65rem; border-radius: 12px; object-fit: contain; }
+.message-attachments { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: min(100%, 620px); gap: .5rem; margin-bottom: .65rem; }
+.message-attachment-item { min-width: 0; }
+.message-attachment { display: block; width: 100%; max-height: 520px; border-radius: 12px; object-fit: contain; }
+.message > .message-attachment { max-width: min(100%, 620px); margin-bottom: .65rem; }
 .message-attachment-status { padding: .35rem .5rem; border-color: transparent; background: transparent; text-align: left; }
 .composer-actions { display: flex; gap: .4rem; }
 .footer-note { margin: 0; padding: 0 max(1rem, calc((100% - 850px) / 2)) .6rem; text-align: center; background: var(--surface); }
@@ -691,6 +694,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .mode-switch button { padding-inline: .55rem; }
   .composer { flex-direction: column; align-items: stretch; }
   .image-preview { max-width: 100%; }
+  .message-attachments { grid-template-columns: minmax(0, 1fr); }
   .composer-actions { justify-content: flex-end; }
   .message { max-width: 94%; }
 }

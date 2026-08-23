@@ -13,10 +13,15 @@ import { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from '../src/direct-chat-contract.js'
 import { createDeterministicContextSummarizer } from '../src/deterministic-context-summarizer.js';
 import { ConflictError, StorageCorruptionError, ValidationError } from '../src/errors.js';
 import { createLocalLlmConnector } from '../src/localllm-connector.js';
+import { validateVisionAttachmentRequest } from '../src/vision-attachment.js';
+import { createPwaIcon } from '../src/web/pwa-assets.js';
 
-function testState(testContext) {
+function testState(testContext, { vision = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-chat-context-test-'));
-  const store = new DirectChatStore({ databasePath: join(root, 'private', 'chat.sqlite') });
+  const store = new DirectChatStore({
+    databasePath: join(root, 'private', 'chat.sqlite'),
+    enableVisionAttachments: vision
+  });
   testContext.after(() => {
     store.close();
     rmSync(root, { recursive: true, force: true });
@@ -208,6 +213,42 @@ test('proactively compacts completed history, then assembles only after atomic s
     result.budget.contextWindowTokens - result.budget.outputTokenReserve - result.budget.protocolTokenReserve
   );
   assert.equal(raw.length, 15);
+});
+
+test('validates a multi-image ledger hash while keeping private image data out of context', async (t) => {
+  const { store } = testState(t, { vision: true });
+  const pending = pendingTurn(1, 0);
+  const coordinator = new DirectChatContextCoordinator({ store });
+  const preparation = await coordinator.prepareForTurn(preparationRequest(store, pending));
+  const image = Buffer.from(createPwaIcon(192));
+  const current = store.getThread('account-context', 'thread-context');
+  const attachments = ['first', 'second'].map((suffix) => validateVisionAttachmentRequest({
+    attachmentId: `image-context-${suffix}-00000001`,
+    mediaType: 'image/png',
+    data: image.toString('base64')
+  }));
+  const turn = store.startTurn({
+    accountId: current.accountId,
+    threadId: current.threadId,
+    messageId: pending.messageId,
+    content: pending.content,
+    generationId: pending.generationId,
+    assistantMessageId: pending.assistantMessageId,
+    expectedRevision: current.revision,
+    expectedHash: current.ledgerHash,
+    idempotencyKey: 'start-context-multi-image-0001',
+    attachments
+  });
+
+  const result = await coordinator.assemble(assembleRequest(turn, preparation));
+  assert.equal(result.payload.messages.at(-1).hash, turn.message.messageHash);
+  assert.equal(Object.hasOwn(result.payload.messages.at(-1), 'attachment'), false);
+  assert.equal(Object.hasOwn(result.payload.messages.at(-1), 'attachments'), false);
+  assert.deepEqual(
+    store.listMessages({ accountId: current.accountId, threadId: current.threadId })[0]
+      .attachments.map((attachment) => attachment.attachmentId),
+    attachments.map((attachment) => attachment.attachmentId)
+  );
 });
 
 test('proactively compacts the 257th short message to the shared connector entry limit', async (t) => {

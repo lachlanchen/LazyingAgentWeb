@@ -10,11 +10,14 @@ const JSON_RESPONSE_LIMIT = 512 * 1024;
 const ERROR_RESPONSE_LIMIT = 16 * 1024;
 const STREAM_RESPONSE_LIMIT = 256 * 1024;
 const VISION_IMAGE_LIMIT = 4 * 1024 * 1024;
+const VISION_IMAGE_COUNT_LIMIT = 4;
+const VISION_IMAGE_TOTAL_LIMIT = 16 * 1024 * 1024;
 const VISION_BASE64_LIMIT = Math.ceil(VISION_IMAGE_LIMIT / 3) * 4;
 const SSE_BLOCK_LIMIT = 32 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
-const VISION_MUTATION_TIMEOUT_MS = 105_000;
+const VISION_MUTATION_TIMEOUT_MS = 270_000;
 const DEFAULT_STREAM_TIMEOUT_MS = 45_000;
+const PREPARED_RUN_BODIES = new WeakMap();
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._~-]{16,160}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
@@ -76,6 +79,29 @@ function exactObject(value, allowed, required, label, { input = false } = {}) {
   }
   for (const key of required) if (!Object.hasOwn(value, key)) fail(`${label}.${key} is required`);
   return value;
+}
+
+function exactDenseArrayValues(value, label, { minimum, maximum }) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
+      || value.length < minimum || value.length > maximum) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const values = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) {
+      throw new TypeError(`${label} must be dense data`);
+    }
+    values.push(descriptor.value);
+  }
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (key === "length") continue;
+    if (typeof key !== "string" || !/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length) {
+      throw new TypeError(`${label} contains an unsupported property`);
+    }
+  }
+  return values;
 }
 
 function utf8Length(value) {
@@ -228,7 +254,7 @@ function responseThread(value, expectedThreadId) {
 function responseMessage(value, expectedThreadId) {
   const message = exactObject(value, [
     "threadId", "messageId", "revision", "role", "content", "contentBytes", "previousHash",
-    "messageHash", "generationId", "createdAt", "attachment",
+    "messageHash", "generationId", "createdAt", "attachment", "attachments",
   ], [
     "threadId", "messageId", "revision", "role", "content", "contentBytes", "previousHash",
     "messageHash", "generationId", "createdAt",
@@ -251,9 +277,19 @@ function responseMessage(value, expectedThreadId) {
   if ((message.role === "user" && generationId !== null) || (message.role === "assistant" && generationId === null)) {
     throw new DirectChatProtocolError("message generation ownership is inconsistent");
   }
-  let attachment;
-  if (message.attachment !== undefined) {
-    const descriptor = exactObject(message.attachment, [
+  if (message.attachment !== undefined && message.attachments !== undefined) {
+    throw new DirectChatProtocolError("message attachment shape is ambiguous");
+  }
+  const rawAttachments = message.attachments ?? (message.attachment === undefined ? [] : [message.attachment]);
+  if (!Array.isArray(rawAttachments) || rawAttachments.length > VISION_IMAGE_COUNT_LIMIT
+      || (message.attachments !== undefined && rawAttachments.length < 2)) {
+    throw new DirectChatProtocolError("message attachment list is invalid");
+  }
+  const attachments = [];
+  const attachmentIds = new Set();
+  let attachmentBytes = 0;
+  for (const rawAttachment of rawAttachments) {
+    const descriptor = exactObject(rawAttachment, [
       "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
     ], [
       "attachmentId", "mediaType", "byteLength", "width", "height", "sha256",
@@ -262,7 +298,7 @@ function responseMessage(value, expectedThreadId) {
         || typeof descriptor.sha256 !== "string" || !HASH.test(descriptor.sha256)) {
       throw new DirectChatProtocolError("message attachment descriptor is invalid");
     }
-    attachment = Object.freeze({
+    const attachment = Object.freeze({
       attachmentId: identifier(descriptor.attachmentId, "message.attachment.attachmentId"),
       mediaType: descriptor.mediaType,
       byteLength: integer(descriptor.byteLength, "message.attachment.byteLength", { minimum: 1, maximum: VISION_IMAGE_LIMIT }),
@@ -273,6 +309,15 @@ function responseMessage(value, expectedThreadId) {
     if (attachment.width * attachment.height > 16 * 1024 * 1024 || message.role !== "user") {
       throw new DirectChatProtocolError("message attachment descriptor is invalid");
     }
+    if (attachmentIds.has(attachment.attachmentId)) {
+      throw new DirectChatProtocolError("message attachment identifiers are not unique");
+    }
+    attachmentIds.add(attachment.attachmentId);
+    attachmentBytes += attachment.byteLength;
+    if (attachmentBytes > VISION_IMAGE_TOTAL_LIMIT) {
+      throw new DirectChatProtocolError("message attachments exceed the aggregate limit");
+    }
+    attachments.push(attachment);
   }
   return Object.freeze({
     threadId,
@@ -285,7 +330,9 @@ function responseMessage(value, expectedThreadId) {
     messageHash: hash(message.messageHash, "message.messageHash"),
     generationId,
     createdAt: timestamp(message.createdAt, "message.createdAt"),
-    ...(attachment === undefined ? {} : { attachment }),
+    ...(attachments.length === 0 ? {} : (attachments.length === 1
+      ? { attachment: attachments[0] }
+      : { attachments: Object.freeze(attachments) })),
   });
 }
 
@@ -319,6 +366,10 @@ function boundedBase64(value) {
         || (code >= 48 && code <= 57) || code === 43 || code === 47)) return false;
   }
   return true;
+}
+
+function decodedBase64Length(value) {
+  return (value.length / 4) * 3 - (value.endsWith("==") ? 2 : (value.endsWith("=") ? 1 : 0));
 }
 
 function bytesToBase64(bytes) {
@@ -377,6 +428,29 @@ function canonicalAttachment(value) {
     mediaType: attachment.mediaType,
     data: bytesToBase64(attachment.bytes),
   });
+}
+
+function canonicalAttachments(value) {
+  const values = exactDenseArrayValues(value, "canonical image attachments", {
+    minimum: 2,
+    maximum: VISION_IMAGE_COUNT_LIMIT,
+  });
+  const attachments = [];
+  const identifiers = new Set();
+  let totalBytes = 0;
+  for (const raw of values) {
+    const attachment = canonicalAttachment(raw);
+    if (identifiers.has(attachment.attachmentId)) {
+      throw new TypeError("canonical image attachment identifiers must be unique");
+    }
+    identifiers.add(attachment.attachmentId);
+    totalBytes += decodedBase64Length(attachment.data);
+    if (totalBytes > VISION_IMAGE_TOTAL_LIMIT) {
+      throw new TypeError("canonical image attachments exceed the aggregate limit");
+    }
+    attachments.push(attachment);
+  }
+  return Object.freeze(attachments);
 }
 
 function responseGeneration(value, expected = {}) {
@@ -509,7 +583,7 @@ function threadTicket(value) {
 function runTicket(value) {
   const request = exactObject(value, [
     "threadId", "messageId", "generationId", "assistantMessageId", "content",
-    "expectedRevision", "expectedHash", "idempotencyKey", "attachment",
+    "expectedRevision", "expectedHash", "idempotencyKey", "attachment", "attachments",
   ], [
     "threadId", "messageId", "generationId", "assistantMessageId", "content",
     "expectedRevision", "expectedHash", "idempotencyKey",
@@ -528,6 +602,15 @@ function runTicket(value) {
   if (!content || UNSAFE_MESSAGE_CONTROL.test(content)) {
     throw new TypeError("content is invalid");
   }
+  if (request.attachment !== undefined && request.attachments !== undefined) {
+    throw new TypeError("prepared run attachment shape is ambiguous");
+  }
+  const encodedAttachments = request.attachments === undefined
+    ? undefined
+    : exactDenseArrayValues(request.attachments, "prepared run attachments", {
+      minimum: 2,
+      maximum: VISION_IMAGE_COUNT_LIMIT,
+    }).map(requestAttachment);
   const result = {
     threadId: identifier(request.threadId, "threadId", { input: true }),
     messageId: identifier(request.messageId, "messageId", { input: true, opaque: true }),
@@ -538,11 +621,32 @@ function runTicket(value) {
     expectedHash: request.expectedHash,
     idempotencyKey: idempotencyKey(request.idempotencyKey, { input: true }),
     ...(request.attachment === undefined ? {} : { attachment: requestAttachment(request.attachment) }),
+    ...(encodedAttachments === undefined ? {} : {
+      attachments: Object.freeze(encodedAttachments),
+    }),
   };
+  if (result.attachments !== undefined) {
+    if (new Set(result.attachments.map((attachment) => attachment.attachmentId)).size !== result.attachments.length) {
+      throw new TypeError("prepared run attachments are invalid");
+    }
+    if (result.attachments.reduce((total, attachment) => total + decodedBase64Length(attachment.data), 0)
+        > VISION_IMAGE_TOTAL_LIMIT) {
+      throw new TypeError("prepared run attachments exceed the aggregate limit");
+    }
+  }
   if (new Set([result.messageId, result.generationId, result.assistantMessageId]).size !== 3) {
     throw new TypeError("prepared run identifiers must be distinct");
   }
   return Object.freeze(result);
+}
+
+function serializedRunBody(ticket) {
+  const { idempotencyKey: _idempotencyKey, ...body } = ticket;
+  const serialized = JSON.stringify(body);
+  if (typeof serialized !== "string" || serialized.length > 24 * 1024 * 1024) {
+    throw new TypeError("prepared run body exceeds the browser request limit");
+  }
+  return serialized;
 }
 
 function cancellationTicket(value) {
@@ -860,8 +964,14 @@ export class DirectChatBrowserClient {
     return token;
   }
 
-  async #post(route, body, { signal, idempotency, expectedStatus = 200, timeoutMs = this.timeoutMs } = {}) {
+  async #post(route, body, {
+    signal, idempotency, expectedStatus = 200, timeoutMs = this.timeoutMs, serializedBody,
+  } = {}) {
     const endpoint = `${this.baseOrigin}${route}`;
+    // Serialization is a local pre-dispatch operation. Keep allocation errors
+    // outside the transport ambiguity boundary so the PWA can truthfully keep
+    // the draft as not sent.
+    const requestBody = serializedBody ?? JSON.stringify(body);
     const deadline = timeoutSignal(signal, timeoutMs);
     try {
       const response = requireResponse(await this.fetch(endpoint, {
@@ -871,7 +981,7 @@ export class DirectChatBrowserClient {
         redirect: "error",
         referrerPolicy: "same-origin",
         headers: requestHeaders(this.#csrf(), idempotency),
-        body: JSON.stringify(body),
+        body: requestBody,
         signal: deadline.signal,
       }));
       if (!responseMatchesRoute(response, endpoint)) throw new DirectChatProtocolError("Direct Chat response came from an unexpected URL");
@@ -1009,6 +1119,7 @@ export class DirectChatBrowserClient {
       threadId,
       afterRevision,
       limit,
+      attachmentSchema: 2,
     }, { signal }), ["messages"], ["messages"], "message list response");
     if (!Array.isArray(response.messages) || response.messages.length > limit) throw new DirectChatProtocolError("message list is invalid");
     const messages = response.messages.map((message) => responseMessage(message, threadId));
@@ -1063,40 +1174,48 @@ export class DirectChatBrowserClient {
   prepareRun(value = {}) {
     const request = exactObject(
       value,
-      ["threadId", "content", "expectedRevision", "expectedHash", "attachment"],
+      ["threadId", "content", "expectedRevision", "expectedHash", "attachment", "attachments"],
       ["threadId", "content", "expectedRevision", "expectedHash"],
       "new run",
       { input: true },
     );
     const { threadId, content, expectedRevision, expectedHash } = request;
+    if (request.attachment !== undefined && request.attachments !== undefined) {
+      throw new TypeError("new run attachment shape is ambiguous");
+    }
     identifier(threadId, "threadId", { input: true });
     const ids = {
       messageId: generated(this.makeOpaqueId, "message"),
       generationId: generated(this.makeOpaqueId, "generation"),
       assistantMessageId: generated(this.makeOpaqueId, "assistant"),
     };
-    return runTicket({
+    const ticket = runTicket({
       threadId,
       ...ids,
       content,
       expectedRevision,
       expectedHash,
       ...(request.attachment === undefined ? {} : { attachment: canonicalAttachment(request.attachment) }),
+      ...(request.attachments === undefined ? {} : { attachments: canonicalAttachments(request.attachments) }),
       idempotencyKey: generated(this.makeOpaqueId, "run_start", { idempotency: true }),
     });
+    PREPARED_RUN_BODIES.set(ticket, serializedRunBody(ticket));
+    return ticket;
   }
 
   async startRun(prepared, options = {}) {
     const { signal } = exactObject(options, ["signal"], [], "start run options", { input: true });
     const ticket = runTicket(prepared);
     const { idempotencyKey: key, ...body } = ticket;
+    const serializedBody = PREPARED_RUN_BODIES.get(prepared) ?? serializedRunBody(ticket);
     const response = exactObject(await this.#post(DIRECT_CHAT_ROUTES.runsStart, body, {
       signal,
       idempotency: key,
       expectedStatus: 202,
-      timeoutMs: ticket.attachment === undefined
+      timeoutMs: ticket.attachment === undefined && ticket.attachments === undefined
         ? this.timeoutMs
         : Math.max(this.timeoutMs, VISION_MUTATION_TIMEOUT_MS),
+      serializedBody,
     }), ["generation"], ["generation"], "run start response");
     return Object.freeze({
       request: ticket,

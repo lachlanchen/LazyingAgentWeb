@@ -103,7 +103,7 @@ presentation migration to silently acquire Direct Chat or Agent authority.
 The browser does not persist ordinary threads, messages, generations, image
 previews, session tokens, or retry state in Cache Storage, localStorage,
 sessionStorage, or IndexedDB. Authenticated history remains authoritative in
-the cloud SQLite stores. The selected composer image and rendered attachment
+the cloud SQLite stores. The selected composer images and rendered attachment
 URLs are page-memory state and are revoked at view and authentication
 boundaries. Historical attachments are fetched only as their messages approach
 the viewport, with bounded concurrency and a 16 MiB per-tab Blob LRU.
@@ -113,10 +113,12 @@ and restores a tap-to-reload placeholder; the compressed-Blob bound therefore
 cannot be bypassed by a historical image element retaining an evicted Blob.
 Both history tiers are disposable, account-scoped by lifecycle rather than
 durable identity, and are purged on logout, authentication loss, account
-transition, or release activation. A single staged or just-sent composer image
-is separate transient page memory and is revoked at its send, view, and
+transition, or release activation. Up to four staged or just-sent composer images
+are separate transient page memory and are revoked at their send, view, and
 authentication boundaries. The encrypted, expiring, one-shot confirmed-update
-composer handoff described below is the only narrow IndexedDB exception.
+composer handoff described below is the only narrow IndexedDB exception and
+accepts at most one image. A multi-image selection keeps the current page open
+and blocks update activation instead of persisting the larger private draft.
 
 The server may reuse a completed per-thread integrity audit from a bounded
 in-process LRU. Entries are keyed by account and thread, guarded by SQLite's
@@ -137,12 +139,19 @@ cross-account rotation.
 
 The attachment migration is an explicit expand/enable boundary. New and
 existing v2 databases remain at v2 while vision is disabled. First enablement
-advances the private Direct Chat database to v3 atomically. A v3-aware service
+advances the private Direct Chat database through v3 to ordered schema v4; an
+existing v3 attachment table migrates each image to position zero atomically.
+A v4-aware service
 can subsequently run with vision disabled: it still serves authenticated
 previews and exact retries of committed turns, but refuses new image turns and
 follow-ups that would reuse stored images. An older binary that knows only v2
-cannot reopen the migrated database; backup or a retained v3-aware rollback
-release is required before first enablement.
+or v3 cannot reopen the migrated database; backup or a retained v4-aware rollback
+release is required before first enablement or v3-to-v4 expansion.
+The deployment boundary blocks every `/api` route, stops the service, verifies
+sidecar-free `DELETE` journal state, and authenticates an offline v3 backup
+before starting the candidate. That backup can be restored only before the
+durable v4 write-authority marker exists. After the marker and API activation,
+all rollbacks preserve the live v4 database and require a v4-aware binary.
 
 The cloud database must never contain AgInTi plans, agent context or summaries,
 tool calls/results, commands, workspace paths, runtime policy, raw artifacts or
@@ -173,20 +182,29 @@ admission, lease, and recovery contract as normal Direct Chat generation.
 
 Direct Chat:
 
-- The PWA accepts exactly one JPEG or PNG and requires a text prompt. It checks
-  source dimensions before decode, redraws through canvas to discard source
-  metadata, and rejects canonical output above 4 MiB. No image is placed in
+- The PWA accepts one to four JPEG or PNG images and requires a text prompt. It
+  accepts source files up to 24 MiB, checks source dimensions before decode,
+  redraws and downscales each image sequentially through canvas to discard source
+  metadata, and rejects canonical output above 4 MiB per image or 16 MiB per
+  message. Its visible composer/message preview is independently bounded to
+  512 pixels and 512 KiB per image. No image is placed in
   Cache Storage, localStorage, or sessionStorage. A user-confirmed PWA update
-  may place one encrypted, expiring, one-shot unsent-composer handoff in a
+  may place one encrypted, expiring, one-shot single-image unsent-composer handoff in a
   dedicated IndexedDB store; it is never history, a send queue, or auto-sent.
+  Multiple staged images block activation and remain only in the current page.
 - The BFF independently validates canonical base64, MIME/signature, structure,
-  dimensions, metadata absence, and digest. It atomically commits the prompt,
-  descriptor-bound ledger row, private BLOB, and pending generation. Public
-  message records contain only the descriptor; authenticated preview bytes are
+  dimensions, metadata absence, digest, order, unique identifiers, count, and
+  aggregate bytes. It atomically commits the prompt, descriptor-bound ledger
+  row, all private BLOBs, and pending generation. Public message records contain
+  only descriptors; authenticated preview bytes are
   same-origin `no-store` responses.
 - The browser prepares stable thread/message/generation/idempotency identifiers.
   The store commits the user message and pending generation atomically, so an
-  ambiguous retry returns the same turn without a second dispatch intent.
+  ambiguous retry returns the same turn without a second dispatch intent. Image
+  JSON is serialized once before dispatch. On a lost response the browser first
+  probes the stable generation ID; it re-uploads only when an authoritative 404
+  proves absence. Once accepted, raw composer bytes and the serialized retry
+  ticket are released before generation finishes.
 - Before calling LocalLLM, one cloud worker claims a durable lease with a
   monotonic fence and marks dispatch started. Append, finalize, failure, and
   renewal require that proof. A restarted or stale worker cannot continue after
@@ -197,7 +215,10 @@ Direct Chat:
   one assistant message to the same hash-linked ledger exactly once.
 - Explicit Stop durably cancels the generation and invalidates its lease.
   Viewer disconnect only detaches the stream; server job limits and shutdown
-  draining remain authoritative.
+  draining remain authoritative. Upload reading has a bounded four-minute
+  ceiling for the largest valid request; accepted text generation remains
+  bounded to two minutes and accepted vision generation has a separate
+  ten-minute ceiling.
 
 AgInTi Agent:
 
@@ -273,8 +294,9 @@ each request. The connector uses an allowlist of fixed `localllm-*` aliases,
 checks `/models` readiness, sends bounded provenance-checked Direct Chat
 context, and consumes only strict OpenAI-compatible SSE text deltas. A thread
 uses its text alias until its first image; that turn and later turns use the
-fixed `localllm-vision` alias and receive the latest private attachment as one
-OpenAI-compatible `image_url` content part. Base64 is created only for that
+fixed `localllm-vision` alias and receive the latest image-bearing message's
+complete ordered attachment set as one `image_url` content part per image,
+followed by the text part. Base64 is created only for that
 bounded in-flight connector request and is never written to a ledger, log,
 receipt, cache, or browser storage.
 
@@ -291,7 +313,7 @@ and Markdown schemas. Plot data is finite, URL-free and expression-free; the
 browser builds DOM/SVG with text nodes. Active HTML, SVG and PDF are never
 served inline on the authenticated origin. File downloads, uploads and vision
 inputs remain disabled until their independent byte, MIME, decompression,
-ownership and sandbox acceptance matrices pass. Direct Chat's single-image
+ownership and sandbox acceptance matrices pass. Direct Chat's bounded multi-image
 input is the narrow exception: it is descriptor-bound, owner-private,
 metadata-stripped, independently revalidated, and has no Agent or artifact
 authority.

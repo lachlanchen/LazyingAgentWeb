@@ -11,7 +11,10 @@ import {
   validateIdempotencyKey
 } from './web/aginti-protocol.js';
 import { verifyStandaloneAssetMap } from './web/asset-map.js';
-import { validateVisionAttachmentRequest } from './vision-attachment.js';
+import {
+  validateVisionAttachmentRequest,
+  validateVisionAttachmentsRequest
+} from './vision-attachment.js';
 
 const RELEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,95}$/u;
 const CONTENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*(?:; charset=utf-8)?$/u;
@@ -29,15 +32,16 @@ export const CLOUD_HTTP_LIMITS = Object.freeze({
   loginBodyBytes: 2_048,
   sessionBodyBytes: 64,
   chatBodyBytes: 72 * 1024,
-  visionChatBodyBytes: 6 * 1024 * 1024,
+  visionChatBodyBytes: 24 * 1024 * 1024,
   agentBodyBytes: 64 * 1024,
   responseJsonBytes: 512 * 1024,
   connectorDeltaBytes: 16 * 1024,
   connectorOutputBytes: 64 * 1024,
   bodyTimeoutMs: 5_000,
-  visionBodyTimeoutMs: 90_000,
+  visionBodyTimeoutMs: 240_000,
   dependencyTimeoutMs: 30_000,
   jobTimeoutMs: 120_000,
+  visionJobTimeoutMs: 600_000,
   sseLifetimeMs: 30_000,
   ssePollMs: 100,
   concurrentBodies: 64,
@@ -443,11 +447,12 @@ export function validateChatRequest(pathname, value) {
       return Object.freeze({ threadId: identifier(body.threadId, 'threadId') });
     }
     case CLOUD_ROUTES.chatMessagesList: {
-      const body = exactObject(value, ['threadId'], ['afterRevision', 'limit'], 'chat message list');
+      const body = exactObject(value, ['threadId'], ['afterRevision', 'limit', 'attachmentSchema'], 'chat message list');
       return Object.freeze({
         threadId: identifier(body.threadId, 'threadId'),
         afterRevision: integer(body.afterRevision ?? 0, 'afterRevision', { min: 0, max: 2_000 }),
-        limit: integer(body.limit ?? 100, 'limit', { min: 1, max: 200 })
+        limit: integer(body.limit ?? 100, 'limit', { min: 1, max: 200 }),
+        attachmentSchema: integer(body.attachmentSchema ?? 1, 'attachmentSchema', { min: 1, max: 2 })
       });
     }
     case CLOUD_ROUTES.chatAttachmentsGet: {
@@ -461,7 +466,7 @@ export function validateChatRequest(pathname, value) {
       const body = exactObject(value, [
         'threadId', 'messageId', 'generationId', 'assistantMessageId',
         'content', 'expectedRevision', 'expectedHash'
-      ], ['attachment'], 'chat run start');
+      ], ['attachment', 'attachments'], 'chat run start');
       const expected = cursor(body.expectedRevision, body.expectedHash);
       const normalized = {
         threadId: identifier(body.threadId, 'threadId'),
@@ -476,17 +481,26 @@ export function validateChatRequest(pathname, value) {
         expectedRevision: expected.revision,
         expectedHash: expected.hash
       };
-      let attachment;
-      if (body.attachment !== undefined) {
+      if (body.attachment !== undefined && body.attachments !== undefined) {
+        throw new CloudHttpError(400, 'invalid_attachment', 'Use either attachment or attachments, not both.');
+      }
+      let attachments;
+      if (body.attachments !== undefined) {
         try {
-          attachment = validateVisionAttachmentRequest(body.attachment);
+          attachments = validateVisionAttachmentsRequest(body.attachments);
+        } catch (error) {
+          throw new CloudHttpError(400, 'invalid_attachment', 'The image attachments are invalid.', { cause: error });
+        }
+      } else if (body.attachment !== undefined) {
+        try {
+          attachments = Object.freeze([validateVisionAttachmentRequest(body.attachment)]);
         } catch (error) {
           throw new CloudHttpError(400, 'invalid_attachment', 'The image attachment is invalid.', { cause: error });
         }
       }
       return Object.freeze({
         ...normalized,
-        ...(attachment === undefined ? {} : { attachment })
+        ...(attachments === undefined ? {} : { attachments })
       });
     }
     case CLOUD_ROUTES.chatRunsStatus: {

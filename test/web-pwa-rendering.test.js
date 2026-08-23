@@ -29,6 +29,8 @@ import {
 import { createSafeRenderer } from "../src/web/safe-rendering.js";
 
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
+const CURRENT_RELEASE = `release-${"a".repeat(64)}`;
+const NEXT_RELEASE = `release-${"b".repeat(64)}`;
 const BOOTSTRAP_IMPORTS = `
   import katex from "./katex.mjs";
   import { createBrowserApp } from "./browser-app.js";
@@ -165,12 +167,13 @@ const APP_IDS = [
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
 ];
 
-function appDocument({ basePath = "/" } = {}) {
+function appDocument({ basePath = "/", releaseId = CURRENT_RELEASE } = {}) {
   const document = new DomDocument();
   APP_IDS.forEach((id) => document.ids.set(id, new DomNode(id === "login-form" || id === "composer" ? "form" : "div")));
   const scope = normalizeAgentWebBasePath(basePath);
   const workerPath = scope === "/" ? "/sw.js" : `${scope.slice(0, -1)}/sw.js`;
   for (const [name, content] of [
+    ["lazying-agent-release", releaseId],
     ["lazying-agent-base-path", scope],
     ["lazying-agent-service-worker", workerPath],
   ]) {
@@ -353,15 +356,34 @@ function workerVm(source, {
   };
 }
 
-function updateEnvironment({ waiting = true, controlled = true, onUpdate = async () => {}, registerPromise } = {}) {
+function updateEnvironment({
+  waiting = true,
+  waitingReleaseId = NEXT_RELEASE,
+  respondToReleaseQuery = true,
+  controlled = true,
+  onUpdate = async () => {},
+  registerPromise,
+} = {}) {
   const workerMessages = [];
-  const waitingWorker = {
+  const workerReleaseQueries = [];
+  let serviceWorker;
+  const makeWorker = (releaseId = NEXT_RELEASE, { respond = true } = {}) => ({
+    releaseId,
     throwOnPost: false,
-    postMessage(value) {
+    postMessage(value, transfer = []) {
       if (this.throwOnPost) throw new Error("postMessage failed");
+      if (value?.type === "GET_LAZYING_AGENT_RELEASE") {
+        workerReleaseQueries.push({ worker: this, releaseId: this.releaseId });
+        if (!respond) return;
+        const response = { type: "LAZYING_AGENT_RELEASE", releaseId: this.releaseId };
+        if (transfer[0]?.postMessage) transfer[0].postMessage(response);
+        else serviceWorker.dispatch("message", { data: response, source: this });
+        return;
+      }
       workerMessages.push(value);
     },
-  };
+  });
+  const waitingWorker = makeWorker(waitingReleaseId, { respond: respondToReleaseQuery });
   const registration = Object.assign(eventTarget(), {
     waiting: waiting ? waitingWorker : null,
     installing: null,
@@ -374,7 +396,7 @@ function updateEnvironment({ waiting = true, controlled = true, onUpdate = async
     messages: [],
     postMessage(value) { this.messages.push(value); },
   });
-  const serviceWorker = Object.assign(eventTarget(), {
+  serviceWorker = Object.assign(eventTarget(), {
     controller: controlled ? makeController() : null,
     registerCalls: [],
     async register(path, options) {
@@ -389,7 +411,22 @@ function updateEnvironment({ waiting = true, controlled = true, onUpdate = async
     serviceWorker.dispatch("controllerchange");
     return controller;
   };
-  return { registration, serviceWorker, waitingWorker, workerMessages, transitionController };
+  return { registration, serviceWorker, waitingWorker, workerMessages, workerReleaseQueries, makeWorker, transitionController };
+}
+
+class FakeMessageChannel {
+  constructor() {
+    let receive = null;
+    this.port1 = {
+      addEventListener(name, listener) { if (name === "message") receive = listener; },
+      start() {},
+      close() { receive = null; },
+    };
+    this.port2 = {
+      postMessage(value) { receive?.({ data: value }); },
+      close() {},
+    };
+  }
 }
 
 function updateControllerHarness({
@@ -414,6 +451,7 @@ function updateControllerHarness({
   let nextTimer = 1;
   const timers = new Map();
   const window = Object.assign(eventTarget(), {
+    MessageChannel: FakeMessageChannel,
     location: {
       protocol: "https:", href: locationHref ?? `https://llm.lazying.art${normalizeAgentWebBasePath(basePath)}`,
       reload() { reloads += 1; },
@@ -455,6 +493,7 @@ function updateControllerHarness({
     navigator,
     window,
     serviceWorker,
+    makeWorker: shared.makeWorker,
     transitionController: shared.transitionController,
     waitingWorker,
     workerMessages,
@@ -690,6 +729,19 @@ test("integrity worker caches the complete offline graph and rejects mismatched 
   assert.equal(releaseMessages.length, 1);
   assert.equal(releaseMessages[0].type, "LAZYING_AGENT_RELEASE");
   assert.equal(releaseMessages[0].releaseId, map.releaseVersion);
+  const channelReleaseMessages = [];
+  let channelClosed = false;
+  await worker.dispatch("message", {
+    data: { type: "GET_LAZYING_AGENT_RELEASE" },
+    ports: [{
+      postMessage(value) { channelReleaseMessages.push(value); },
+      close() { channelClosed = true; },
+    }],
+  });
+  assert.equal(channelReleaseMessages.length, 1);
+  assert.equal(channelReleaseMessages[0].type, "LAZYING_AGENT_RELEASE");
+  assert.equal(channelReleaseMessages[0].releaseId, map.releaseVersion);
+  assert.equal(channelClosed, true, "the one-shot identity channel is closed after its exact response");
 });
 
 test("v1/v2/v3/rollback retains current plus immediate predecessor and isolates sibling scopes", async () => {
@@ -848,6 +900,7 @@ test("one tab confirms globally, all old controlled tabs navigate once, and init
   initialEnvironment.registration.waiting = initialEnvironment.waitingWorker;
   initialEnvironment.registration.dispatch("updatefound");
   installing.dispatch("statechange");
+  await Promise.resolve();
   initialTab.document.getElementById("apply-update").dispatch("click");
   assert.deepEqual(initialEnvironment.workerMessages, [{ type: "SKIP_WAITING" }]);
   initialEnvironment.transitionController();
@@ -855,6 +908,64 @@ test("one tab confirms globally, all old controlled tabs navigate once, and init
   initialTab.runTimers(1_000);
   assert.deepEqual(initialTab.replacements, ["https://llm.lazying.art/"], "the same tab navigates for a later approved successor");
   assert.equal(initialTab.reloads, 0);
+});
+
+test("a fresh exact-release install skips the redundant startup update and never offers its own waiting worker", async () => {
+  const environment = updateEnvironment({
+    waiting: false,
+    waitingReleaseId: CURRENT_RELEASE,
+    controlled: false,
+  });
+  const harness = updateControllerHarness({ environment, controlled: false });
+  await harness.app.initialize();
+  await Promise.resolve();
+  assert.equal(environment.registration.updateCalls, 0, "an uncontrolled first load must not race its initial install with update()");
+  assert.equal(harness.document.getElementById("update-banner").hidden, true);
+
+  const installing = eventTarget();
+  environment.registration.installing = installing;
+  environment.registration.waiting = environment.waitingWorker;
+  environment.registration.dispatch("updatefound");
+  installing.dispatch("statechange");
+  await Promise.resolve();
+
+  assert.equal(harness.document.getElementById("update-banner").hidden, true);
+  harness.document.getElementById("apply-update").dispatch("click");
+  harness.document.getElementById("defer-update").dispatch("click");
+  assert.deepEqual(environment.workerMessages, [], "stale controls cannot activate or defer a same-release worker");
+  assert.equal(environment.workerReleaseQueries.length, 1);
+});
+
+test("waiting-worker release proof suppresses only the exact shell release and offers a verified successor", async () => {
+  const sameEnvironment = updateEnvironment({ waitingReleaseId: CURRENT_RELEASE });
+  const same = updateControllerHarness({ environment: sameEnvironment });
+  await same.app.initialize();
+  await Promise.resolve();
+  assert.equal(same.document.getElementById("update-banner").hidden, true);
+  assert.equal(sameEnvironment.workerReleaseQueries.length, 1);
+
+  const newerEnvironment = updateEnvironment({ waitingReleaseId: NEXT_RELEASE });
+  const newer = updateControllerHarness({ environment: newerEnvironment });
+  await newer.app.initialize();
+  await Promise.resolve();
+  assert.equal(newer.document.getElementById("update-banner").hidden, false);
+  newer.document.getElementById("apply-update").dispatch("click");
+  assert.deepEqual(newerEnvironment.workerMessages, [{ type: "SKIP_WAITING" }]);
+});
+
+test("an unidentified legacy waiting worker is conservatively offered after the bounded proof timeout", async () => {
+  const environment = updateEnvironment({ respondToReleaseQuery: false });
+  const harness = updateControllerHarness({ environment });
+  await harness.app.initialize();
+  await Promise.resolve();
+  assert.equal(harness.document.getElementById("update-banner").hidden, true, "identity is checked before prompting");
+  assert.equal(environment.workerReleaseQueries.length, 1);
+
+  harness.runTimers(1_000);
+  await Promise.resolve();
+  assert.equal(harness.document.getElementById("update-banner").hidden, false, "unknown workers must not be silently discarded");
+  harness.document.getElementById("apply-update").dispatch("click");
+  assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
 });
 
 test("controller migration uses a content-versioned full navigation and defers tabs with browser-only work", async () => {
@@ -880,6 +991,116 @@ test("controller migration uses a content-versioned full navigation and defers t
   unsafe.document.getElementById("message-input").value = "";
   unsafe.document.getElementById("message-input").dispatch("input");
   assert.deepEqual(unsafe.replacements, [`https://llm.lazying.art/?v=${successor}`]);
+});
+
+test("a paused authoritative chat finalization defers update activation and controller reload until Resume completes it", async () => {
+  const threadId = "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx";
+  const generationId = "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx";
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
+  const now = "2026-08-23T08:00:00.000Z";
+  let thread = null;
+  let messages = [];
+  let runStarted = false;
+  let snapshotAvailable = false;
+  const disabledCapability = {
+    schemaVersion: "1",
+    enabled: false,
+    agent: { kind: "aginti", label: "AgInTi Agent" },
+    model: { label: "LocalLLM" },
+    actions: { cancel: false, resume: false, retry: false },
+    attachments: { enabled: false },
+    artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+  };
+  const agent = {
+    async capabilities() { return disabledCapability; },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async *streamRunEvents() {},
+  };
+  const chat = {
+    async capabilities() { return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }; },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId, title, idempotencyKey: "thread_create_update_finalize_x" });
+    },
+    async createThread(request) {
+      thread = {
+        threadId, title: request.title, modelAlias: "local-default", revision: 0, ledgerHash: null,
+        messageCount: 0, ledgerBytes: 0, currentGenerationId: null, createdAt: now, updatedAt: now,
+      };
+      return { request, thread };
+    },
+    async retryCreateThread(request) { return await this.createThread(request); },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() {
+      if (runStarted && !snapshotAvailable) {
+        throw Object.assign(new Error("snapshot temporarily unavailable"), { retryable: true });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment() { throw new Error("unexpected attachment read"); },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId, idempotencyKey: "run_start_update_finalize_xxxx" });
+    },
+    async startRun(request) {
+      runStarted = true;
+      messages = [
+        {
+          threadId, messageId: "message_0001_xxxxxxxxxxxxxxxxxxxxxxxx", revision: 1, role: "user",
+          content: request.content, contentBytes: request.content.length, previousHash: null, messageHash: hashA,
+          generationId: null, createdAt: now,
+        },
+        {
+          threadId, messageId: "message_0002_xxxxxxxxxxxxxxxxxxxxxxxx", revision: 2, role: "assistant",
+          content: "Ready after finalization", contentBytes: 24, previousHash: hashA, messageHash: hashB,
+          generationId, createdAt: now,
+        },
+      ];
+      thread = {
+        ...thread, revision: 2, ledgerHash: hashB, messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0), updatedAt: now,
+      };
+      return { request, generation: { threadId, generationId, status: "completed", terminal: true } };
+    },
+    async retryRun(request) { return await this.startRun(request); },
+    async getRunStatus() { return { generation: { threadId, generationId, status: "completed", terminal: true } }; },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("unexpected cancellation"); },
+    async cancelRun() { throw new Error("unexpected cancellation"); },
+  };
+  const environment = updateEnvironment();
+  const harness = updateControllerHarness({
+    environment,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat,
+  });
+  await harness.app.initialize();
+  await Promise.resolve();
+  harness.document.getElementById("message-input").value = "Keep this completed response recoverable";
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(harness.document.getElementById("workspace").dataset.status, "finalizing");
+
+  harness.document.getElementById("apply-update").dispatch("click");
+  assert.deepEqual(environment.workerMessages, [], "Finalizing cannot activate a waiting worker");
+  assert.match(harness.document.getElementById("toast").textContent, /Finish the current draft or response/u);
+
+  environment.registration.waiting = null;
+  const controller = environment.transitionController();
+  const successor = `release-${"f".repeat(64)}`;
+  environment.serviceWorker.dispatch("message", {
+    data: { type: "LAZYING_AGENT_RELEASE", releaseId: successor },
+    source: controller,
+  });
+  assert.deepEqual(harness.replacements, [], "another tab's controller activation cannot reload paused Finalizing");
+
+  snapshotAvailable = true;
+  await harness.app.resume();
+  assert.equal(harness.document.getElementById("workspace").dataset.status, "completed");
+  harness.runTimers(1_000);
+  assert.deepEqual(harness.replacements, [`https://llm.lazying.art/?v=${successor}`]);
 });
 
 test("a deferred tab replaces an obsolete R2 handshake when a distinct R3 controller takes ownership", async () => {
@@ -1001,12 +1222,13 @@ test("Later re-prompts after bounded deferral and a newer waiting worker bypasse
   assert.equal(harness.document.getElementById("update-banner").hidden, false, "the same worker is offered again after bounded deferral");
 
   harness.document.getElementById("defer-update").dispatch("click");
-  const newerWorker = { postMessage(value) { harness.workerMessages.push(value); } };
+  const newerWorker = harness.makeWorker(`release-${"c".repeat(64)}`);
   const installing = eventTarget();
   harness.registration.installing = installing;
   harness.registration.dispatch("updatefound");
   harness.registration.waiting = newerWorker;
   installing.dispatch("statechange");
+  await Promise.resolve();
   assert.equal(harness.document.getElementById("update-banner").hidden, false, "a newer worker is never hidden behind an older deferral");
   instant += 1;
 });
@@ -1045,6 +1267,7 @@ test("updatefound shows a visible prompt only after the successor reaches waitin
   harness.registration.dispatch("updatefound");
   harness.registration.waiting = harness.waitingWorker;
   installing.dispatch("statechange");
+  await Promise.resolve();
   assert.equal(harness.document.getElementById("update-banner").hidden, false);
   assert.deepEqual(harness.workerMessages, []);
 });

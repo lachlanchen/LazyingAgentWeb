@@ -188,10 +188,16 @@ therefore cannot mix files from two deployments.
 
 `/sw.js` is deliberately stable and is always served with `no-store`,
 `no-cache`, and `must-revalidate`. The browser registers that one URL with
-`updateViaCache: "none"`, checks it at startup and on a bounded foreground or
-online transition, and can therefore discover v1, v2, v3, and later releases
+`updateViaCache: "none"`. An already-controlled page checks it at startup and
+on a bounded foreground or online transition; a fresh uncontrolled install
+skips the redundant immediate check and joins the same periodic schedule. The
+stable registration can therefore discover v1, v2, v3, and later releases
 without another version endpoint. A successor installs a separate complete
-shell cache but remains waiting. The UI offers **Update** or **Later**:
+shell cache but remains waiting. Before showing anything, the page asks that
+specific worker to prove its immutable release over a one-shot message channel.
+A positively verified worker matching the loaded HTML is silent; a verified
+successor, or a legacy worker that cannot answer within the bounded proof
+window, is offered through **Update** or **Later**:
 
 - **Later** leaves the current worker and offline shell untouched.
 - **Update** explicitly requests activation and reloads the page exactly once

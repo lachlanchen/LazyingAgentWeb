@@ -74,13 +74,18 @@ it cannot be paired with a caller-invented release ID.
 
 The update authority is the stable `/sw.js` route, served with `no-store`,
 `no-cache`, and `must-revalidate`. The browser registers it with
-`updateViaCache: "none"` and checks at startup and on bounded foreground/online
-transitions. A complete successor shell is verified by exact URL, MIME type,
-security headers, byte length, and SHA-256 before it can wait for activation.
-The UI offers **Update** and **Later**; Update reloads once only after the new
-worker controls the tab. Activation retains the current and immediately
-previous verified shell. An offline or failed update leaves the current app
-usable.
+`updateViaCache: "none"`. Controlled pages check at startup and on bounded
+foreground/online transitions, while a fresh uncontrolled install skips a
+redundant immediate update race. A complete successor shell is verified by
+exact URL, MIME type, security headers, byte length, and SHA-256 before it can
+wait for activation.
+The page proves a waiting worker's release over a one-shot message channel and
+suppresses the banner only when it exactly matches the loaded shell. The UI
+offers **Update** and **Later** for a verified successor, conservatively falling
+back to the same offer for an unresponsive legacy worker; Update reloads once
+only after the new worker controls the tab. Activation retains the current and
+immediately previous verified shell. An offline or failed update leaves the
+current app usable.
 
 Only immutable public shell assets enter Cache Storage. Login/session, Direct
 Chat, Agent, SSE, artifact, and upload traffic always bypasses it. Production

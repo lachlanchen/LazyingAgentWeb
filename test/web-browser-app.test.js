@@ -103,8 +103,9 @@ const IDS = [
 ];
 
 class Document {
-  constructor() {
+  constructor({ decodeImage = async () => {} } = {}) {
     this.documentElement = new Node("html");
+    this.decodeImage = decodeImage;
     this.ids = new Map(IDS.map((id) => [id, new Node(id === "composer" || id === "login-form" ? "form" : "div")]));
     this.ids.get("app-view").hidden = true;
     this.ids.get("mode-switch").hidden = true;
@@ -115,7 +116,11 @@ class Document {
     this.ids.get("remember-session").checked = true;
   }
   getElementById(id) { return this.ids.get(id) ?? null; }
-  createElement(name) { return new Node(name); }
+  createElement(name) {
+    const node = new Node(name);
+    if (name === "img") node.decode = () => this.decodeImage(node);
+    return node;
+  }
   createTextNode(value) { return new Node("#text", String(value)); }
 }
 
@@ -161,6 +166,60 @@ function baseChat(overrides = {}) {
   };
 }
 
+function terminalVisionChat({ bytes, descriptor, onAttachment = () => {} }) {
+  let thread = null;
+  let messages = [];
+  return baseChat({
+    async capabilities() {
+      return {
+        visionInput: true,
+        visionMediaTypes: ["image/jpeg", "image/png"],
+        maximumImageBytes: 4 * 1024 * 1024,
+      };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_finalize_image_x" });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_finalize_image_xxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages = [
+        chatMessage(1, "user", ticket.content, { attachment: descriptor }),
+        chatMessage(2, "assistant", "Vision final answer"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+    async getAttachment(value) {
+      onAttachment(value);
+      return { descriptor, bytes };
+    },
+  });
+}
+
 function harness({
   restore = { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" },
   login,
@@ -169,12 +228,14 @@ function harness({
   chat,
   credentialSaver = async () => false,
   canonicalizeImage,
+  decodeImage,
   createObjectUrl,
   revokeObjectUrl,
+  attachmentDecodeTimeoutMs,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
 } = {}) {
-  const document = new Document();
+  const document = new Document({ ...(decodeImage === undefined ? {} : { decodeImage }) });
   const windowListeners = new Map();
   const window = {
     location: { protocol: "http:", reload() {} },
@@ -206,6 +267,7 @@ function harness({
     ...(canonicalizeImage === undefined ? {} : { canonicalizeImage }),
     ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
     ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
+    ...(attachmentDecodeTimeoutMs === undefined ? {} : { attachmentDecodeTimeoutMs }),
     wait,
     maxStreamBackoffSteps,
   });
@@ -783,6 +845,242 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
 });
 
+test("Completed waits in Finalizing until its restored attachment is decoded and ready", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_0000000000000010",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 160,
+    height: 90,
+    sha256: "d".repeat(64),
+  };
+  const decodeStarted = Promise.withResolvers();
+  const decodeGate = Promise.withResolvers();
+  const createdUrls = [];
+  const browser = harness({
+    chat: terminalVisionChat({ bytes, descriptor }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        ...descriptor,
+        bytes,
+        previewBlob: new Blob([bytes], { type: descriptor.mediaType }),
+      });
+    },
+    decodeImage(image) {
+      decodeStarted.resolve(image);
+      return decodeGate.promise;
+    },
+    createObjectUrl() {
+      const url = `blob:decode-gate-${createdUrls.length + 1}`;
+      createdUrls.push(url);
+      return url;
+    },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "decode-gate.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Wait for the restored preview";
+
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  const image = await decodeStarted.promise;
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "finalizing");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Finalizing");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "true");
+  assert.equal(browser.document.getElementById("new-thread").disabled, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, true);
+  assert.equal(image.dataset.previewState, "loading");
+  assert.equal(image.hidden, true);
+
+  decodeGate.resolve();
+  await submission;
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "false");
+  assert.equal(browser.document.getElementById("new-thread").disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(image.dataset.previewState, "ready");
+  assert.equal(image.hidden, false);
+  assert.equal(image.alt, "Attached image");
+});
+
+test("a restored attachment decode timeout becomes explicit unavailable state and releases Finalizing", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_0000000000000011",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 120,
+    height: 120,
+    sha256: "e".repeat(64),
+  };
+  const revokedUrls = [];
+  const browser = harness({
+    chat: terminalVisionChat({ bytes, descriptor }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        ...descriptor,
+        bytes,
+        previewBlob: new Blob([bytes], { type: descriptor.mediaType }),
+      });
+    },
+    decodeImage() { return new Promise(() => {}); },
+    createObjectUrl() { return `blob:decode-timeout-${revokedUrls.length + 1}`; },
+    revokeObjectUrl(url) { revokedUrls.push(url); },
+    attachmentDecodeTimeoutMs: 5,
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "decode-timeout.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Bound the restored preview decode";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  const article = browser.document.getElementById("messages").children[0];
+  const [image, status] = article.children;
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "false");
+  assert.equal(browser.document.getElementById("new-thread").disabled, false);
+  assert.equal(image.dataset.previewState, "unavailable");
+  assert.equal(image.hidden, true);
+  assert.equal(image.src, "");
+  assert.equal(status.hidden, false);
+  assert.equal(status.textContent, "Attached image preview unavailable");
+  assert.equal(article.dataset.attachmentState, "unavailable");
+  assert.ok(revokedUrls.some((url) => url.startsWith("blob:decode-timeout-")));
+});
+
+test("completed chat navigation ignores a stalled and then out-of-order sidebar refresh", async () => {
+  const messages = [
+    chatMessage(1, "user", "Existing question"),
+    chatMessage(2, "assistant", "Existing answer"),
+  ];
+  const thread = chatThread({
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const sidebarRead = Promise.withResolvers();
+  const sidebarReadStarted = Promise.withResolvers();
+  const newerThread = chatThread({
+    threadId: "chat_0003_zzzzzzzzzzzzzzzzzzzzzzzz",
+    title: "Newer chat",
+  });
+  let listedThreads = [thread];
+  let stallSidebar = false;
+  const chat = baseChat({
+    async listThreads() {
+      if (stallSidebar) {
+        stallSidebar = false;
+        sidebarReadStarted.resolve();
+        return sidebarRead.promise;
+      }
+      return { threads: listedThreads };
+    },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+  });
+  const browser = harness({ chat });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  stallSidebar = true;
+  browser.document.getElementById("thread-list").children[0].dispatch("click");
+  await sidebarReadStarted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(browser.document.getElementById("new-thread").disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+
+  listedThreads = [newerThread, thread];
+  browser.document.getElementById("thread-list").children[0].dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    browser.document.getElementById("thread-list").children.map((button) => button.dataset.threadId),
+    [newerThread.threadId, thread.threadId],
+  );
+
+  sidebarRead.resolve({ threads: [thread] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    browser.document.getElementById("thread-list").children.map((button) => button.dataset.threadId),
+    [newerThread.threadId, thread.threadId],
+    "an older list response cannot remove a chat learned by a newer refresh",
+  );
+});
+
+test("a stale restored-image decode revokes its object URL even when replacement thread loading fails", async () => {
+  const replacementThreadId = "chat_0002_yyyyyyyyyyyyyyyyyyyyyyyy";
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_0000000000000012",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 96,
+    height: 64,
+    sha256: "f".repeat(64),
+  };
+  const sourceMessage = chatMessage(1, "user", "Image still loading", { attachment: descriptor });
+  const sourceThread = chatThread({
+    revision: 1,
+    ledgerHash: CHAT_HASH_A,
+    messageCount: 1,
+    ledgerBytes: sourceMessage.contentBytes,
+  });
+  const replacementThread = chatThread({ threadId: replacementThreadId, title: "Replacement" });
+  const decodeStarted = Promise.withResolvers();
+  const decodeGate = Promise.withResolvers();
+  const replacementReadStarted = Promise.withResolvers();
+  const revokedUrls = [];
+  const chat = baseChat({
+    async listThreads() { return { threads: [sourceThread, replacementThread] }; },
+    async getThread(threadId) {
+      if (threadId === replacementThreadId) {
+        replacementReadStarted.resolve();
+        throw Object.assign(new Error("replacement snapshot unavailable"), { retryable: true });
+      }
+      return { thread: sourceThread };
+    },
+    async listMessages({ threadId, afterRevision, limit }) {
+      const messages = threadId === CHAT_THREAD_ID ? [sourceMessage] : [];
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment() { return { descriptor, bytes }; },
+  });
+  const browser = harness({
+    chat,
+    decodeImage(image) {
+      decodeStarted.resolve(image);
+      return decodeGate.promise;
+    },
+    createObjectUrl() { return "blob:stale-restored-image"; },
+    revokeObjectUrl(url) { revokedUrls.push(url); },
+  });
+
+  const initialization = browser.app.initialize();
+  await decodeStarted.promise;
+  browser.document.getElementById("thread-list").children[1].dispatch("click");
+  await replacementReadStarted.promise;
+  decodeGate.reject(new Error("stale image decode"));
+  await initialization;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(revokedUrls, ["blob:stale-restored-image"]);
+  assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/iu);
+});
+
 test("a local image-run preparation failure cannot create an empty thread and restores the exact draft", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const prompt = `${"a".repeat(79)}😀 private image`;
@@ -1286,9 +1584,11 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
   assert.equal(canonicalizations, 3);
 });
 
-test("a confirmed completed run stays completed when its final snapshot is temporarily unavailable", async () => {
+test("a completed generation stays visibly locked in Finalizing until Resume restores its authoritative snapshot", async () => {
   let thread = null;
+  let messages = [];
   let runAccepted = false;
+  let finalSnapshotAvailable = false;
   const completed = chatGeneration({ status: "completed", terminal: true });
   const chat = baseChat({
     prepareThread({ title }) {
@@ -1300,15 +1600,30 @@ test("a confirmed completed run stays completed when its final snapshot is tempo
     },
     async listThreads() { return { threads: thread ? [thread] : [] }; },
     async getThread() {
-      if (runAccepted) throw Object.assign(new Error("snapshot temporarily unavailable"), { retryable: true });
+      if (runAccepted && !finalSnapshotAvailable) {
+        throw Object.assign(new Error("snapshot temporarily unavailable"), { retryable: true });
+      }
       return { thread };
     },
-    async listMessages() { return { messages: [] }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
     prepareRun(request) {
       return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_terminal_xxxxxxxxx" });
     },
     async startRun(ticket) {
       runAccepted = true;
+      messages = [
+        chatMessage(1, "user", ticket.content),
+        chatMessage(2, "assistant", "Authoritative final answer"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
       return { request: ticket, generation: completed };
     },
   });
@@ -1316,13 +1631,30 @@ test("a confirmed completed run stays completed when its final snapshot is tempo
   await browser.app.initialize();
   browser.document.getElementById("message-input").value = "Keep the confirmed result";
   await browser.app.submitMessage({ preventDefault() {} });
-  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
-  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
-  assert.equal(browser.document.getElementById("connection-state").textContent, "Completed · refresh pending");
-  assert.equal(browser.document.getElementById("resume-run").hidden, true);
-  assert.match(browser.document.getElementById("toast").textContent, /completed this response/iu);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "finalizing");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "true");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Finalizing");
+  assert.equal(browser.document.getElementById("connection-state").textContent, "Finalizing · reconnect needed");
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.equal(browser.document.getElementById("new-thread").disabled, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.match(browser.document.getElementById("toast").textContent, /authoritative final view is not ready/iu);
   assert.doesNotMatch(browser.document.getElementById("toast").textContent, /interrupted/iu);
   assert.match(browser.document.getElementById("messages").textContent, /Keep the confirmed result/u);
+
+  browser.document.getElementById("new-thread").dispatch("click");
+  assert.equal(browser.document.getElementById("conversation-title").textContent, "Keep the confirmed result");
+  finalSnapshotAvailable = true;
+  await browser.app.resume();
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "false");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(browser.document.getElementById("connection-state").textContent, "Connected");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.equal(browser.document.getElementById("new-thread").disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.match(browser.document.getElementById("messages").textContent, /Authoritative final answer/u);
 });
 
 test("Resume releases an ambiguous run when its exact retry receives an authoritative rejection", async () => {

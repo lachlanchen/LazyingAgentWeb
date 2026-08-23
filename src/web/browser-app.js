@@ -148,6 +148,13 @@ function validAgentRelease(value) {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._~-]{0,95}$/u.test(value);
 }
 
+function agentReleaseMessage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "releaseId,type"
+      || value.type !== "LAZYING_AGENT_RELEASE" || !validAgentRelease(value.releaseId)) return null;
+  return value.releaseId;
+}
+
 function safeRunStatus(value) {
   return ["starting", "running", "completed", "failed", "cancelled"].includes(value) ? value : "running";
 }
@@ -210,6 +217,7 @@ export function createBrowserApp({
   updateCheckIntervalMs = 15 * 60 * 1_000,
   updateDeferralMs = 60 * 60 * 1_000,
   activationTimeoutMs = 30_000,
+  attachmentDecodeTimeoutMs = 15_000,
   now = Date.now,
   maxStreamBackoffSteps = 5,
   wait = (milliseconds, signal) => new Promise((resolve, reject) => {
@@ -255,6 +263,8 @@ export function createBrowserApp({
     "serviceWorkerPath",
   );
   if (workerPath !== expectedWorkerPath) throw new TypeError("serviceWorkerPath must be bound to serviceWorkerScope");
+  const declaredRelease = metaContent(document, "lazying-agent-release");
+  const currentRelease = validAgentRelease(declaredRelease) ? declaredRelease : null;
   if (!Number.isSafeInteger(updateCheckIntervalMs) || updateCheckIntervalMs < 60_000 || updateCheckIntervalMs > 86_400_000) {
     throw new TypeError("updateCheckIntervalMs must be from one minute through one day");
   }
@@ -263,6 +273,10 @@ export function createBrowserApp({
   }
   if (!Number.isSafeInteger(activationTimeoutMs) || activationTimeoutMs < 5_000 || activationTimeoutMs > 300_000) {
     throw new TypeError("activationTimeoutMs must be from five seconds through five minutes");
+  }
+  if (!Number.isSafeInteger(attachmentDecodeTimeoutMs) || attachmentDecodeTimeoutMs < 1
+      || attachmentDecodeTimeoutMs > 60_000) {
+    throw new TypeError("attachmentDecodeTimeoutMs must be from one millisecond through one minute");
   }
   if (typeof now !== "function") throw new TypeError("now must be a function");
   if (!Number.isSafeInteger(maxStreamBackoffSteps) || maxStreamBackoffSteps < 0 || maxStreamBackoffSteps > 20) {
@@ -284,6 +298,7 @@ export function createBrowserApp({
     mode: "chat",
     agentThreads: [],
     chatThreads: [],
+    chatThreadListEpoch: 0,
     agentThreadId: null,
     chatThreadId: null,
     chatThread: null,
@@ -291,6 +306,7 @@ export function createBrowserApp({
     chatAfterSequence: 0,
     chatOutput: "",
     chatPendingSend: null,
+    chatFinalization: null,
     selectedImage: null,
     selectedImageUrl: null,
     imagePreparing: false,
@@ -314,9 +330,12 @@ export function createBrowserApp({
     showUpdatePrompt: null,
     updateConfirmed: false,
     updateConfirmedWorker: null,
+    updateOfferedWorker: null,
     updateControllerChanged: false,
     updateController: null,
     updateTargetRelease: null,
+    updateKnownWorkerReleases: new WeakMap(),
+    updateReleaseQueries: new Map(),
     updateReleaseTimer: null,
     updateSafetyTimer: null,
     updatePollTimer: null,
@@ -400,18 +419,30 @@ export function createBrowserApp({
     return true;
   }
 
+  function interactionLocked() {
+    return state.busy || state.logoutPending || state.chatFinalization !== null;
+  }
+
   function updateImageControl() {
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
-    const interactionLocked = state.busy || state.logoutPending;
+    const locked = interactionLocked();
     if (!available && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
     elements.add_image.hidden = !available;
-    elements.add_image.disabled = !available || interactionLocked || state.imagePreparing || pendingChatSend;
-    elements.remove_image.disabled = !available || interactionLocked || pendingChatSend
+    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend;
+    elements.remove_image.disabled = !available || locked || pendingChatSend
       || (state.selectedImage === null && !state.imagePreparing);
-    elements.message_input.disabled = !state.session.authenticated || interactionLocked || state.imagePreparing || pendingChatSend;
-    elements.send_message.disabled = !state.session.authenticated || interactionLocked || state.imagePreparing || pendingChatSend;
+    elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend;
+    elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend;
+    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend;
+    elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked;
+    elements.chat_mode.disabled = !state.session.authenticated || locked;
+    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend ? "true" : "false");
+    elements.workspace.setAttribute("aria-busy", state.chatFinalization === null ? "false" : "true");
+    for (const button of elements.thread_list.children ?? []) {
+      button.disabled = locked || pendingChatSend;
+    }
   }
 
   function currentThreads() {
@@ -426,7 +457,7 @@ export function createBrowserApp({
     const agentAvailable = state.capabilities.enabled === true;
     const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
     const changed = nextMode !== state.mode;
-    if (changed && (state.busy || state.logoutPending)) return;
+    if (changed && interactionLocked()) return;
     if (changed && state.mode === "chat" && state.chatPendingSend) {
       showToast("Confirm the pending durable send with Resume before changing modes.");
       return;
@@ -469,7 +500,78 @@ export function createBrowserApp({
     state.assistantNode = null;
   }
 
-  function messageNode(role, content, { runId, attachment, threadId, localAttachment } = {}) {
+  function restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch }) {
+    return state.chat === chat && state.viewEpoch === expectedEpoch
+      && state.imageRenderEpoch === expectedImageEpoch;
+  }
+
+  function waitForImageDecode(image) {
+    let readiness;
+    if (typeof image.decode === "function") readiness = Promise.resolve().then(() => image.decode());
+    else if (image.complete === true) {
+      readiness = Number(image.naturalWidth) > 0
+        ? Promise.resolve()
+        : Promise.reject(new TypeError("restored image did not decode"));
+    } else {
+      readiness = new Promise((resolve, reject) => {
+        image.addEventListener("load", resolve, { once: true });
+        image.addEventListener("error", () => reject(new TypeError("restored image did not load")), { once: true });
+      });
+    }
+    return new Promise((resolve, reject) => {
+      const timer = globalThis.setTimeout(() => {
+        reject(new TypeError("restored image decode timed out"));
+      }, attachmentDecodeTimeoutMs);
+      readiness.then(
+        (value) => { globalThis.clearTimeout(timer); resolve(value); },
+        (error) => { globalThis.clearTimeout(timer); reject(error); },
+      );
+    });
+  }
+
+  async function restoreMessageAttachment({ article, image, status, threadId, attachment }) {
+    const expectedEpoch = state.viewEpoch;
+    const expectedImageEpoch = state.imageRenderEpoch;
+    const chat = state.chat;
+    const current = () => restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch });
+    const unavailable = () => {
+      image.src = "";
+      image.hidden = true;
+      image.alt = "Attached image preview unavailable";
+      image.dataset.previewState = "unavailable";
+      status.textContent = "Attached image preview unavailable";
+      status.hidden = false;
+      article.dataset.attachmentState = "unavailable";
+    };
+    let url = null;
+    try {
+      const { bytes, descriptor } = await chat.getAttachment({ threadId, attachment });
+      if (!current()) return "stale";
+      url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
+      state.messageImageUrls.add(url);
+      image.src = url;
+      await waitForImageDecode(image);
+      if (!current()) {
+        if (state.messageImageUrls.delete(url)) revokeObjectUrl(url);
+        return "stale";
+      }
+      image.alt = "Attached image";
+      image.hidden = false;
+      image.dataset.previewState = "ready";
+      status.hidden = true;
+      article.dataset.attachmentState = "ready";
+      return "ready";
+    } catch {
+      if (url !== null && state.messageImageUrls.delete(url)) revokeObjectUrl(url);
+      if (!current()) return "stale";
+      unavailable();
+      return "unavailable";
+    }
+  }
+
+  function messageNode(role, content, {
+    runId, attachment, threadId, localAttachment, attachmentReadyTasks,
+  } = {}) {
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.role = role;
@@ -483,18 +585,21 @@ export function createBrowserApp({
         const url = createObjectUrl(new Blob([localAttachment.bytes], { type: localAttachment.mediaType }));
         state.messageImageUrls.add(url);
         image.src = url;
+        image.dataset.previewState = "local";
+        article.dataset.attachmentState = "local";
       } else {
-        const expectedEpoch = state.viewEpoch;
-        const expectedImageEpoch = state.imageRenderEpoch;
-        const chat = state.chat;
-        void chat.getAttachment({ threadId, attachment }).then(({ bytes, descriptor }) => {
-          if (state.viewEpoch !== expectedEpoch || state.imageRenderEpoch !== expectedImageEpoch || state.chat !== chat) return;
-          const url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
-          state.messageImageUrls.add(url);
-          image.src = url;
-        }).catch(() => {
-          image.alt = "Attached image preview unavailable";
-        });
+        image.hidden = true;
+        image.alt = "Loading attached image";
+        image.dataset.previewState = "loading";
+        article.dataset.attachmentState = "loading";
+        const status = document.createElement("span");
+        status.className = "message-attachment-status muted";
+        status.textContent = "Loading attached image…";
+        status.setAttribute("role", "status");
+        article.appendChild(status);
+        const ready = restoreMessageAttachment({ article, image, status, threadId, attachment });
+        if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(ready);
+        else void ready;
       }
     }
     const body = document.createElement("div");
@@ -514,7 +619,7 @@ export function createBrowserApp({
       const threadId = mode === "agent" ? thread.id : thread.threadId;
       const title = thread.title || "New conversation";
       const button = makeButton(document, title, () => { void openThread(threadId, { mode }); });
-      button.disabled = mode === "chat" && state.chatPendingSend !== null;
+      button.disabled = interactionLocked() || (mode === "chat" && state.chatPendingSend !== null);
       button.dataset.threadId = threadId;
       button.dataset.mode = mode;
       button.setAttribute("aria-current", threadId === selected ? "true" : "false");
@@ -539,8 +644,9 @@ export function createBrowserApp({
   async function loadChatThreads() {
     const session = state.session;
     const chat = state.chat;
+    const listEpoch = ++state.chatThreadListEpoch;
     const response = await chat.listThreads({ limit: 100 });
-    if (state.session !== session || state.chat !== chat) return;
+    if (state.session !== session || state.chat !== chat || state.chatThreadListEpoch !== listEpoch) return;
     state.chatThreads = [...response.threads];
     if (state.mode === "chat") renderThreads();
   }
@@ -777,55 +883,171 @@ export function createBrowserApp({
     throw new DirectChatProtocolError("Direct Chat changed while its authoritative snapshot was being read");
   }
 
-  function renderChatSnapshot(snapshot) {
+  function chatFinalizationIsCurrent(finalization) {
+    return state.chatFinalization === finalization
+      && state.session === finalization.session
+      && state.chat === finalization.chat
+      && state.session.authenticated
+      && state.mode === "chat"
+      && state.chatThreadId === finalization.threadId
+      && state.viewEpoch === finalization.expectedEpoch;
+  }
+
+  function markChatFinalizing(finalization) {
+    if (!chatFinalizationIsCurrent(finalization)) return false;
+    elements.workspace.dataset.status = "finalizing";
+    elements.run_state.textContent = "Finalizing";
+    elements.stop_run.hidden = true;
+    elements.resume_run.hidden = true;
+    connection("Finalizing response…");
+    updateImageControl();
+    renderThreads();
+    return true;
+  }
+
+  function beginChatFinalization({ threadId, generationId = null, expectedEpoch = state.viewEpoch }) {
+    const finalization = Object.freeze({
+      session: state.session,
+      chat: state.chat,
+      threadId,
+      generationId,
+      expectedEpoch,
+    });
+    state.chatFinalization = finalization;
+    markChatFinalizing(finalization);
+    return finalization;
+  }
+
+  function abandonChatFinalization(finalization) {
+    if (state.chatFinalization !== finalization) return false;
+    state.chatFinalization = null;
+    updateImageControl();
+    renderThreads();
+    return true;
+  }
+
+  function completeChatFinalization(finalization) {
+    if (!chatFinalizationIsCurrent(finalization)) return false;
+    state.chatFinalization = null;
+    elements.workspace.dataset.status = "completed";
+    elements.run_state.textContent = "Completed";
+    elements.stop_run.hidden = true;
+    elements.resume_run.hidden = true;
+    connection("Connected");
+    updateImageControl();
+    renderThreads();
+    return true;
+  }
+
+  function pauseChatFinalization(finalization) {
+    if (!chatFinalizationIsCurrent(finalization)) return false;
+    elements.workspace.dataset.status = "finalizing";
+    elements.run_state.textContent = "Finalizing";
+    elements.stop_run.hidden = true;
+    elements.resume_run.hidden = false;
+    connection("Finalizing · reconnect needed", false);
+    updateImageControl();
+    renderThreads();
+    showToast("LocalLLM finished generating, but the authoritative final view is not ready yet. Resume completes it without rerunning the prompt.");
+    return true;
+  }
+
+  async function renderChatSnapshot(snapshot, {
+    expectedEpoch = state.viewEpoch,
+    finalization: suppliedFinalization = null,
+  } = {}) {
     clearConversation();
     state.chatThread = snapshot.thread;
     state.chatThreadId = snapshot.thread.threadId;
     elements.conversation_title.textContent = snapshot.thread.title || "New conversation";
+    const last = snapshot.messages.at(-1);
+    const completed = last?.role === "assistant";
+    const finalization = suppliedFinalization ?? (completed
+      ? beginChatFinalization({
+        threadId: snapshot.thread.threadId,
+        generationId: last.generationId,
+        expectedEpoch,
+      })
+      : null);
+    const ownsFinalization = finalization !== null && suppliedFinalization === null;
+    if (finalization !== null) markChatFinalizing(finalization);
+    const attachmentReadyTasks = [];
     snapshot.messages.forEach((message) => messageNode(message.role, message.content, {
       runId: message.generationId ?? undefined,
       attachment: message.attachment,
       threadId: snapshot.thread.threadId,
+      attachmentReadyTasks,
     }));
-    const last = snapshot.messages.at(-1);
-    elements.workspace.dataset.status = last?.role === "assistant" ? "completed" : "idle";
-    elements.run_state.textContent = last?.role === "assistant" ? "Completed" : "Idle";
+    await Promise.all(attachmentReadyTasks);
+    if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch
+        || state.chatThreadId !== snapshot.thread.threadId) {
+      if (ownsFinalization) abandonChatFinalization(finalization);
+      return false;
+    }
+    if (ownsFinalization) completeChatFinalization(finalization);
+    else if (!completed && suppliedFinalization === null) {
+      elements.workspace.dataset.status = "idle";
+      elements.run_state.textContent = "Idle";
+    }
     renderThreads();
+    return true;
   }
 
-  async function refreshChatThread(threadId, signal, { expectedEpoch = state.viewEpoch } = {}) {
+  async function refreshChatThread(threadId, signal, {
+    expectedEpoch = state.viewEpoch,
+    finalization = null,
+  } = {}) {
     const session = state.session;
     const chat = state.chat;
     const snapshot = await fetchChatSnapshot(threadId, signal);
     if (state.session !== session || state.chat !== chat) return snapshot;
     state.chatThread = snapshot.thread;
     state.chatThreadId = snapshot.thread.threadId;
-    if (state.mode === "chat" && state.viewEpoch === expectedEpoch) renderChatSnapshot(snapshot);
-    try { await loadChatThreads(); } catch { /* The open authoritative thread remains usable. */ }
+    if (state.mode === "chat" && state.viewEpoch === expectedEpoch) {
+      await renderChatSnapshot(snapshot, { expectedEpoch, finalization });
+    }
+    void loadChatThreads().catch(() => { /* The open authoritative thread remains usable. */ });
     return snapshot;
+  }
+
+  async function finalizeChatGeneration(finalization, signal) {
+    if (!markChatFinalizing(finalization)) return false;
+    try {
+      const snapshot = await refreshChatThread(finalization.threadId, signal, {
+        expectedEpoch: finalization.expectedEpoch,
+        finalization,
+      });
+      if (!chatFinalizationIsCurrent(finalization)) return false;
+      const assistant = snapshot.messages.at(-1);
+      if (assistant?.role !== "assistant" || assistant.generationId !== finalization.generationId) {
+        throw new DirectChatProtocolError("Direct Chat finalization did not include the completed assistant message");
+      }
+      state.chatThread = snapshot.thread;
+    } catch {
+      pauseChatFinalization(finalization);
+      return false;
+    }
+    return completeChatFinalization(finalization);
   }
 
   async function finishChatGeneration(generation, controller, expectedEpoch = state.viewEpoch) {
     state.chatGeneration = generation;
     const presenting = state.mode === "chat" && state.viewEpoch === expectedEpoch;
+    if (generation.status === "completed" && presenting && state.chatThreadId === generation.threadId) {
+      const finalization = beginChatFinalization({
+        threadId: generation.threadId,
+        generationId: generation.generationId,
+        expectedEpoch,
+      });
+      await finalizeChatGeneration(finalization, controller.signal);
+      return;
+    }
     if (presenting) {
       elements.workspace.dataset.status = generation.status;
       elements.run_state.textContent = statusLabel(generation.status);
       elements.resume_run.hidden = true;
     }
-    let refreshFailed = false;
-    if (generation.status === "completed" && presenting && state.chatThreadId === generation.threadId) {
-      try {
-        const snapshot = await refreshChatThread(generation.threadId, controller.signal, { expectedEpoch });
-        state.chatThread = snapshot.thread;
-      } catch {
-        refreshFailed = true;
-      }
-    }
-    if (presenting && refreshFailed) {
-      connection("Completed · refresh pending", false);
-      showToast("LocalLLM completed this response. Reopen the conversation if its final view does not refresh automatically.");
-    } else if (presenting) connection("Connected");
+    if (presenting) connection("Connected");
   }
 
   async function streamChatGeneration(generation, { afterSequence = 0, output = "" } = {}) {
@@ -940,12 +1162,14 @@ export function createBrowserApp({
   }
 
   async function openThread(threadId, { mode = state.mode } = {}) {
-    if (state.busy || state.logoutPending || mode !== state.mode) return;
+    if (interactionLocked() || mode !== state.mode) return;
     if (mode === "chat" && state.chatPendingSend) {
       showToast("Confirm the pending durable send with Resume before opening another conversation.");
       return;
     }
     state.busy = true;
+    updateImageControl();
+    renderThreads();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     try {
@@ -957,6 +1181,8 @@ export function createBrowserApp({
         : "This LocalLLM conversation could not be restored safely.");
     } finally {
       state.busy = false;
+      updateImageControl();
+      renderThreads();
     }
   }
 
@@ -1039,6 +1265,7 @@ export function createBrowserApp({
       workflow.thread = thread;
       state.chatThreadId = thread.threadId;
       state.chatThread = thread;
+      state.chatThreadListEpoch += 1;
       state.chatThreads = [thread, ...state.chatThreads.filter((item) => item.threadId !== thread.threadId)];
       elements.conversation_title.textContent = thread.title || "New conversation";
       renderThreads();
@@ -1135,7 +1362,7 @@ export function createBrowserApp({
   }
 
   async function selectImage() {
-    if (state.busy || !state.session.authenticated || state.mode !== "chat"
+    if (interactionLocked() || !state.session.authenticated || state.mode !== "chat"
         || state.chatCapabilities.visionInput !== true || state.chatPendingSend !== null
         || state.logoutPending) return;
     const files = elements.image_input.files;
@@ -1176,7 +1403,7 @@ export function createBrowserApp({
 
   async function submitMessage(event) {
     event?.preventDefault?.();
-    if (state.busy || state.logoutPending || !state.session.authenticated) return;
+    if (interactionLocked() || !state.session.authenticated) return;
     if (state.mode === "chat" && state.chatPendingSend) {
       showToast("The previous durable send is awaiting confirmation. Use Resume; this draft and image were not changed.");
       return;
@@ -1258,6 +1485,7 @@ export function createBrowserApp({
       disposeDetachedImage(detachedImage);
       state.busy = false;
       updateImageControl();
+      renderThreads();
     }
   }
 
@@ -1274,12 +1502,14 @@ export function createBrowserApp({
       state.viewEpoch += 1;
       state.streamAbort?.abort();
       state.agentThreads = [];
+      state.chatThreadListEpoch += 1;
       state.chatThreads = [];
       state.agentThreadId = null;
       state.chatThreadId = null;
       state.chatThread = null;
       state.chatGeneration = null;
       state.chatPendingSend = null;
+      state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
       clearConversation();
@@ -1313,7 +1543,10 @@ export function createBrowserApp({
       try { await restoreModeView({ autoOpen: true }); }
       catch {
         if (state.mode === "agent") state.agentThreads = [];
-        else state.chatThreads = [];
+        else {
+          state.chatThreadListEpoch += 1;
+          state.chatThreads = [];
+        }
         renderThreads();
         connection(state.mode === "agent" ? "Agent unavailable" : "Chat unavailable", false);
       }
@@ -1382,12 +1615,14 @@ export function createBrowserApp({
     state.chat = null;
     state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
     state.agentThreads = [];
+    state.chatThreadListEpoch += 1;
     state.chatThreads = [];
     state.agentThreadId = null;
     state.chatThreadId = null;
     state.chatThread = null;
     state.chatGeneration = null;
     state.chatPendingSend = null;
+    state.chatFinalization = null;
     state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
     clearSelectedImage();
     updateImageControl();
@@ -1442,7 +1677,20 @@ export function createBrowserApp({
     updateImageControl();
     try {
       if (state.mode === "chat") {
-        if (state.chatPendingSend) await continueChatSend(state.chatPendingSend);
+        if (state.chatFinalization) {
+          const finalization = state.chatFinalization;
+          const controller = new AbortController();
+          state.streamAbort?.abort();
+          state.streamAbort = controller;
+          state.streamKind = "chat-finalization";
+          try { await finalizeChatGeneration(finalization, controller.signal); }
+          finally {
+            if (state.streamAbort === controller) {
+              state.streamAbort = null;
+              state.streamKind = null;
+            }
+          }
+        } else if (state.chatPendingSend) await continueChatSend(state.chatPendingSend);
         else if (state.chatGeneration?.status === "in_progress") await streamChatGeneration(state.chatGeneration, {
           afterSequence: state.chatAfterSequence,
           output: state.chatOutput,
@@ -1463,11 +1711,12 @@ export function createBrowserApp({
       state.busy = false;
       elements.resume_run.disabled = false;
       updateImageControl();
+      renderThreads();
     }
   }
 
   function newConversation() {
-    if (state.busy || state.logoutPending) return;
+    if (interactionLocked()) return;
     if (state.mode === "chat" && state.chatPendingSend) {
       showToast("This durable request has an uncertain response. Use Resume before starting another conversation.");
       return;
@@ -1483,6 +1732,7 @@ export function createBrowserApp({
       state.chatThread = null;
       state.chatGeneration = null;
       state.chatPendingSend = null;
+      state.chatFinalization = null;
       state.chatAfterSequence = 0;
       state.chatOutput = "";
     }
@@ -1494,7 +1744,7 @@ export function createBrowserApp({
   }
 
   function updateReloadSafe() {
-    if (state.loginPending || state.logoutPending || state.busy || state.imagePreparing
+    if (state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null || state.imagePreparing
         || state.selectedImage || state.chatPendingSend
         || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
         || (state.runId && !TERMINAL.has(state.agentRunStatus))
@@ -1546,7 +1796,7 @@ export function createBrowserApp({
       return reloadForActiveUpdate();
     }
     const worker = state.updateRegistration?.waiting;
-    if (!worker || state.updateConfirmed) return false;
+    if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return false;
     if (!updateReloadSafe()) {
       elements.update_banner.hidden = false;
       showToast("Finish the current draft or response before activating the update.");
@@ -1577,7 +1827,7 @@ export function createBrowserApp({
       state.updateActivationTimer = null;
       elements.apply_update.disabled = false;
       elements.defer_update.disabled = false;
-      elements.update_banner.hidden = !state.updateRegistration?.waiting;
+      elements.update_banner.hidden = state.updateRegistration?.waiting !== state.updateOfferedWorker;
       showToast("The update is still waiting. You can retry or choose Later.");
     }, activationTimeoutMs) ?? null;
     return true;
@@ -1591,7 +1841,7 @@ export function createBrowserApp({
     elements.add_image.addEventListener("click", () => elements.image_input.click?.());
     elements.image_input.addEventListener("change", () => { void selectImage(); });
     elements.remove_image.addEventListener("click", () => {
-      if (state.busy || state.chatPendingSend) return;
+      if (interactionLocked() || state.chatPendingSend) return;
       clearSelectedImage();
       updateImageControl();
     });
@@ -1607,7 +1857,7 @@ export function createBrowserApp({
     elements.apply_update.addEventListener("click", activateWaitingUpdate);
     elements.defer_update.addEventListener("click", () => {
       const worker = state.updateRegistration?.waiting;
-      if (!worker || state.updateConfirmed) return;
+      if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return;
       state.updateDeferredWorker = worker;
       state.updateDeferredUntil = Number(now()) + updateDeferralMs;
       elements.update_banner.hidden = true;
@@ -1641,18 +1891,60 @@ export function createBrowserApp({
   }
 
   async function registerPwa() {
-    if (!navigator?.serviceWorker?.register || window?.location?.protocol !== "https:") return;
+    if (!navigator?.serviceWorker?.register || window?.location?.protocol !== "https:" || currentRelease === null) return;
     try {
       let observedController = navigator.serviceWorker.controller ?? null;
+      const controlledAtStartup = observedController !== null;
       let hadController = observedController !== null;
       state.updateController = observedController;
+      const queryWorkerRelease = (worker) => {
+        const known = state.updateKnownWorkerReleases.get(worker);
+        if (known) return Promise.resolve(known);
+        const pending = state.updateReleaseQueries.get(worker);
+        if (pending) return pending.promise;
+
+        let settle;
+        const promise = new Promise((resolve) => { settle = resolve; });
+        let timer = null;
+        let replyPort = null;
+        const query = {
+          promise,
+          finish(releaseId) {
+            if (state.updateReleaseQueries.get(worker) !== query) return;
+            state.updateReleaseQueries.delete(worker);
+            if (timer !== null) window?.clearTimeout?.(timer);
+            try { replyPort?.close?.(); } catch { /* A transferred channel is optional. */ }
+            const accepted = validAgentRelease(releaseId) ? releaseId : null;
+            if (accepted !== null) state.updateKnownWorkerReleases.set(worker, accepted);
+            settle(accepted);
+          },
+        };
+        state.updateReleaseQueries.set(worker, query);
+        timer = window?.setTimeout?.(() => query.finish(null), 1_000) ?? null;
+        try {
+          const Channel = window?.MessageChannel ?? globalThis.MessageChannel;
+          const channel = typeof Channel === "function" ? new Channel() : null;
+          if (channel?.port1 && channel?.port2) {
+            replyPort = channel.port1;
+            const receive = (event) => query.finish(agentReleaseMessage(event?.data));
+            if (typeof replyPort.addEventListener === "function") replyPort.addEventListener("message", receive, { once: true });
+            else replyPort.onmessage = receive;
+            replyPort.start?.();
+            worker.postMessage({ type: "GET_LAZYING_AGENT_RELEASE" }, [channel.port2]);
+          } else {
+            worker.postMessage({ type: "GET_LAZYING_AGENT_RELEASE" });
+          }
+        } catch {
+          query.finish(null);
+        }
+        return promise;
+      };
       navigator.serviceWorker.addEventListener?.("message", (event) => {
-        const value = event?.data;
-        if (!state.updateControllerChanged || !value || typeof value !== "object" || Array.isArray(value)
-            || Object.keys(value).sort().join(",") !== "releaseId,type"
-            || value.type !== "LAZYING_AGENT_RELEASE" || !validAgentRelease(value.releaseId)
-            || event.source !== state.updateController) return;
-        state.updateTargetRelease = value.releaseId;
+        const releaseId = agentReleaseMessage(event?.data);
+        if (releaseId === null) return;
+        state.updateReleaseQueries.get(event.source)?.finish(releaseId);
+        if (!state.updateControllerChanged || event.source !== state.updateController) return;
+        state.updateTargetRelease = releaseId;
         if (state.updateReleaseTimer !== null) window?.clearTimeout?.(state.updateReleaseTimer);
         state.updateReleaseTimer = null;
         if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
@@ -1676,6 +1968,7 @@ export function createBrowserApp({
         state.updateActivationTimer = null;
         state.updateConfirmed = false;
         state.updateConfirmedWorker = null;
+        state.updateOfferedWorker = null;
         elements.apply_update.disabled = false;
         elements.defer_update.disabled = false;
         elements.update_banner.hidden = false;
@@ -1689,9 +1982,17 @@ export function createBrowserApp({
         scheduleSafeUpdateReload();
       });
       const registration = await navigator.serviceWorker.register(workerPath, { scope: workerScope, updateViaCache: "none" });
-      const ready = () => {
-        const waiting = registration.waiting;
-        if (!waiting) return;
+      const offerWaitingWorker = (waiting, releaseId) => {
+        if (registration.waiting !== waiting) return;
+        if (releaseId === currentRelease) {
+          if (state.updateOfferedWorker === waiting) state.updateOfferedWorker = null;
+          if (state.updateDeferredWorker === waiting) {
+            state.updateDeferredWorker = null;
+            state.updateDeferredUntil = Number.NEGATIVE_INFINITY;
+          }
+          elements.update_banner.hidden = true;
+          return;
+        }
         if (state.updateConfirmed && waiting === state.updateConfirmedWorker) return;
         if (waiting !== state.updateConfirmedWorker) {
           state.updateConfirmed = false;
@@ -1704,7 +2005,24 @@ export function createBrowserApp({
         state.updateDeferredWorker = null;
         state.updateDeferredUntil = Number.NEGATIVE_INFINITY;
         state.updateRegistration = registration;
+        state.updateOfferedWorker = waiting;
         elements.update_banner.hidden = false;
+      };
+      const ready = () => {
+        const waiting = registration.waiting;
+        if (!waiting) {
+          if (!state.updateControllerChanged) elements.update_banner.hidden = true;
+          state.updateOfferedWorker = null;
+          return;
+        }
+        state.updateRegistration = registration;
+        const known = state.updateKnownWorkerReleases.get(waiting);
+        if (known) {
+          offerWaitingWorker(waiting, known);
+          return;
+        }
+        if (state.updateOfferedWorker !== waiting) elements.update_banner.hidden = true;
+        void queryWorkerRelease(waiting).then((releaseId) => offerWaitingWorker(waiting, releaseId));
       };
       state.showUpdatePrompt = ready;
       ready();
@@ -1740,7 +2058,7 @@ export function createBrowserApp({
       };
       document?.addEventListener?.("visibilitychange", () => { void checkForUpdate(); });
       window?.addEventListener?.("online", () => { void checkForUpdate({ onlineTransition: true }); });
-      void checkForUpdate({ force: true });
+      if (controlledAtStartup) void checkForUpdate({ force: true });
       scheduleUpdateCheck();
     } catch { /* PWA installation is optional; chat remains usable. */ }
   }

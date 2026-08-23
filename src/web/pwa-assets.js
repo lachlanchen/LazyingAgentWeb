@@ -318,8 +318,10 @@ export function createServiceWorkerSource({
     + `});\n\n`
     + `self.addEventListener("message", (event) => {\n`
     + `  if (event.data && event.data.type === "SKIP_WAITING") self.skipWaiting();\n`
-    + `  if (event.data && event.data.type === "GET_LAZYING_AGENT_RELEASE" && event.source && typeof event.source.postMessage === "function") {\n`
-    + `    event.source.postMessage({ type: "LAZYING_AGENT_RELEASE", releaseId: VERSION });\n`
+    + `  if (event.data && event.data.type === "GET_LAZYING_AGENT_RELEASE") {\n`
+    + `    const reply = event.ports && event.ports[0] && typeof event.ports[0].postMessage === "function" ? event.ports[0] : event.source;\n`
+    + `    if (reply && typeof reply.postMessage === "function") reply.postMessage({ type: "LAZYING_AGENT_RELEASE", releaseId: VERSION });\n`
+    + `    if (reply === event.ports?.[0]) reply.close?.();\n`
     + `  }\n`
     + `});\n\n`
     + `async function cacheRecord(name) {\n`

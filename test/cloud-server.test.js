@@ -1702,7 +1702,10 @@ test('fails a globally queued generation truthfully if its admission deadline ex
       }
     }
   });
-  const first = await state.start({ limits: { jobTimeoutMs: 500 } });
+  // Keep the admission owner alive well beyond the assertion window. A busy
+  // CI runner must not make this fixture release the global slot before the
+  // deliberately short second deadline is observed.
+  const first = await state.start({ limits: { jobTimeoutMs: 10_000 } });
   const second = await state.start({
     directChatConnector: {
       async generate() {

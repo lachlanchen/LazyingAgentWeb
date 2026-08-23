@@ -1147,6 +1147,10 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   const input = browser.document.getElementById("image-input");
   const add = browser.document.getElementById("add-image");
   assert.equal(add.hidden, false);
+  let nativePickerClicks = 0;
+  input.click = () => { nativePickerClicks += 1; };
+  add.dispatch("click");
+  assert.equal(nativePickerClicks, 1, "the visible image action synchronously opens the native picker");
 
   input.files = [{ name: "one.png" }, { name: "two.png" }];
   input.dispatch("change");

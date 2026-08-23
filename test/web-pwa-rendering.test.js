@@ -586,6 +586,21 @@ test("the conversation sidebar gives the thread list one bounded scroll region",
   assert.doesNotMatch(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*margin-top: auto;/u);
 });
 
+test("the mobile workspace keeps the image action inside the dynamic viewport", () => {
+  assert.match(
+    BRIGHT_APP_CSS,
+    /\.app-view \{[^}]*height: 100vh;[^}]*height: 100dvh;[^}]*min-height: 0;[^}]*overflow: hidden;/u,
+  );
+  assert.match(
+    BRIGHT_APP_CSS,
+    /\.workspace \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;[^}]*grid-template-rows: auto auto auto minmax\(0, 1fr\) auto auto;/u,
+  );
+  assert.match(
+    BRIGHT_APP_CSS,
+    /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*flex-direction: column;[^}]*align-items: stretch;/u,
+  );
+});
+
 test("content digest deterministically owns release, cache, routes, and final-map verification", async () => {
   const first = await productionMap({ label: "stable", marker: "same" });
   const repeated = await productionMap({ label: "stable", marker: "same" });

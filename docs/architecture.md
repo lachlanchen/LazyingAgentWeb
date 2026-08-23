@@ -265,10 +265,14 @@ threads are migrated or intentionally left offline.
 
 ## Independent health and failure semantics
 
-- LazyingAgentWeb health reports its database independently and dependency
-  states separately.
+- LazyingAgentWeb's operator-only `health --config` contract reports
+  `CloudIndexStore` and `DirectChatStore` independently, binds the result to the
+  exact shell release, and gives LocalLLM and configured AgInTi separate bounded
+  states. It emits only fixed projections and does not add a public health
+  route.
 - LazyEdge doctor proves transport policy, listeners and tunnel health, not
-  application capability.
+  application capability. LazyingAgentWeb therefore always reports LazyEdge as
+  `not_probed` and makes no transport-health claim.
 - AgInTi readiness proves native ownership, durable idempotency/event state,
   fixed runtime policy and current sandbox/resource admission.
 - LocalLLM reports API/model availability without claiming agent readiness.

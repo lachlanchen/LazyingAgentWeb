@@ -7,7 +7,11 @@ import {
   StorageCorruptionError,
   ValidationError
 } from './errors.js';
-import { applyChatMigrations } from './chat-migrations.js';
+import {
+  CHAT_SQLITE_APPLICATION_ID,
+  applyChatMigrations
+} from './chat-migrations.js';
+import { checkOpenSqliteHealth } from './sqlite-health.js';
 import { assertSecureDatabaseFile, prepareSecureDatabasePath } from './storage-path.js';
 import {
   assertCanonicalIsoTimestamp,
@@ -2887,6 +2891,14 @@ export class DirectChatStore {
       idempotencyReceiptsRemoved: this.#deleteExpiredReceipts(before, limit),
       chatRowsRemoved: 0
     }));
+  }
+
+  healthCheck() {
+    this.#assertOpen();
+    return checkOpenSqliteHealth(this.#database, {
+      expectedApplicationId: CHAT_SQLITE_APPLICATION_ID,
+      allowedSchemaVersions: [this.#schemaVersion]
+    });
   }
 
   close() {

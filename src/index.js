@@ -6,6 +6,11 @@ export {
   createHealthContract
 } from './contracts.js';
 export {
+  OPERATOR_HEALTH_SCHEMA,
+  OPERATOR_HEALTH_TIMEOUT_MS,
+  createOperatorHealthReport
+} from './operator-health.js';
+export {
   ConflictError,
   ControlPlaneError,
   IdempotencyConflictError,

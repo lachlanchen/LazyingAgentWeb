@@ -102,6 +102,52 @@ test('edge-routes emits the candidate build exact static route contract', async 
   assert.equal(stdout.text().includes('token'), false);
 });
 
+test('health is operator-only, reports the bounded contract, and exits nonzero when degraded', async () => {
+  const stdout = outputCollector();
+  const loaded = Object.freeze({ kind: 'loaded' });
+  const releaseId = `release-${'d'.repeat(64)}`;
+  let checked = 0;
+  const code = await runCli({
+    argv: ['health', '--config', '/private/service.json'],
+    env: environment(),
+    stdout,
+    configLoader: () => loaded,
+    configChecker() { throw new Error('config checker must not run'); },
+    async healthChecker(value) {
+      assert.equal(value, loaded);
+      checked += 1;
+      return {
+        schema: 'lazying-agent-web/operator-health/v1',
+        checkedAt: '2026-08-23T09:00:00.000Z',
+        status: 'degraded',
+        component: { id: 'lazying-agent-web', releaseId },
+        scope: { audience: 'operator', publicHttpEndpoint: false, staticShell: 'independent' },
+        storage: {
+          cloudIndexStore: { state: 'ready', schemaVersion: 1, sqliteVersion: '3.47.2' },
+          directChatStore: { state: 'ready', schemaVersion: 2, sqliteVersion: '3.47.2' }
+        },
+        dependencies: {
+          localLlm: { state: 'unavailable', reason: 'timeout' },
+          aginti: { state: 'not_configured' },
+          lazyEdge: { state: 'not_probed', healthClaim: false, authority: 'lazyedge' }
+        }
+      };
+    },
+    serviceFactory() { throw new Error('serve factory must not run'); },
+    terminationWaiter() { throw new Error('termination waiter must not run'); }
+  });
+
+  assert.equal(code, 1);
+  assert.equal(checked, 1);
+  assert.equal(stdout.json().ok, false);
+  assert.equal(stdout.json().command, 'health');
+  assert.equal(stdout.json().component.releaseId, releaseId);
+  assert.equal(stdout.json().scope.publicHttpEndpoint, false);
+  assert.equal(stdout.json().dependencies.lazyEdge.healthClaim, false);
+  assert.equal(stdout.text().includes('/private/service.json'), false);
+  assert.equal(stdout.text().includes('CREDENTIALS_DIRECTORY'), false);
+});
+
 test('serve binds through the service only and always performs graceful shutdown', async () => {
   const stdout = outputCollector();
   const server = new EventEmitter();

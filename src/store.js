@@ -13,6 +13,7 @@ import {
   SQLITE_APPLICATION_ID,
   applyMigrations
 } from './migrations.js';
+import { checkOpenSqliteHealth } from './sqlite-health.js';
 import { assertSecureDatabaseFile, prepareSecureDatabasePath } from './storage-path.js';
 import {
   assertBoolean,
@@ -877,22 +878,10 @@ export class CloudIndexStore {
 
   healthCheck() {
     this.#assertOpen();
-    const quickCheck = this.#database.prepare('PRAGMA quick_check').get();
-    if (quickCheck?.quick_check !== 'ok') throw new StorageCorruptionError();
-    if (this.#database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
-      throw new StorageCorruptionError('The database contains invalid ownership references.');
-    }
-    const schemaVersion = Number(this.#database.prepare('PRAGMA user_version').get()?.user_version);
-    const applicationId = Number(this.#database.prepare('PRAGMA application_id').get()?.application_id);
-    if (schemaVersion !== LATEST_SCHEMA_VERSION || applicationId !== SQLITE_APPLICATION_ID) {
-      throw new StorageCorruptionError('The database identity or schema version changed unexpectedly.');
-    }
-    const sqliteVersion = this.#database.prepare('SELECT sqlite_version() AS version').get()?.version;
-    return {
-      ready: true,
-      schemaVersion,
-      sqliteVersion
-    };
+    return checkOpenSqliteHealth(this.#database, {
+      expectedApplicationId: SQLITE_APPLICATION_ID,
+      allowedSchemaVersions: [LATEST_SCHEMA_VERSION]
+    });
   }
 
   close() {

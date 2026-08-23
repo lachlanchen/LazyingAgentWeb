@@ -5,16 +5,28 @@ import {
   validateAgintiTransportCredential
 } from './aginti-adapter.js';
 import { DirectChatContextCoordinator } from './chat-context.js';
+import {
+  CHAT_SQLITE_APPLICATION_ID,
+  DEFAULT_CHAT_SCHEMA_VERSION,
+  LATEST_CHAT_SCHEMA_VERSION
+} from './chat-migrations.js';
 import { DirectChatStore } from './chat-store.js';
 import { createCloudServer } from './cloud-server.js';
 import { createDeterministicContextSummarizer } from './deterministic-context-summarizer.js';
 import { createLocalLlmConnector } from './localllm-connector.js';
+import { LATEST_SCHEMA_VERSION, SQLITE_APPLICATION_ID } from './migrations.js';
+import {
+  OPERATOR_HEALTH_TIMEOUT_MS,
+  createOperatorHealthReport
+} from './operator-health.js';
 import {
   createScryptPasswordVerifier,
   validateScryptPasswordHash
 } from './password-verifier.js';
 import { assertLoadedServiceConfig } from './service-config.js';
+import { checkSqliteFileHealth } from './sqlite-health.js';
 import { CloudIndexStore } from './store.js';
+import { AGINTI_RPC_PATHS } from './web/aginti-protocol.js';
 import {
   createStandaloneAssetMap,
   verifyStandaloneAssetMap
@@ -33,6 +45,8 @@ void app.initialize();
 function sha256(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
+
+const OPERATOR_HEALTH_BROWSER_SESSION = sha256('lazying-agent-web/operator-health/v1');
 
 function validateTransportCredential(value, label) {
   if (typeof value !== 'string' || value.length < 16 || value.length > 4_096
@@ -157,6 +171,65 @@ export async function checkStandaloneServiceConfiguration(loadedConfig) {
 export async function createStandaloneServiceEdgeRouteManifest(loadedConfig) {
   const materialized = await materializeInputs(loadedConfig, { createVerifier: false });
   return safeEdgeRouteManifest(materialized.loaded.config, materialized.assetMap);
+}
+
+export async function checkStandaloneServiceHealth(loadedConfig, {
+  fetchImpl,
+  dependencyTimeoutMs = OPERATOR_HEALTH_TIMEOUT_MS,
+  databaseHealthChecker = checkSqliteFileHealth,
+  clock
+} = {}) {
+  if (fetchImpl !== undefined && typeof fetchImpl !== 'function') {
+    throw new TypeError('fetchImpl must be a function');
+  }
+  if (typeof databaseHealthChecker !== 'function') {
+    throw new TypeError('databaseHealthChecker must be a function');
+  }
+  if (clock !== undefined && typeof clock !== 'function') throw new TypeError('clock must be a function');
+
+  const loaded = assertLoadedServiceConfig(loadedConfig);
+  const config = loaded.config;
+  const assetMap = await buildAssetMap(config);
+  const localLlmConnector = createLocalLlmConnector({
+    baseUrl: config.localLlm.baseUrl,
+    allowedModelAliases: config.localLlm.allowedModelAliases,
+    credentialProvider: loaded.createCredentialProvider('localLlmToken'),
+    ...(fetchImpl === undefined ? {} : { fetchImpl })
+  });
+  const agintiAdapter = config.aginti.enabled
+    ? createAgintiAgentAdapter({
+        upstream: config.aginti.baseUrl,
+        credentialProvider: loaded.createCredentialProvider('agintiToken'),
+        ...(fetchImpl === undefined ? {} : { fetchImpl })
+      })
+    : null;
+  const allowedDirectChatSchemas = config.localLlm.vision.enabled
+    ? [LATEST_CHAT_SCHEMA_VERSION]
+    : [DEFAULT_CHAT_SCHEMA_VERSION, LATEST_CHAT_SCHEMA_VERSION];
+
+  return createOperatorHealthReport({
+    releaseId: assetMap.releaseVersion,
+    cloudIndexProbe: () => databaseHealthChecker({
+      databasePath: config.state.cloudIndexDatabase,
+      expectedApplicationId: SQLITE_APPLICATION_ID,
+      allowedSchemaVersions: [LATEST_SCHEMA_VERSION]
+    }),
+    directChatProbe: () => databaseHealthChecker({
+      databasePath: config.state.directChatDatabase,
+      expectedApplicationId: CHAT_SQLITE_APPLICATION_ID,
+      allowedSchemaVersions: allowedDirectChatSchemas
+    }),
+    localLlmProbe: ({ signal }) => localLlmConnector.readiness({ signal }),
+    agintiProbe: agintiAdapter === null
+      ? null
+      : ({ signal }) => agintiAdapter.rpc(AGINTI_RPC_PATHS.capabilities, {}, {
+          principalId: config.account.principalId,
+          browserSession: OPERATOR_HEALTH_BROWSER_SESSION,
+          signal
+        }),
+    dependencyTimeoutMs,
+    ...(clock === undefined ? {} : { clock })
+  });
 }
 
 export async function createStandaloneService({

@@ -187,6 +187,23 @@ worker. Stage and validate the proxy from this output, switch the proxy and app
 as one release, then verify every request target before retiring the previous
 allowlist. Unknown or foreign release assets must continue to return 404.
 
+Operators can inspect the deployed release and its decoupled runtime state
+without adding a public HTTP endpoint:
+
+```sh
+lazying-agent-web health --config /etc/lazying-agent-web/service.json
+```
+
+The command opens `CloudIndexStore` and `DirectChatStore` state read-only and
+reports them independently. LocalLLM and configured AgInTi probes are bounded;
+their errors collapse to fixed reason codes. Paths, origins, account identity,
+credentials, and raw upstream responses are never emitted. LazyEdge is always
+reported as `not_probed` with `healthClaim: false`; use LazyEdge doctor for
+transport health. A degraded or unavailable report exits nonzero. This is an
+operator diagnostic, not a public liveness endpoint: `/health` and
+`/api/health` remain default-deny 404s, and dependency health does not gate the
+static shell.
+
 Direct Chat vision remains fail-closed when `localLlm.vision` is absent or
 disabled. Enabling it requires the fixed `localllm-vision` alias while keeping a
 different default text alias. The PWA accepts exactly one JPEG or PNG plus a
@@ -195,7 +212,7 @@ and enforces a 4 MiB canonical limit. The server independently validates MIME,
 framing, dimensions, metadata absence, and digest before committing the user
 message, private bytes, and generation atomically.
 
-A minimal storage-only probe is:
+A minimal in-process storage-only probe is:
 
 ```js
 import { CloudIndexStore, createCapabilityContract } from '@lazyingart/agent-web';
@@ -205,7 +222,7 @@ const store = new CloudIndexStore({
 });
 
 console.log(createCapabilityContract());
-console.log(store.healthCheck());
+console.log(store.healthCheck()); // DirectChatStore exposes the same safe shape.
 store.close();
 ```
 

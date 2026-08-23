@@ -15,6 +15,7 @@ import test from 'node:test';
 
 import { loadServiceConfig } from '../src/service-config.js';
 import {
+  checkStandaloneServiceHealth,
   checkStandaloneServiceConfiguration,
   createStandaloneServiceEdgeRouteManifest,
   createStandaloneService
@@ -158,6 +159,41 @@ test('configuration check validates credentials and branded PWA without creating
   assert.equal(output.includes(AGINTI_TOKEN), false);
 });
 
+test('operator health inspects missing stores independently without creating state', async (t) => {
+  const state = serviceFixture(t);
+  const harness = serviceHarness(state.config);
+  assert.equal(existsSync(join(state.root, 'state')), false);
+
+  const report = await checkStandaloneServiceHealth(state.loadedConfig, {
+    fetchImpl: harness.fetchImpl,
+    dependencyTimeoutMs: 50,
+    clock: () => new Date('2026-08-23T09:00:00.000Z')
+  });
+
+  assert.equal(report.status, 'unavailable');
+  assert.deepEqual(report.storage.cloudIndexStore, {
+    state: 'unavailable',
+    reason: 'storage_unavailable'
+  });
+  assert.deepEqual(report.storage.directChatStore, {
+    state: 'unavailable',
+    reason: 'storage_unavailable'
+  });
+  assert.equal(report.dependencies.localLlm.state, 'ready');
+  assert.equal(report.dependencies.aginti.state, 'ready');
+  assert.equal(report.dependencies.lazyEdge.healthClaim, false);
+  assert.equal(existsSync(join(state.root, 'state')), false);
+  assert.deepEqual(new Set(harness.captured.requests.map(({ url }) => url)), new Set([
+    'http://127.0.0.1:18008/v1/models',
+    'http://127.0.0.1:18009/agent/v1/capabilities'
+  ]));
+  const output = JSON.stringify(report);
+  assert.equal(output.includes(state.cloudIndexDatabase), false);
+  assert.equal(output.includes(state.directChatDatabase), false);
+  assert.equal(output.includes(LOCAL_TOKEN), false);
+  assert.equal(output.includes(AGINTI_TOKEN), false);
+});
+
 test('edge route manifest binds the proxy allowlist to the exact candidate PWA', async (t) => {
   const state = serviceFixture(t);
   assert.equal(existsSync(join(state.root, 'state')), false);
@@ -259,6 +295,74 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   await service.shutdown();
   await service.shutdown();
   assert.equal(harness.fakeServer.shutdownCalls, 1);
+});
+
+test('operator health reads both initialized stores without taking service ownership', async (t) => {
+  const state = serviceFixture(t);
+  const serviceHarnessValue = serviceHarness(state.config);
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: serviceHarnessValue.fetchImpl,
+    serverFactory: serviceHarnessValue.serverFactory
+  });
+  t.after(async () => { await service.shutdown(); });
+  const healthHarness = serviceHarness(state.config);
+  const before = [state.cloudIndexDatabase, state.directChatDatabase].map((pathname) => {
+    const stat = lstatSync(pathname);
+    return { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+  });
+
+  const report = await checkStandaloneServiceHealth(state.loadedConfig, {
+    fetchImpl: healthHarness.fetchImpl,
+    dependencyTimeoutMs: 50
+  });
+
+  assert.equal(report.status, 'ready');
+  assert.equal(report.component.releaseId, service.releaseId);
+  assert.equal(report.storage.cloudIndexStore.state, 'ready');
+  assert.equal(report.storage.cloudIndexStore.schemaVersion, 1);
+  assert.equal(report.storage.directChatStore.state, 'ready');
+  assert.equal(report.storage.directChatStore.schemaVersion, 2);
+  assert.equal(service.controlStore.healthCheck().ready, true);
+  assert.equal(service.directChatStore.healthCheck().ready, true);
+  assert.equal(report.scope.publicHttpEndpoint, false);
+  assert.equal(report.dependencies.lazyEdge.state, 'not_probed');
+  assert.deepEqual(
+    [state.cloudIndexDatabase, state.directChatDatabase].map((pathname) => {
+      const stat = lstatSync(pathname);
+      return { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+    }),
+    before
+  );
+  await service.shutdown();
+});
+
+test('operator health keeps storage and AgInTi visible when LocalLLM credentials fail', async (t) => {
+  const state = serviceFixture(t);
+  const bootstrapHarness = serviceHarness(state.config);
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: bootstrapHarness.fetchImpl,
+    serverFactory: bootstrapHarness.serverFactory
+  });
+  await service.shutdown();
+  rmSync(join(state.credentialsDirectory, 'localllm-token'));
+  const healthHarness = serviceHarness(state.config);
+
+  const report = await checkStandaloneServiceHealth(state.loadedConfig, {
+    fetchImpl: healthHarness.fetchImpl,
+    dependencyTimeoutMs: 50
+  });
+
+  assert.equal(report.status, 'degraded');
+  assert.equal(report.storage.cloudIndexStore.state, 'ready');
+  assert.equal(report.storage.directChatStore.state, 'ready');
+  assert.deepEqual(report.dependencies.localLlm, {
+    state: 'unavailable',
+    reason: 'dependency_unavailable'
+  });
+  assert.equal(report.dependencies.aginti.state, 'ready');
+  assert.equal(JSON.stringify(report).includes(state.credentialsDirectory), false);
 });
 
 test('restarts over the same private databases with idempotent account provisioning', async (t) => {

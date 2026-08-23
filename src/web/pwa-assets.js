@@ -426,6 +426,7 @@ export function createAppShellHtml({
       <footer>
         <span id="signed-in-user"></span>
         <button id="logout" type="button" disabled>Sign out</button>
+        <button id="install-app" class="install-app" type="button" hidden>Install app</button>
       </footer>
     </aside>
     <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="Close conversations" hidden></button>
@@ -488,7 +489,6 @@ export function createAppShellHtml({
       <p class="footer-note">AgInTi owns Agent runs, tools, context, compaction, and artifacts. This UI is a presentation surface.</p>
     </section>
   </div>
-  <button id="install-app" class="install-app" type="button" hidden>Install app</button>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script type="module" src="${base}${versionedAgentWebAsset("/assets/app.js", version)}"></script>
 </body>
@@ -613,7 +613,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .footer-note { margin: 0; padding: 0 max(1rem, calc((100% - 850px) / 2)) .6rem; text-align: center; background: var(--surface); }
 .icon-button { display: none; }
 .sidebar-scrim { display: none; }
-.install-app { position: fixed; right: 1rem; bottom: 1rem; box-shadow: var(--shadow); }
+.install-app { width: 100%; }
 .toast { position: fixed; left: 50%; bottom: 1rem; z-index: 8; transform: translateX(-50%); padding: .7rem 1rem; border-radius: 12px; background: var(--text); color: var(--surface); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 [hidden] { display: none !important; }

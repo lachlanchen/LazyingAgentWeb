@@ -586,6 +586,29 @@ test("the conversation sidebar gives the thread list one bounded scroll region",
   assert.doesNotMatch(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*margin-top: auto;/u);
 });
 
+test("the install action stays in the sidebar footer without covering mobile controls", async () => {
+  const map = await productionMap({ label: "sidebar-install" });
+  const html = map.get("/").body;
+  const sidebarStart = html.indexOf('<aside id="sidebar"');
+  const sidebarEnd = html.indexOf("</aside>", sidebarStart);
+  const footerStart = html.indexOf("<footer>", sidebarStart);
+  const footerEnd = html.indexOf("</footer>", footerStart);
+  const installButton = html.indexOf('id="install-app"');
+
+  assert.equal([...html.matchAll(/id="install-app"/gu)].length, 1);
+  assert.ok(sidebarStart >= 0);
+  assert.ok(sidebarStart < footerStart);
+  assert.ok(footerStart < installButton);
+  assert.ok(installButton < footerEnd);
+  assert.ok(footerEnd < sidebarEnd);
+
+  const installRule = /\.install-app \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(installRule);
+  assert.match(installRule[1], /\bwidth:\s*100%;/u);
+  assert.doesNotMatch(installRule[1], /\bposition:\s*fixed;/u);
+  assert.doesNotMatch(installRule[1], /\b(?:right|bottom):/u);
+});
+
 test("the mobile workspace keeps the image action inside the dynamic viewport", () => {
   assert.match(
     BRIGHT_APP_CSS,

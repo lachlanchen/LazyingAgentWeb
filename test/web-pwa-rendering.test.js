@@ -220,6 +220,9 @@ function workerVm(source, {
   clock = { value: 1_000 },
   operations = [],
   windowClients = [],
+  clientClaim = () => undefined,
+  workerSetTimeout = setTimeout,
+  workerClearTimeout = clearTimeout,
 } = {}) {
   const listeners = new Map();
   let online = true;
@@ -304,7 +307,7 @@ function workerVm(source, {
   const self = {
     location: { origin: "https://llm.lazying.art" },
     clients: {
-      async claim() { claimCalls += 1; operations.push("claim"); },
+      claim() { claimCalls += 1; operations.push("claim"); return clientClaim(); },
       async matchAll(options) {
         operations.push(`matchAll:${options?.type ?? ""}:${options?.includeUncontrolled === true}`);
         return windowClients;
@@ -322,6 +325,8 @@ function workerVm(source, {
     Response: FakeResponse,
     caches,
     self,
+    setTimeout: workerSetTimeout,
+    clearTimeout: workerClearTimeout,
     fetch: async (request) => {
       if (!online) throw new Error("offline");
       const url = new URL(request.url);
@@ -914,7 +919,7 @@ test("integrity worker caches the complete offline graph and rejects mismatched 
   assert.equal(releaseMessages[0].releaseId, map.releaseVersion);
 });
 
-test("emergency worker takeover is exact-release gated and navigates stale scoped windows once", async () => {
+test("emergency worker takeover is exact-release gated, navigates stale windows, and bounds unresponsive clients", async () => {
   const map = await productionMap({ label: "emergency" });
   const source = map.get(map.serviceWorkerRoute).body;
   const vulnerableDigest = AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS.find((digest) => digest.startsWith("9496cadb"));
@@ -950,6 +955,42 @@ test("emergency worker takeover is exact-release gated and navigates stale scope
   assert.equal(legacy.skipWaitingCalls, 1, "a validated very old cache without a pointer escapes the legacy trap");
   await legacy.dispatch("activate");
   assert.deepEqual(navigations, [`https://llm.lazying.art/?v=${map.releaseVersion}`]);
+
+  const stuckNavigations = [];
+  const timeoutDelays = [];
+  const pendingTimers = new Set();
+  const workerSetTimeout = (callback, delay) => {
+    timeoutDelays.push(delay);
+    const timer = setImmediate(() => {
+      pendingTimers.delete(timer);
+      callback();
+    });
+    pendingTimers.add(timer);
+    return timer;
+  };
+  const workerClearTimeout = (timer) => {
+    pendingTimers.delete(timer);
+    clearImmediate(timer);
+  };
+  const never = new Promise(() => {});
+  const stuck = workerVm(source, {
+    assetMap: map,
+    clientClaim: () => never,
+    windowClients: [{
+      url: `https://llm.lazying.art/?v=${oldRelease}`,
+      navigate(value) { stuckNavigations.push(String(value)); return never; },
+    }],
+    workerSetTimeout,
+    workerClearTimeout,
+  });
+  const stuckOldCache = await seedRelease(stuck, oldRelease);
+  await stuck.dispatch("install");
+  await stuck.dispatch("activate");
+  assert.equal(stuck.claimCalls, 1);
+  assert.deepEqual(stuckNavigations, [`https://llm.lazying.art/?v=${map.releaseVersion}`], "takeover navigation is triggered without waiting for claim");
+  assert.deepEqual(timeoutDelays, [2_000, 2_000, 2_000]);
+  assert.equal(pendingTimers.size, 0);
+  assert.equal(stuck.cacheStores.has(stuckOldCache), false, "activation continues through pruning after client-operation timeouts");
 
   const safeCurrentRelease = `release-${"e".repeat(64)}`;
   const safeNavigations = [];

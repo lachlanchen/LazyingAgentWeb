@@ -1185,7 +1185,7 @@ test("PWA image control canonicalizes exactly one file, sends it once, and rende
   assert.ok(createdUrls.length >= 2, "a server-returned private preview gets a distinct object URL");
 });
 
-test("Completed waits in Finalizing until its restored attachment is decoded and ready", async () => {
+test("Completed becomes usable while its restored attachment decodes in the background", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const descriptor = {
     attachmentId: "image_0000000000000010",
@@ -1227,16 +1227,6 @@ test("Completed waits in Finalizing until its restored attachment is decoded and
 
   const submission = browser.app.submitMessage({ preventDefault() {} });
   const image = await decodeStarted.promise;
-  assert.equal(browser.document.getElementById("workspace").dataset.status, "finalizing");
-  assert.equal(browser.document.getElementById("run-state").textContent, "Finalizing");
-  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "true");
-  assert.equal(browser.document.getElementById("new-thread").disabled, true);
-  assert.equal(browser.document.getElementById("send-message").disabled, true);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, true);
-  assert.equal(image.dataset.previewState, "loading");
-  assert.equal(image.hidden, true);
-
-  decodeGate.resolve();
   await submission;
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
   assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
@@ -1244,12 +1234,17 @@ test("Completed waits in Finalizing until its restored attachment is decoded and
   assert.equal(browser.document.getElementById("new-thread").disabled, false);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
   assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(image.dataset.previewState, "loading");
+  assert.equal(image.hidden, true);
+
+  decodeGate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(image.dataset.previewState, "ready");
   assert.equal(image.hidden, false);
   assert.equal(image.alt, "Attached image");
 });
 
-test("a restored attachment decode timeout becomes explicit unavailable state and releases Finalizing", async () => {
+test("a background attachment decode timeout becomes explicit unavailable state without blocking chat", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const descriptor = {
     attachmentId: "image_0000000000000011",
@@ -1281,6 +1276,10 @@ test("a restored attachment decode timeout becomes explicit unavailable state an
   await new Promise((resolve) => setImmediate(resolve));
   browser.document.getElementById("message-input").value = "Bound the restored preview decode";
   await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "false");
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
 
   const article = browser.document.getElementById("messages").children[0];
   const [image, status] = article.children;

@@ -2,6 +2,7 @@ export const AGENT_WEB_GENERATOR_VERSION = "3";
 export const AGENT_WEB_CACHE_PREFIX = "lazying-agent-web-";
 export const AGENT_WEB_KATEX_VERSION = "0.16.47";
 export const AGENT_WEB_RELEASE_ROOT = "/assets/r";
+const AGENT_WEB_ACTIVATION_CLIENT_TIMEOUT_MS = 2_000;
 export const AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS = Object.freeze([
   "17a3bdd37f3eb6a2d6438de08c6eaeec5330ef4c467428fb1653def9e5dc5d8a",
   "19b1b6fc7542a0688410805ebb1f10eabdf27295d2bacd47502518d2594f8a13",
@@ -305,6 +306,7 @@ export function createServiceWorkerSource({
     + `const META_KEY = ${JSON.stringify(metaKey)};\n`
     + `const STATE_CACHE_NAME = ${JSON.stringify(stateCacheName)};\n`
     + `const ACTIVE_KEY = ${JSON.stringify(activeKey)};\n`
+    + `const CLIENT_OPERATION_TIMEOUT_MS = ${AGENT_WEB_ACTIVATION_CLIENT_TIMEOUT_MS};\n`
     + `const EMERGENCY_PREDECESSOR_DIGESTS = new Set(${JSON.stringify(AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS)});\n`
     + `const SHELL = Object.freeze(${JSON.stringify(shell)});\n`
     + `const STATIC = new Set(SHELL.slice(1).map((asset) => asset.url));\n\n`
@@ -363,6 +365,20 @@ export function createServiceWorkerSource({
     + `    return value;\n`
     + `  } catch { return null; }\n`
     + `}\n\n`
+    + `function boundedClientOperation(operation) {\n`
+    + `  return new Promise((resolve) => {\n`
+    + `    let settled = false;\n`
+    + `    let timer = null;\n`
+    + `    const finish = (value) => {\n`
+    + `      if (settled) return;\n`
+    + `      settled = true;\n`
+    + `      if (timer !== null) clearTimeout(timer);\n`
+    + `      resolve(value);\n`
+    + `    };\n`
+    + `    timer = setTimeout(() => finish(false), CLIENT_OPERATION_TIMEOUT_MS);\n`
+    + `    Promise.resolve().then(operation).then(finish, () => finish(false));\n`
+    + `  });\n`
+    + `}\n\n`
     + `async function emergencyPredecessor() {\n`
     + `  const records = (await Promise.all((await caches.keys()).map(cacheRecord))).filter(Boolean);\n`
     + `  const pointer = await activePointer();\n`
@@ -383,19 +399,20 @@ export function createServiceWorkerSource({
     + `    const previous = candidate && records.some((record) => record.name === candidate) ? candidate : null;\n`
     + `    const keep = new Set([CACHE_NAME, previous].filter(Boolean));\n`
     + `    await (await caches.open(STATE_CACHE_NAME)).put(ACTIVE_KEY, new Response(JSON.stringify({ scopeId: SCOPE_ID, current: CACHE_NAME, previous }), { headers: { "content-type": "application/json" } }));\n`
-    + `    await self.clients.claim();\n`
+    + `    const claim = boundedClientOperation(() => self.clients.claim());\n`
     + `    if (emergency) {\n`
     + `      const target = new URL(BASE + "/", self.location.origin);\n`
     + `      target.search = "?v=" + encodeURIComponent(VERSION);\n`
-    + `      const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });\n`
-    + `      await Promise.all(windows.map((client) => {\n`
+    + `      const windows = await boundedClientOperation(() => self.clients.matchAll({ type: "window", includeUncontrolled: true }));\n`
+    + `      await Promise.all((Array.isArray(windows) ? windows : []).map((client) => {\n`
     + `        try {\n`
     + `          const current = new URL(client.url);\n`
     + `          if (current.origin !== self.location.origin || !current.pathname.startsWith(BASE + "/") || typeof client.navigate !== "function") return false;\n`
-    + `          return Promise.resolve(client.navigate(target.href)).catch(() => false);\n`
+    + `          return boundedClientOperation(() => client.navigate(target.href));\n`
     + `        } catch { return false; }\n`
     + `      }));\n`
     + `    }\n`
+    + `    await claim;\n`
     + `    await Promise.all(names.map((name) => name.startsWith(CACHE_SCOPE_PREFIX) && !keep.has(name) ? caches.delete(name) : false));\n`
     + `  }));\n`
     + `});\n\n`

@@ -1098,10 +1098,12 @@ export function createBrowserApp({
     });
   }
 
-  async function restoreMessageAttachment({ article, image, status, threadId, attachment }) {
-    const expectedEpoch = state.viewEpoch;
-    const expectedImageEpoch = state.imageRenderEpoch;
-    const chat = state.chat;
+  async function restoreMessageAttachment({
+    article, image, status, threadId, attachment,
+    expectedEpoch = state.viewEpoch,
+    expectedImageEpoch = state.imageRenderEpoch,
+    chat = state.chat,
+  }) {
     const current = () => restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch });
     const unavailable = () => {
       image.src = "";
@@ -1114,6 +1116,7 @@ export function createBrowserApp({
     };
     let url = null;
     try {
+      if (!current()) return "stale";
       const { bytes, descriptor } = await chat.getAttachment({ threadId, attachment });
       if (!current()) return "stale";
       url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
@@ -1167,9 +1170,21 @@ export function createBrowserApp({
         status.textContent = "Loading attached image…";
         status.setAttribute("role", "status");
         article.appendChild(status);
-        const ready = restoreMessageAttachment({ article, image, status, threadId, attachment });
-        if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(ready);
-        else void ready;
+        const restorationOwner = Object.freeze({
+          expectedEpoch: state.viewEpoch,
+          expectedImageEpoch: state.imageRenderEpoch,
+          chat: state.chat,
+        });
+        const restoration = () => restoreMessageAttachment({
+          article,
+          image,
+          status,
+          threadId,
+          attachment,
+          ...restorationOwner,
+        });
+        if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(restoration);
+        else void restoration();
       }
     }
     const body = document.createElement("div");
@@ -1587,7 +1602,13 @@ export function createBrowserApp({
       threadId: snapshot.thread.threadId,
       attachmentReadyTasks,
     }));
-    await Promise.all(attachmentReadyTasks);
+    // Attachment previews are cosmetic. Restore them serially in the
+    // background so several historical multi-megabyte images cannot hold the
+    // authoritative conversation in Finalizing or spike mobile memory.
+    void attachmentReadyTasks.reduce(
+      (previous, restoreAttachment) => previous.then(restoreAttachment),
+      Promise.resolve(),
+    );
     if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch
         || state.chatThreadId !== snapshot.thread.threadId) {
       if (ownsFinalization) abandonChatFinalization(finalization);

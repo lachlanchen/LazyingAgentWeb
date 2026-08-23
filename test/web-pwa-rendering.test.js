@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import { MessageChannel } from "node:worker_threads";
 
 import {
   AGENT_WEB_CACHE_PREFIX,
@@ -751,19 +752,41 @@ test("integrity worker caches the complete offline graph and rejects mismatched 
   assert.equal(releaseMessages.length, 1);
   assert.equal(releaseMessages[0].type, "LAZYING_AGENT_RELEASE");
   assert.equal(releaseMessages[0].releaseId, map.releaseVersion);
-  const channelReleaseMessages = [];
-  let channelClosed = false;
-  await worker.dispatch("message", {
-    data: { type: "GET_LAZYING_AGENT_RELEASE" },
-    ports: [{
-      postMessage(value) { channelReleaseMessages.push(value); },
-      close() { channelClosed = true; },
-    }],
+});
+
+test("release identity survives asynchronous MessagePort delivery", async () => {
+  const map = await productionMap({ label: "message-port" });
+  const worker = workerVm(map.get(map.serviceWorkerRoute).body, { assetMap: map });
+  const channel = new MessageChannel();
+  const send = channel.port2.postMessage.bind(channel.port2);
+  const close = channel.port2.close.bind(channel.port2);
+  let senderClosed = false;
+  let timeout;
+  const delivered = new Promise((resolve, reject) => {
+    channel.port1.once("message", resolve);
+    timeout = setTimeout(() => reject(new Error("asynchronous release reply was dropped")), 2_000);
   });
-  assert.equal(channelReleaseMessages.length, 1);
-  assert.equal(channelReleaseMessages[0].type, "LAZYING_AGENT_RELEASE");
-  assert.equal(channelReleaseMessages[0].releaseId, map.releaseVersion);
-  assert.equal(channelClosed, true, "the one-shot identity channel is closed after its exact response");
+  channel.port1.start();
+  channel.port2.postMessage = (value) => queueMicrotask(() => {
+    if (!senderClosed) send(value);
+  });
+  channel.port2.close = () => {
+    senderClosed = true;
+    close();
+  };
+  try {
+    await worker.dispatch("message", {
+      data: { type: "GET_LAZYING_AGENT_RELEASE" },
+      ports: [channel.port2],
+    });
+    const response = await delivered;
+    assert.deepEqual(response, { type: "LAZYING_AGENT_RELEASE", releaseId: map.releaseVersion });
+    assert.equal(senderClosed, false, "the sender must not close a reply port before asynchronous delivery");
+  } finally {
+    clearTimeout(timeout);
+    channel.port1.close();
+    close();
+  }
 });
 
 test("v1/v2/v3/rollback retains current plus immediate predecessor and isolates sibling scopes", async () => {

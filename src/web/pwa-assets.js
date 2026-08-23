@@ -2,9 +2,26 @@ export const AGENT_WEB_GENERATOR_VERSION = "3";
 export const AGENT_WEB_CACHE_PREFIX = "lazying-agent-web-";
 export const AGENT_WEB_KATEX_VERSION = "0.16.47";
 export const AGENT_WEB_RELEASE_ROOT = "/assets/r";
+export const AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS = Object.freeze([
+  "17a3bdd37f3eb6a2d6438de08c6eaeec5330ef4c467428fb1653def9e5dc5d8a",
+  "19b1b6fc7542a0688410805ebb1f10eabdf27295d2bacd47502518d2594f8a13",
+  "480879404f6a3e666c5982243b60c33b169a7e0101b18d3c3202a5ff3eb7558a",
+  "497eb6f9c7be203713f8c80981c04a63816a9164a4edd38e8d2e3efd46b1eacb",
+  "56faff53823b04b923ca79895879efcedb16b1422296a9f49b7a666346cefa81",
+  "7387e08bf395559b0718616f51acfde88e3aa738c65198c67bf77955031e36e0",
+  "8ca822161842b784a6ab29e3f56d43d8794abbd49e0132bec4b1e7a41adcc8e9",
+  "93ddb89692bd1f60fb1624f02df1f26b08e0b9731d89ade868e7ce19a1a77225",
+  "9496cadb920f3f5f89d00bff55dcdba39010621b0a680bc14b062c637e788f13",
+  "9582db23fa8ff50d32170e6e0d4fef22341628898b42d10f5280095c5e4eb0a5",
+  "966eaa758b0a2df838579746c0ea8f683f582f31502b4dffbfd9b9c8e379ce9f",
+  "b491a975961abf6357bd7e6c091a80da5044608b013834d6eeafceaa9ad6bf87",
+  "b998bac4dbf27545d98ebfe44cc768a0d4da83efd15b0c03ee1f23bd4491eb19",
+  "d8dd3d04190973610c7a8fcfc3bed1a7c3b514ac3e6bc6bf18f101ff013661cc",
+]);
 export const AGENT_WEB_MODULE_ROUTES = Object.freeze([
   "/assets/app.js",
   "/assets/browser-app.js",
+  "/assets/pwa-update-handoff-store.js",
   "/assets/cloud-session-client.js",
   "/assets/direct-chat-client.js",
   "/assets/vision-image-client.js",
@@ -288,6 +305,7 @@ export function createServiceWorkerSource({
     + `const META_KEY = ${JSON.stringify(metaKey)};\n`
     + `const STATE_CACHE_NAME = ${JSON.stringify(stateCacheName)};\n`
     + `const ACTIVE_KEY = ${JSON.stringify(activeKey)};\n`
+    + `const EMERGENCY_PREDECESSOR_DIGESTS = new Set(${JSON.stringify(AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS)});\n`
     + `const SHELL = Object.freeze(${JSON.stringify(shell)});\n`
     + `const STATIC = new Set(SHELL.slice(1).map((asset) => asset.url));\n\n`
     + `async function digestHex(bytes) {\n`
@@ -311,6 +329,7 @@ export function createServiceWorkerSource({
     + `      const cache = await caches.open(CACHE_NAME);\n`
     + `      await Promise.all(responses.map(({ asset, response }) => cache.put(asset.url, response)));\n`
     + `      await cache.put(META_KEY, new Response(JSON.stringify({ cacheName: CACHE_NAME, contentDigest: CONTENT_DIGEST, scopeId: SCOPE_ID, installedAt: Date.now() }), { headers: { "content-type": "application/json" } }));\n`
+    + `      if (await emergencyPredecessor()) await self.skipWaiting();\n`
     + `    } catch (error) {\n`
     + `      await caches.delete(CACHE_NAME);\n`
     + `      throw error;\n`
@@ -344,8 +363,18 @@ export function createServiceWorkerSource({
     + `    return value;\n`
     + `  } catch { return null; }\n`
     + `}\n\n`
+    + `async function emergencyPredecessor() {\n`
+    + `  const records = (await Promise.all((await caches.keys()).map(cacheRecord))).filter(Boolean);\n`
+    + `  const pointer = await activePointer();\n`
+    + `  if (pointer) {\n`
+    + `    const active = records.find((record) => record.name === pointer.current);\n`
+    + `    return Boolean(active && active.name !== CACHE_NAME && EMERGENCY_PREDECESSOR_DIGESTS.has(active.metadata.contentDigest));\n`
+    + `  }\n`
+    + `  return records.some((record) => record.name !== CACHE_NAME && EMERGENCY_PREDECESSOR_DIGESTS.has(record.metadata.contentDigest));\n`
+    + `}\n\n`
     + `self.addEventListener("activate", (event) => {\n`
     + `  event.waitUntil(caches.keys().then(async (names) => {\n`
+    + `    const emergency = await emergencyPredecessor();\n`
     + `    const records = (await Promise.all(names.map(cacheRecord))).filter(Boolean);\n`
     + `    const current = records.find((record) => record.name === CACHE_NAME);\n`
     + `    if (!current) throw new Error("current PWA cache metadata is unavailable");\n`
@@ -355,6 +384,18 @@ export function createServiceWorkerSource({
     + `    const keep = new Set([CACHE_NAME, previous].filter(Boolean));\n`
     + `    await (await caches.open(STATE_CACHE_NAME)).put(ACTIVE_KEY, new Response(JSON.stringify({ scopeId: SCOPE_ID, current: CACHE_NAME, previous }), { headers: { "content-type": "application/json" } }));\n`
     + `    await self.clients.claim();\n`
+    + `    if (emergency) {\n`
+    + `      const target = new URL(BASE + "/", self.location.origin);\n`
+    + `      target.search = "?v=" + encodeURIComponent(VERSION);\n`
+    + `      const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });\n`
+    + `      await Promise.all(windows.map((client) => {\n`
+    + `        try {\n`
+    + `          const current = new URL(client.url);\n`
+    + `          if (current.origin !== self.location.origin || !current.pathname.startsWith(BASE + "/") || typeof client.navigate !== "function") return false;\n`
+    + `          return Promise.resolve(client.navigate(target.href)).catch(() => false);\n`
+    + `        } catch { return false; }\n`
+    + `      }));\n`
+    + `    }\n`
     + `    await Promise.all(names.map((name) => name.startsWith(CACHE_SCOPE_PREFIX) && !keep.has(name) ? caches.delete(name) : false));\n`
     + `  }));\n`
     + `});\n\n`

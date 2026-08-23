@@ -13,7 +13,12 @@ import {
   offerPasswordManagerSave,
   restoreTheme,
 } from "./pwa-assets.js";
-import { canonicalizeVisionImage } from "./vision-image-client.js";
+import { createBrowserUpdateHandoffStore } from "./pwa-update-handoff-store.js";
+import {
+  BROWSER_VISION_IMAGE_LIMITS,
+  canonicalizeVisionImage,
+  inspectVisionImageBytes,
+} from "./vision-image-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
@@ -24,6 +29,17 @@ const BODY_REJECTION_CODES = new Set([
 const SAFE_CHAT_FAILURE_OPERATIONS = new Set([
   "local_thread", "local_run", "thread_dispatch", "snapshot", "run_dispatch", "before_run_dispatch",
 ]);
+const UPDATE_HANDOFF_SCHEMA_VERSION = "1";
+const UPDATE_HANDOFF_MAX_AGE_MS = 5 * 60 * 1_000;
+const UPDATE_HANDOFF_FUTURE_SKEW_MS = 30_000;
+const UPDATE_HANDOFF_METADATA_LIMIT = 160 * 1024;
+const UPDATE_HANDOFF_PAYLOAD_LIMIT = BROWSER_VISION_IMAGE_LIMITS.canonicalBytes + UPDATE_HANDOFF_METADATA_LIMIT + 4;
+const UPDATE_HANDOFF_DIGEST = /^[a-f0-9]{64}$/u;
+const UPDATE_HANDOFF_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const UPDATE_HANDOFF_ID = /^[a-f0-9]{64}$/u;
+const UPDATE_HANDOFF_KEY = /^[A-Za-z0-9_-]{43}$/u;
+const updateHandoffEncoder = new TextEncoder();
+const updateHandoffDecoder = new TextDecoder("utf-8", { fatal: true });
 
 class LocalChatNotSentError extends Error {
   constructor(stage, cause) {
@@ -108,6 +124,334 @@ function boundedMessage(value) {
   const text = value.trim();
   if (!text) throw new TypeError("message must contain non-whitespace text");
   return text;
+}
+
+function updateHandoffDraft(value) {
+  if (typeof value !== "string" || value.length > 32_000 || UNSAFE_MESSAGE_CONTROL.test(value)) {
+    throw new TypeError("update handoff draft is invalid");
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError("update handoff draft contains invalid Unicode");
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError("update handoff draft contains invalid Unicode");
+    }
+  }
+  return value;
+}
+
+async function updateHandoffDigest(bytes) {
+  if (!(bytes instanceof Uint8Array) || typeof globalThis.crypto?.subtle?.digest !== "function") {
+    throw new TypeError("browser update handoff hashing is unavailable");
+  }
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function updateHandoffDigestInput(record) {
+  const image = record.image === null ? null : {
+    attachmentId: record.image.attachmentId,
+    mediaType: record.image.mediaType,
+    byteLength: record.image.byteLength,
+    width: record.image.width,
+    height: record.image.height,
+  };
+  const metadata = updateHandoffEncoder.encode(JSON.stringify({
+    schemaVersion: record.schemaVersion,
+    scope: record.scope,
+    sourceRelease: record.sourceRelease,
+    targetRelease: record.targetRelease,
+    createdAt: record.createdAt,
+    accountDigest: record.accountDigest,
+    threadId: record.threadId,
+    draft: record.draft,
+    image,
+  }));
+  const imageBytes = record.image?.bytes ?? new Uint8Array(0);
+  const payload = new Uint8Array(4 + metadata.byteLength + imageBytes.byteLength);
+  new DataView(payload.buffer).setUint32(0, metadata.byteLength);
+  payload.set(metadata, 4);
+  payload.set(imageBytes, 4 + metadata.byteLength);
+  return payload;
+}
+
+function updateHandoffImage(value) {
+  if (value === null) return null;
+  const image = exactObject(value, [
+    "attachmentId", "mediaType", "byteLength", "width", "height", "bytes",
+  ], [
+    "attachmentId", "mediaType", "byteLength", "width", "height", "bytes",
+  ], "update handoff image");
+  if (typeof image.attachmentId !== "string" || image.attachmentId.length < 16
+      || !UPDATE_HANDOFF_IDENTIFIER.test(image.attachmentId)
+      || !["image/jpeg", "image/png"].includes(image.mediaType)
+      || !Number.isSafeInteger(image.byteLength) || image.byteLength < 1
+      || image.byteLength > BROWSER_VISION_IMAGE_LIMITS.canonicalBytes
+      || !(image.bytes instanceof Uint8Array) || image.bytes.byteLength !== image.byteLength
+      || !Number.isSafeInteger(image.width) || image.width < 1
+      || image.width > BROWSER_VISION_IMAGE_LIMITS.maximumEdge
+      || !Number.isSafeInteger(image.height) || image.height < 1
+      || image.height > BROWSER_VISION_IMAGE_LIMITS.maximumEdge
+      || image.width * image.height > BROWSER_VISION_IMAGE_LIMITS.pixels) {
+    throw new TypeError("update handoff image is invalid");
+  }
+  const inspected = inspectVisionImageBytes(image.bytes, image.mediaType);
+  if (inspected.width !== image.width || inspected.height !== image.height) {
+    throw new TypeError("update handoff image dimensions are inconsistent");
+  }
+  return Object.freeze({
+    attachmentId: image.attachmentId,
+    mediaType: image.mediaType,
+    byteLength: image.byteLength,
+    width: image.width,
+    height: image.height,
+    bytes: image.bytes.slice(),
+  });
+}
+
+async function validateUpdateHandoff(value, {
+  scope,
+  currentRelease,
+  username,
+  now,
+}) {
+  const record = exactObject(value, [
+    "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
+    "threadId", "draft", "image", "digest",
+  ], [
+    "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
+    "threadId", "draft", "image", "digest",
+  ], "update handoff");
+  const instant = Number(now());
+  if (record.schemaVersion !== UPDATE_HANDOFF_SCHEMA_VERSION || record.scope !== scope
+      || !validAgentRelease(record.sourceRelease) || record.targetRelease !== currentRelease
+      || !validAgentRelease(record.targetRelease)
+      || !Number.isSafeInteger(record.createdAt) || record.createdAt < 0
+      || !Number.isSafeInteger(instant) || instant < 0
+      || record.createdAt > instant + UPDATE_HANDOFF_FUTURE_SKEW_MS
+      || instant - record.createdAt > UPDATE_HANDOFF_MAX_AGE_MS
+      || typeof record.accountDigest !== "string" || !UPDATE_HANDOFF_DIGEST.test(record.accountDigest)
+      || typeof record.digest !== "string" || !UPDATE_HANDOFF_DIGEST.test(record.digest)
+      || (record.threadId !== null && (typeof record.threadId !== "string"
+        || !UPDATE_HANDOFF_IDENTIFIER.test(record.threadId)))) {
+    throw new TypeError("update handoff ownership is invalid");
+  }
+  const draft = updateHandoffDraft(record.draft);
+  const image = updateHandoffImage(record.image);
+  if (!draft && image === null) throw new TypeError("update handoff is empty");
+  const accountDigest = await updateHandoffDigest(updateHandoffEncoder.encode(
+    `lazying-agent-update-account\u0000${normalizedSessionUsername(username)}`,
+  ));
+  if (accountDigest !== record.accountDigest) throw new TypeError("update handoff account is invalid");
+  const normalized = Object.freeze({
+    schemaVersion: record.schemaVersion,
+    scope: record.scope,
+    sourceRelease: record.sourceRelease,
+    targetRelease: record.targetRelease,
+    createdAt: record.createdAt,
+    accountDigest: record.accountDigest,
+    threadId: record.threadId,
+    draft,
+    image,
+  });
+  if (await updateHandoffDigest(updateHandoffDigestInput(normalized)) !== record.digest) {
+    throw new TypeError("update handoff digest is invalid");
+  }
+  return normalized;
+}
+
+function encodeUpdateHandoffPayload(record) {
+  const image = record.image === null ? null : {
+    attachmentId: record.image.attachmentId,
+    mediaType: record.image.mediaType,
+    byteLength: record.image.byteLength,
+    width: record.image.width,
+    height: record.image.height,
+  };
+  const metadata = updateHandoffEncoder.encode(JSON.stringify({
+    schemaVersion: record.schemaVersion,
+    scope: record.scope,
+    sourceRelease: record.sourceRelease,
+    targetRelease: record.targetRelease,
+    createdAt: record.createdAt,
+    accountDigest: record.accountDigest,
+    threadId: record.threadId,
+    draft: record.draft,
+    image,
+    digest: record.digest,
+  }));
+  const imageBytes = record.image?.bytes ?? new Uint8Array(0);
+  if (metadata.byteLength > UPDATE_HANDOFF_METADATA_LIMIT
+      || 4 + metadata.byteLength + imageBytes.byteLength > UPDATE_HANDOFF_PAYLOAD_LIMIT) {
+    throw new TypeError("update handoff payload is too large");
+  }
+  const payload = new Uint8Array(4 + metadata.byteLength + imageBytes.byteLength);
+  new DataView(payload.buffer).setUint32(0, metadata.byteLength);
+  payload.set(metadata, 4);
+  payload.set(imageBytes, 4 + metadata.byteLength);
+  return payload;
+}
+
+function decodeUpdateHandoffPayload(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 6 || bytes.byteLength > UPDATE_HANDOFF_PAYLOAD_LIMIT) {
+    throw new TypeError("update handoff payload is invalid");
+  }
+  const metadataLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+  if (metadataLength < 2 || metadataLength > UPDATE_HANDOFF_METADATA_LIMIT
+      || 4 + metadataLength > bytes.byteLength) throw new TypeError("update handoff metadata is invalid");
+  const metadata = JSON.parse(updateHandoffDecoder.decode(bytes.subarray(4, 4 + metadataLength)));
+  const envelope = exactObject(metadata, [
+    "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
+    "threadId", "draft", "image", "digest",
+  ], [
+    "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
+    "threadId", "draft", "image", "digest",
+  ], "update handoff payload");
+  let image = null;
+  if (envelope.image !== null) {
+    const descriptor = exactObject(envelope.image, [
+      "attachmentId", "mediaType", "byteLength", "width", "height",
+    ], [
+      "attachmentId", "mediaType", "byteLength", "width", "height",
+    ], "update handoff image descriptor");
+    image = { ...descriptor, bytes: bytes.slice(4 + metadataLength) };
+  } else if (bytes.byteLength !== 4 + metadataLength) {
+    throw new TypeError("update handoff contains unexpected binary data");
+  }
+  return { ...envelope, image };
+}
+
+function updateHandoffBase64Url(bytes) {
+  if (typeof bytes?.toBase64 === "function") {
+    return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return globalThis.btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+function decodeUpdateHandoffKey(value) {
+  if (typeof value !== "string" || !UPDATE_HANDOFF_KEY.test(value) || typeof globalThis.atob !== "function") {
+    throw new TypeError("update handoff key is invalid");
+  }
+  const binary = globalThis.atob(`${value.replaceAll("-", "+").replaceAll("_", "/")}=`);
+  if (binary.length !== 32) throw new TypeError("update handoff key is invalid");
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function createUpdateHandoffClaim() {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new TypeError("secure update handoff randomness is unavailable");
+  }
+  const identifierBytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  const keyBytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  return Object.freeze({
+    handoffId: [...identifierBytes].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
+    key: updateHandoffBase64Url(keyBytes),
+  });
+}
+
+function updateHandoffFragment(claim) {
+  return `#lazying-update-handoff=${claim.handoffId}.${claim.key}`;
+}
+
+function captureUpdateHandoffClaim(window) {
+  let url;
+  try { url = new URL(window?.location?.href); }
+  catch { return null; }
+  const match = /^#lazying-update-handoff=([a-f0-9]{64})\.([A-Za-z0-9_-]{43})$/u.exec(url.hash);
+  if (!match) return null;
+  try {
+    window.history.replaceState(window.history.state ?? null, "", `${url.pathname}${url.search}`);
+  } catch { return null; }
+  return Object.freeze({ handoffId: match[1], key: match[2] });
+}
+
+function updateHandoffAdditionalData(envelope) {
+  return updateHandoffEncoder.encode(JSON.stringify({
+    schemaVersion: envelope.schemaVersion,
+    scope: envelope.scope,
+    handoffId: envelope.handoffId,
+    sourceRelease: envelope.sourceRelease,
+    targetRelease: envelope.targetRelease,
+    createdAt: envelope.createdAt,
+    expiresAt: envelope.expiresAt,
+  }));
+}
+
+async function encryptUpdateHandoff(record, claim) {
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof subtle?.importKey !== "function" || typeof subtle?.encrypt !== "function"
+      || !UPDATE_HANDOFF_ID.test(claim.handoffId)) throw new TypeError("update handoff encryption is unavailable");
+  const keyBytes = decodeUpdateHandoffKey(claim.key);
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const envelope = Object.freeze({
+    schemaVersion: UPDATE_HANDOFF_SCHEMA_VERSION,
+    scope: record.scope,
+    handoffId: claim.handoffId,
+    sourceRelease: record.sourceRelease,
+    targetRelease: record.targetRelease,
+    createdAt: record.createdAt,
+    expiresAt: record.createdAt + UPDATE_HANDOFF_MAX_AGE_MS,
+  });
+  const key = await subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const ciphertext = new Uint8Array(await subtle.encrypt({
+    name: "AES-GCM",
+    iv,
+    additionalData: updateHandoffAdditionalData(envelope),
+    tagLength: 128,
+  }, key, encodeUpdateHandoffPayload(record)));
+  return Object.freeze({ ...envelope, iv, ciphertext });
+}
+
+async function decryptUpdateHandoff(value, claim, {
+  scope,
+  currentRelease,
+  username,
+  now,
+}) {
+  const envelope = exactObject(value, [
+    "schemaVersion", "scope", "handoffId", "sourceRelease", "targetRelease", "createdAt", "expiresAt", "iv", "ciphertext",
+  ], [
+    "schemaVersion", "scope", "handoffId", "sourceRelease", "targetRelease", "createdAt", "expiresAt", "iv", "ciphertext",
+  ], "encrypted update handoff");
+  const instant = Number(now());
+  if (envelope.schemaVersion !== UPDATE_HANDOFF_SCHEMA_VERSION || envelope.scope !== scope
+      || envelope.handoffId !== claim.handoffId || !UPDATE_HANDOFF_ID.test(envelope.handoffId)
+      || !validAgentRelease(envelope.sourceRelease) || envelope.targetRelease !== currentRelease
+      || !validAgentRelease(envelope.targetRelease)
+      || !Number.isSafeInteger(envelope.createdAt) || envelope.createdAt < 0
+      || envelope.expiresAt !== envelope.createdAt + UPDATE_HANDOFF_MAX_AGE_MS
+      || !Number.isSafeInteger(instant) || instant < 0 || instant > envelope.expiresAt
+      || envelope.createdAt > instant + UPDATE_HANDOFF_FUTURE_SKEW_MS
+      || !(envelope.iv instanceof Uint8Array) || envelope.iv.byteLength !== 12
+      || !(envelope.ciphertext instanceof Uint8Array) || envelope.ciphertext.byteLength < 17
+      || envelope.ciphertext.byteLength > UPDATE_HANDOFF_PAYLOAD_LIMIT + 16) {
+    throw new TypeError("encrypted update handoff is invalid");
+  }
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof subtle?.importKey !== "function" || typeof subtle?.decrypt !== "function") {
+    throw new TypeError("update handoff decryption is unavailable");
+  }
+  const key = await subtle.importKey("raw", decodeUpdateHandoffKey(claim.key), "AES-GCM", false, ["decrypt"]);
+  const plaintext = new Uint8Array(await subtle.decrypt({
+    name: "AES-GCM",
+    iv: envelope.iv,
+    additionalData: updateHandoffAdditionalData(envelope),
+    tagLength: 128,
+  }, key, envelope.ciphertext));
+  const record = await validateUpdateHandoff(decodeUpdateHandoffPayload(plaintext), {
+    scope,
+    currentRelease,
+    username,
+    now,
+  });
+  if (record.sourceRelease !== envelope.sourceRelease || record.targetRelease !== envelope.targetRelease
+      || record.createdAt !== envelope.createdAt) throw new TypeError("update handoff envelope is inconsistent");
+  return record;
 }
 
 function conversationTitle(value) {
@@ -326,6 +670,7 @@ export function createBrowserApp({
   canonicalizeImage = canonicalizeVisionImage,
   createObjectUrl = (blob) => globalThis.URL.createObjectURL(blob),
   revokeObjectUrl = (url) => globalThis.URL.revokeObjectURL(url),
+  updateHandoffStore: suppliedUpdateHandoffStore,
   serviceWorkerPath,
   serviceWorkerScope,
   updateCheckIntervalMs = 15 * 60 * 1_000,
@@ -366,6 +711,11 @@ export function createBrowserApp({
       || typeof revokeObjectUrl !== "function") {
     throw new TypeError("browser image handlers must be functions");
   }
+  const updateHandoffStore = suppliedUpdateHandoffStore
+    ?? createBrowserUpdateHandoffStore();
+  for (const method of ["save", "take", "discard"]) {
+    requiredMethod(updateHandoffStore, method, "updateHandoffStore");
+  }
   const workerScope = normalizedBrowserPath(
     serviceWorkerScope ?? metaContent(document, "lazying-agent-base-path") ?? "/",
     "serviceWorkerScope",
@@ -377,6 +727,7 @@ export function createBrowserApp({
     "serviceWorkerPath",
   );
   if (workerPath !== expectedWorkerPath) throw new TypeError("serviceWorkerPath must be bound to serviceWorkerScope");
+  const claimedUpdateHandoff = captureUpdateHandoffClaim(window);
   const declaredRelease = metaContent(document, "lazying-agent-release");
   const currentRelease = validAgentRelease(declaredRelease) ? declaredRelease : null;
   if (!Number.isSafeInteger(updateCheckIntervalMs) || updateCheckIntervalMs < 60_000 || updateCheckIntervalMs > 86_400_000) {
@@ -462,6 +813,11 @@ export function createBrowserApp({
     updateSafetyTimer: null,
     updatePollTimer: null,
     updateReloaded: false,
+    updateHandoffConsumed: false,
+    updateHandoffEpoch: 0,
+    updateHandoffInFlight: false,
+    updateHandoffStagingClaim: null,
+    updatePreparedHandoff: null,
     updateCheckAt: Number.NEGATIVE_INFINITY,
     updateFailureAt: Number.NEGATIVE_INFINITY,
     updateCheckInFlight: false,
@@ -582,6 +938,7 @@ export function createBrowserApp({
   }
 
   function detachSelectedImage() {
+    invalidatePreparedUpdateHandoff();
     state.imageSelectionEpoch += 1;
     state.imagePreparing = false;
     const detached = state.selectedImage === null ? null : Object.freeze({
@@ -1934,12 +2291,17 @@ export function createBrowserApp({
       if (state.session !== authenticatedSession || !state.session.authenticated) return;
       state.capabilities = capability;
       state.chatCapabilities = chatCapability;
+      const updateHandoff = sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null
+        ? await consumeUpdateHandoff()
+        : null;
+      if (state.session !== authenticatedSession || !state.session.authenticated) return;
+      if (updateHandoff !== null) state.chatThreadId = updateHandoff.threadId;
       if (sameAccountRecoveryWorkflow?.thread) {
         state.chatThread = sameAccountRecoveryWorkflow.thread;
         state.chatThreadId = sameAccountRecoveryWorkflow.thread.threadId;
       }
       showApp();
-      setMode(recoveringAuthenticationDraft && !discardedCrossAccountDraft
+      setMode(updateHandoff !== null || (recoveringAuthenticationDraft && !discardedCrossAccountDraft)
         ? "chat"
         : selectDefaultMode(capability), { restoreView: false });
       const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
@@ -1953,6 +2315,10 @@ export function createBrowserApp({
       state.authRecoveryGeneration = sameAccountRecoveryGeneration;
       clearChatFailureDiagnostic();
       updateImageControl();
+      const restoredUpdateHandoff = restoreUpdateHandoff(updateHandoff);
+      if (updateHandoff !== null && !restoredUpdateHandoff) {
+        showToast("The saved update draft could not be restored safely and was discarded.");
+      }
       if (sameAccountRecoveryWorkflow !== null) {
         connection("Signed in · exact send ready to confirm");
       } else if (sameAccountRecoveryGeneration !== null) {
@@ -1962,7 +2328,9 @@ export function createBrowserApp({
           ? "Signed in · image sending unavailable"
           : "Signed in · image capability unavailable", false);
       } else {
-        connection(recoveringAuthenticationDraft && !discardedCrossAccountDraft
+        connection(restoredUpdateHandoff
+          ? "Updated · unsent draft ready"
+          : recoveringAuthenticationDraft && !discardedCrossAccountDraft
           ? "Signed in · unsent draft ready"
           : "Connected");
       }
@@ -1975,8 +2343,14 @@ export function createBrowserApp({
       }
       try {
         await restoreModeView({
-          autoOpen: sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null,
+          autoOpen: updateHandoff === null
+            && sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null,
         });
+        if (restoredUpdateHandoff && updateHandoff.threadId !== null) {
+          const target = state.chatThreads.find((thread) => thread.threadId === updateHandoff.threadId);
+          if (target) await openChatThread(target.threadId, { backgroundStream: true });
+          else state.chatThreadId = null;
+        }
       }
       catch (error) {
         if (state.mode === "chat" && isChatAuthenticationRejection(error)
@@ -2249,14 +2623,178 @@ export function createBrowserApp({
     renderThreads();
   }
 
-  function updateReloadSafe() {
-    if (state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null || state.imagePreparing
-        || state.selectedImage || state.chatPendingSend || state.authRecoveryGeneration !== null
-        || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
-        || (state.runId && !TERMINAL.has(state.agentRunStatus))
-        || state.streamAbort || String(elements.message_input.value ?? "").length > 0) return false;
+  function updateHasUnsafeActivity() {
+    return state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null
+      || state.imagePreparing || state.chatPendingSend !== null || state.authRecoveryGeneration !== null
+      || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
+      || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
+  }
+
+  function updateComposerWork() {
+    return Object.freeze({
+      draft: String(elements.message_input.value ?? ""),
+      image: state.selectedImage,
+    });
+  }
+
+  function invalidatePreparedUpdateHandoff() {
+    state.updateHandoffEpoch += 1;
+    const claim = state.updatePreparedHandoff?.claim ?? state.updateHandoffStagingClaim;
+    state.updatePreparedHandoff = null;
+    if (claim) void updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+  }
+
+  function updateHandoffMatchesComposer(targetRelease = state.updateTargetRelease) {
+    const prepared = state.updatePreparedHandoff;
+    const work = updateComposerWork();
+    return prepared !== null && prepared.targetRelease === targetRelease
+      && prepared.session === state.session && prepared.threadId === state.chatThreadId
+      && prepared.draft === work.draft && prepared.image === work.image;
+  }
+
+  function updateHandoffEligible(targetRelease) {
+    const work = updateComposerWork();
+    return !updateHasUnsafeActivity() && state.session.authenticated && state.mode === "chat"
+      && !state.authRecoveryPending && validAgentRelease(currentRelease) && validAgentRelease(targetRelease)
+      && (work.draft.length > 0 || work.image !== null)
+      && (work.image === null || state.chatCapabilities.visionInput === true)
+      && (state.chatThreadId === null || UPDATE_HANDOFF_IDENTIFIER.test(state.chatThreadId));
+  }
+
+  async function prepareUpdateHandoff(targetRelease) {
+    if (state.updatePreparedHandoff !== null && !updateHandoffMatchesComposer(targetRelease)) {
+      invalidatePreparedUpdateHandoff();
+    }
+    if (state.updateHandoffInFlight || !updateHandoffEligible(targetRelease)) return false;
+    state.updateHandoffInFlight = true;
+    let claim = null;
+    elements.apply_update.disabled = true;
+    elements.defer_update.disabled = true;
+    const epoch = state.updateHandoffEpoch;
+    const session = state.session;
+    const threadId = state.chatThreadId;
+    const { draft, image: selectedImage } = updateComposerWork();
+    try {
+      claim = createUpdateHandoffClaim();
+      state.updateHandoffStagingClaim = claim;
+      const instant = Number(now());
+      if (!Number.isSafeInteger(instant) || instant < 0) throw new TypeError("update handoff time is invalid");
+      const image = selectedImage === null ? null : updateHandoffImage({
+        attachmentId: selectedImage.attachmentId,
+        mediaType: selectedImage.mediaType,
+        byteLength: selectedImage.byteLength,
+        width: selectedImage.width,
+        height: selectedImage.height,
+        bytes: selectedImage.bytes,
+      });
+      const accountDigest = await updateHandoffDigest(updateHandoffEncoder.encode(
+        `lazying-agent-update-account\u0000${normalizedSessionUsername(session.username)}`,
+      ));
+      const unsigned = Object.freeze({
+        schemaVersion: UPDATE_HANDOFF_SCHEMA_VERSION,
+        scope: workerScope,
+        sourceRelease: currentRelease,
+        targetRelease,
+        createdAt: instant,
+        accountDigest,
+        threadId,
+        draft: updateHandoffDraft(draft),
+        image,
+      });
+      const record = Object.freeze({
+        ...unsigned,
+        digest: await updateHandoffDigest(updateHandoffDigestInput(unsigned)),
+      });
+      await updateHandoffStore.save(await encryptUpdateHandoff(record, claim));
+      if (epoch !== state.updateHandoffEpoch || state.session !== session
+          || state.chatThreadId !== threadId || !updateHandoffEligible(targetRelease)
+          || elements.message_input.value !== draft || state.selectedImage !== selectedImage) {
+        await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+        return false;
+      }
+      state.updatePreparedHandoff = Object.freeze({
+        targetRelease,
+        session,
+        threadId,
+        draft,
+        image: selectedImage,
+        claim,
+      });
+      return true;
+    } catch {
+      if (claim) await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+      state.updatePreparedHandoff = null;
+      showToast("The update is ready, but this draft and image could not be protected. This page stayed open; retry safely.");
+      return false;
+    } finally {
+      state.updateHandoffInFlight = false;
+      state.updateHandoffStagingClaim = null;
+      if (!state.updateConfirmed && !state.updateReloaded) {
+        elements.apply_update.disabled = false;
+        elements.defer_update.disabled = false;
+      }
+      scheduleSafeUpdateReload();
+    }
+  }
+
+  async function consumeUpdateHandoff() {
+    if (state.updateHandoffConsumed || claimedUpdateHandoff === null
+        || !state.session.authenticated || !validAgentRelease(currentRelease)) return null;
+    state.updateHandoffConsumed = true;
+    let value;
+    try { value = await updateHandoffStore.take(workerScope, claimedUpdateHandoff.handoffId); }
+    catch {
+      showToast("The saved update draft could not be read safely and was not restored.");
+      return null;
+    }
+    if (value === null || value === undefined) {
+      showToast("The saved update draft was no longer available and was not restored.");
+      return null;
+    }
+    try {
+      return await decryptUpdateHandoff(value, claimedUpdateHandoff, {
+        scope: workerScope,
+        currentRelease,
+        username: state.session.username,
+        now,
+      });
+    } catch {
+      showToast("A saved update draft failed its safety checks and was discarded.");
+      return null;
+    }
+  }
+
+  function restoreUpdateHandoff(record) {
+    if (record === null || !state.session.authenticated || state.mode !== "chat"
+        || state.chatPendingSend !== null || elements.message_input.value || state.selectedImage !== null) return false;
+    let detached = null;
+    try {
+      if (record.image !== null) {
+        if (state.chatCapabilities.visionInput !== true) return false;
+        const previewBlob = new Blob([record.image.bytes], { type: record.image.mediaType });
+        const selected = Object.freeze({ ...record.image, previewBlob });
+        detached = Object.freeze({ selected, previewUrl: createObjectUrl(previewBlob) });
+        if (!restoreDetachedImage(detached)) return false;
+        detached = null;
+      }
+      elements.message_input.value = record.draft;
+      updateImageControl();
+      showToast(record.image === null
+        ? "Updated app loaded. Your unsent prompt was restored; review it before sending."
+        : "Updated app loaded. Your unsent prompt and image were restored; review them before sending.");
+      return true;
+    } catch {
+      disposeDetachedImage(detached);
+      return false;
+    }
+  }
+
+  function updateReloadSafe(targetRelease = state.updateTargetRelease) {
+    if (state.updateHandoffInFlight || updateHasUnsafeActivity()) return false;
     if (!state.session.authenticated && String(elements.password.value ?? "").length > 0) return false;
-    return true;
+    const work = updateComposerWork();
+    return (work.draft.length === 0 && work.image === null)
+      || (updateHandoffEligible(targetRelease) && updateHandoffMatchesComposer(targetRelease));
   }
 
   function clearUpdateReloadTimers() {
@@ -2267,14 +2805,16 @@ export function createBrowserApp({
   }
 
   function reloadForActiveUpdate() {
-    if (!state.updateControllerChanged || state.updateReloaded || !updateReloadSafe()) return false;
+    if (!state.updateControllerChanged || state.updateReloaded || !updateReloadSafe(state.updateTargetRelease)) return false;
     if (!validAgentRelease(state.updateTargetRelease)) return false;
     state.updateReloaded = true;
     clearUpdateReloadTimers();
     const releaseId = state.updateTargetRelease;
     const target = new URL(workerScope, window.location.href);
     target.search = `?v=${encodeURIComponent(releaseId)}`;
-    target.hash = "";
+    target.hash = state.updatePreparedHandoff === null
+      ? ""
+      : updateHandoffFragment(state.updatePreparedHandoff.claim);
     if (typeof window?.location?.replace === "function") window.location.replace(target.href);
     else if (window?.location) window.location.href = target.href;
     return true;
@@ -2300,8 +2840,9 @@ export function createBrowserApp({
       if (!validAgentRelease(state.updateTargetRelease)) return;
       if (reloadForActiveUpdate()) return;
     } else if (waitingUpdateCanActivateAutomatically()) {
-      if (updateReloadSafe()) {
-        activateWaitingUpdate({ announceUnsafe: false });
+      const releaseId = state.updateKnownWorkerReleases.get(state.updateRegistration?.waiting);
+      if (updateReloadSafe(releaseId)) {
+        void activateWaitingUpdate({ announceUnsafe: false });
         return;
       }
     } else return;
@@ -2311,27 +2852,42 @@ export function createBrowserApp({
     }, 1_000) ?? null;
   }
 
-  function activateWaitingUpdate({ announceUnsafe = true } = {}) {
+  async function activateWaitingUpdate({ announceUnsafe = true } = {}) {
     if (state.updateControllerChanged) {
-      if (!updateReloadSafe()) {
-        elements.update_banner.hidden = false;
-        if (announceUnsafe) showToast("Finish the current draft or response before reloading the updated app.");
-        scheduleSafeUpdateReload();
-        return false;
-      }
       if (!validAgentRelease(state.updateTargetRelease)) {
         elements.update_banner.hidden = false;
         elements.apply_update.disabled = true;
         void state.retryUpdateControllerRelease?.({ announceFailure: announceUnsafe });
         return false;
       }
+      if (!updateReloadSafe(state.updateTargetRelease)) {
+        if (announceUnsafe && updateHandoffEligible(state.updateTargetRelease)) {
+          if (await prepareUpdateHandoff(state.updateTargetRelease)) {
+            return await activateWaitingUpdate({ announceUnsafe });
+          }
+          return false;
+        }
+        elements.update_banner.hidden = false;
+        if (announceUnsafe && !state.updateHandoffInFlight) {
+          showToast("Finish the current draft or response before reloading the updated app.");
+        }
+        scheduleSafeUpdateReload();
+        return false;
+      }
       return reloadForActiveUpdate();
     }
     const worker = state.updateRegistration?.waiting;
     if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return false;
-    if (!updateReloadSafe()) {
+    const targetRelease = state.updateKnownWorkerReleases.get(worker);
+    if (!updateReloadSafe(targetRelease)) {
+      if (announceUnsafe && updateHandoffEligible(targetRelease)) {
+        if (await prepareUpdateHandoff(targetRelease)) return await activateWaitingUpdate({ announceUnsafe });
+        return false;
+      }
       elements.update_banner.hidden = false;
-      if (announceUnsafe) showToast("Finish the current draft or response before activating the update.");
+      if (announceUnsafe && !state.updateHandoffInFlight) {
+        showToast("Finish the current draft or response before activating the update.");
+      }
       scheduleSafeUpdateReload();
       return false;
     }
@@ -2346,6 +2902,7 @@ export function createBrowserApp({
     } catch {
       state.updateConfirmed = false;
       state.updateConfirmedWorker = null;
+      invalidatePreparedUpdateHandoff();
       elements.apply_update.disabled = false;
       elements.defer_update.disabled = false;
       elements.update_banner.hidden = false;
@@ -2358,6 +2915,7 @@ export function createBrowserApp({
       state.updateConfirmed = false;
       state.updateConfirmedWorker = null;
       state.updateActivationTimer = null;
+      invalidatePreparedUpdateHandoff();
       elements.apply_update.disabled = false;
       elements.defer_update.disabled = false;
       elements.update_banner.hidden = state.updateRegistration?.waiting !== state.updateOfferedWorker;
@@ -2393,7 +2951,7 @@ export function createBrowserApp({
     elements.theme_picker.addEventListener("change", () => applyTheme(elements.theme_picker.value, { document }));
     elements.open_sidebar.addEventListener("click", () => { elements.sidebar.dataset.open = "true"; elements.sidebar_scrim.hidden = false; });
     elements.sidebar_scrim.addEventListener("click", () => { elements.sidebar.dataset.open = "false"; elements.sidebar_scrim.hidden = true; });
-    elements.apply_update.addEventListener("click", () => { activateWaitingUpdate(); });
+    elements.apply_update.addEventListener("click", () => { void activateWaitingUpdate(); });
     elements.defer_update.addEventListener("click", () => {
       const worker = state.updateRegistration?.waiting;
       if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return;
@@ -2424,6 +2982,7 @@ export function createBrowserApp({
     });
     for (const input of [elements.username, elements.password, elements.message_input]) {
       input.addEventListener("input", () => {
+        if (input === elements.message_input) invalidatePreparedUpdateHandoff();
         if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
         state.updateSafetyTimer = null;
         scheduleSafeUpdateReload();

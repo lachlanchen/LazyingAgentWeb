@@ -289,6 +289,7 @@ test("vision capabilities, canonical image retries, and authenticated previews s
 
 test("maximum-size image base64 uses bounded mobile intermediates and stays canonical", () => {
   const bytes = new Uint8Array(4 * 1024 * 1024);
+  Object.defineProperty(bytes, "toBase64", { value: undefined });
   for (let index = 0; index < bytes.byteLength; index += 1) bytes[index] = index & 0xff;
   const originalBtoa = globalThis.btoa;
   let calls = 0;
@@ -318,6 +319,40 @@ test("maximum-size image base64 uses bounded mobile intermediates and stays cano
     assert.ok(maximumInput <= 12 * 1024, `largest btoa input was ${maximumInput} bytes`);
     assert.equal(request.attachment.data.length, Math.ceil(bytes.byteLength / 3) * 4);
     assert.deepEqual(Buffer.from(request.attachment.data, "base64"), Buffer.from(bytes));
+  } finally {
+    globalThis.btoa = originalBtoa;
+  }
+});
+
+test("native Uint8Array base64 avoids binary-string upload intermediates", () => {
+  const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
+  let nativeCalls = 0;
+  Object.defineProperty(bytes, "toBase64", {
+    value() {
+      nativeCalls += 1;
+      return Buffer.from(this).toString("base64");
+    },
+  });
+  const originalBtoa = globalThis.btoa;
+  try {
+    globalThis.btoa = () => { throw new Error("the native path must not allocate a binary string"); };
+    const client = new DirectChatBrowserClient(clientOptions());
+    const request = client.prepareRun({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      content: "Use the native mobile encoder.",
+      expectedRevision: 0,
+      expectedHash: null,
+      attachment: {
+        attachmentId: "image_0000000000000100",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 1,
+        height: 1,
+        bytes,
+      },
+    });
+    assert.equal(nativeCalls, 1);
+    assert.equal(request.attachment.data, "AAEC/f7/");
   } finally {
     globalThis.btoa = originalBtoa;
   }

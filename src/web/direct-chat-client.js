@@ -325,6 +325,14 @@ function bytesToBase64(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > VISION_IMAGE_LIMIT) {
     throw new TypeError("attachment bytes are invalid");
   }
+  if (typeof bytes.toBase64 === "function") {
+    const encoded = bytes.toBase64();
+    if (typeof encoded !== "string" || encoded.length !== Math.ceil(bytes.byteLength / 3) * 4
+        || !boundedBase64(encoded)) {
+      throw new TypeError("native attachment base64 encoding is invalid");
+    }
+    return encoded;
+  }
   // Keep both the temporary binary string and every spread call small. A
   // single multi-megabyte binary join materially increases peak memory in a
   // mobile PWA before JSON serialization makes the required wire copy.

@@ -7,6 +7,7 @@ import { MessageChannel } from "node:worker_threads";
 
 import {
   AGENT_WEB_CACHE_PREFIX,
+  AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS,
   AGENT_WEB_RELEASE_ROOT,
   BRIGHT_APP_CSS,
   agentWebCacheName,
@@ -218,6 +219,7 @@ function workerVm(source, {
   responseOverride,
   clock = { value: 1_000 },
   operations = [],
+  windowClients = [],
 } = {}) {
   const listeners = new Map();
   let online = true;
@@ -301,7 +303,13 @@ function workerVm(source, {
 
   const self = {
     location: { origin: "https://llm.lazying.art" },
-    clients: { async claim() { claimCalls += 1; operations.push("claim"); } },
+    clients: {
+      async claim() { claimCalls += 1; operations.push("claim"); },
+      async matchAll(options) {
+        operations.push(`matchAll:${options?.type ?? ""}:${options?.includeUncontrolled === true}`);
+        return windowClients;
+      },
+    },
     async skipWaiting() { skipWaitingCalls += 1; },
     addEventListener(name, listener) { listeners.set(name, listener); },
   };
@@ -453,6 +461,7 @@ function updateControllerHarness({
   online = true,
   onUpdate = async () => {},
   basePath = "/",
+  releaseId = CURRENT_RELEASE,
   environment,
   registerPromise,
   restore = async () => ({ authenticated: false }),
@@ -462,12 +471,14 @@ function updateControllerHarness({
   canonicalizeImage,
   createObjectUrl,
   revokeObjectUrl,
+  updateHandoffStore,
 } = {}) {
-  const document = appDocument({ basePath });
+  const document = appDocument({ basePath, releaseId });
   const shared = environment ?? updateEnvironment({ waiting, controlled, onUpdate, registerPromise });
   const { registration, serviceWorker, waitingWorker, workerMessages } = shared;
   let reloads = 0;
   const replacements = [];
+  const historyReplacements = [];
   let nextTimer = 1;
   const timers = new Map();
   const window = Object.assign(eventTarget(), {
@@ -480,6 +491,14 @@ function updateControllerHarness({
     setTimeout(callback, delay) { const id = nextTimer; nextTimer += 1; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
+  window.history = {
+    state: null,
+    replaceState(value, unused, target) {
+      this.state = value;
+      historyReplacements.push(String(target));
+      window.location.href = new URL(String(target), window.location.href).href;
+    },
+  };
   const navigator = { onLine: online, serviceWorker };
   let restoreCalls = 0;
   const app = createBrowserApp({
@@ -508,6 +527,7 @@ function updateControllerHarness({
     ...(canonicalizeImage === undefined ? {} : { canonicalizeImage }),
     ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
     ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
+    ...(updateHandoffStore === undefined ? {} : { updateHandoffStore }),
   });
   return {
     app,
@@ -532,7 +552,108 @@ function updateControllerHarness({
     get restoreCalls() { return restoreCalls; },
     get reloads() { return reloads; },
     get replacements() { return [...replacements]; },
+    get historyReplacements() { return [...historyReplacements]; },
   };
+}
+
+function memoryUpdateHandoffStore(initial = []) {
+  const records = new Map(initial.map(([key, value]) => [key, structuredClone(value)]));
+  const calls = { save: 0, take: 0, discard: 0 };
+  let savedResolve;
+  const saved = new Promise((resolve) => { savedResolve = resolve; });
+  return {
+    calls,
+    records,
+    saved,
+    async save(record) {
+      calls.save += 1;
+      records.set(`${record.scope}\u0000${record.handoffId}`, structuredClone(record));
+      savedResolve();
+    },
+    async take(scope, handoffId) {
+      calls.take += 1;
+      const key = `${scope}\u0000${handoffId}`;
+      const record = records.get(key);
+      records.delete(key);
+      return record === undefined ? null : structuredClone(record);
+    },
+    async discard(scope, handoffId) {
+      calls.discard += 1;
+      records.delete(`${scope}\u0000${handoffId}`);
+    },
+  };
+}
+
+function canonicalPngHeader(width = 64, height = 64) {
+  const bytes = new Uint8Array(24);
+  bytes.set([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return bytes;
+}
+
+function idleAuthenticatedPwaClients(mutationCalls = { prepareThread: 0, createThread: 0, startRun: 0 }) {
+  const agent = {
+    async capabilities() {
+      return {
+        schemaVersion: "1",
+        enabled: false,
+        agent: { kind: "aginti", label: "AgInTi Agent" },
+        model: { label: "LocalLLM" },
+        actions: { cancel: false, resume: false, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+      };
+    },
+    async listThreads() { return { threads: [] }; },
+    async *streamRunEvents() {},
+  };
+  const chat = {
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread() { mutationCalls.prepareThread += 1; throw new Error("must not prepare during restore"); },
+    async createThread() { mutationCalls.createThread += 1; throw new Error("must not create during restore"); },
+    async retryCreateThread() { throw new Error("must not retry during restore"); },
+    async listThreads() { return { threads: [] }; },
+    async getThread() { throw new Error("no thread exists"); },
+    async listMessages() { return { messages: [] }; },
+    async getAttachment() { throw new Error("no attachment exists"); },
+    prepareRun() { throw new Error("must not prepare a run during restore"); },
+    async startRun() { mutationCalls.startRun += 1; throw new Error("must not send during restore"); },
+    async retryRun() { throw new Error("must not retry during restore"); },
+    async getRunStatus() { throw new Error("no run exists"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("no run exists"); },
+    async cancelRun() { throw new Error("no run exists"); },
+  };
+  return { agent, chat, mutationCalls };
+}
+
+async function stageEncryptedTextUpdateHandoff() {
+  const clients = idleAuthenticatedPwaClients();
+  const store = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const source = updateControllerHarness({
+    environment,
+    now: () => 20_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: clients.agent,
+    chat: clients.chat,
+    updateHandoffStore: store,
+  });
+  await source.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "private handoff draft";
+  source.document.getElementById("apply-update").dispatch("click");
+  await store.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(source.replacements.length, 1);
+  return { href: source.replacements[0], record: [...store.records.entries()][0] };
 }
 
 test("content-addressed PWA shell is bright and has safe session/password-manager semantics", async () => {
@@ -740,7 +861,8 @@ test("integrity worker caches the complete offline graph and rejects mismatched 
   assert.match(source, /crypto\.subtle\.digest\("SHA-256"/u);
   assert.match(source, /response\.redirected/u);
   assert.match(source, /response\.url !== expected/u);
-  assert.doesNotMatch(source.match(/self\.addEventListener\("install"[\s\S]*?\n\}\);/u)[0], /skipWaiting/u);
+  assert.match(source.match(/self\.addEventListener\("install"[\s\S]*?\n\}\);/u)[0], /emergencyPredecessor/u);
+  assert.match(source, /if \(await emergencyPredecessor\(\)\) await self\.skipWaiting\(\)/u);
   const worker = workerVm(source, { assetMap: map });
   await worker.dispatch("install");
   worker.setOnline(false);
@@ -790,6 +912,65 @@ test("integrity worker caches the complete offline graph and rejects mismatched 
   assert.equal(releaseMessages.length, 1);
   assert.equal(releaseMessages[0].type, "LAZYING_AGENT_RELEASE");
   assert.equal(releaseMessages[0].releaseId, map.releaseVersion);
+});
+
+test("emergency worker takeover is exact-release gated and navigates stale scoped windows once", async () => {
+  const map = await productionMap({ label: "emergency" });
+  const source = map.get(map.serviceWorkerRoute).body;
+  const vulnerableDigest = AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS.find((digest) => digest.startsWith("9496cadb"));
+  assert.equal(vulnerableDigest?.length, 64);
+  const oldRelease = `release-${vulnerableDigest}`;
+  const metaKey = `/.lazying-agent-cache-${map.scopeIdentity}.json`;
+  const stateCacheName = `${AGENT_WEB_CACHE_PREFIX}state-${map.scopeIdentity}`;
+  const activeKey = `/.lazying-agent-active-${map.scopeIdentity}.json`;
+  const seedRelease = async (worker, releaseId, installedAt = 1) => {
+    const cacheName = agentWebCacheName(releaseId);
+    const contentDigest = releaseId.slice("release-".length);
+    await (await worker.caches.open(cacheName)).put(metaKey, new worker.FakeResponse(JSON.stringify({
+      cacheName,
+      contentDigest,
+      scopeId: map.scopeIdentity,
+      installedAt,
+    }), { contentType: "application/json" }));
+    return cacheName;
+  };
+
+  const fresh = workerVm(source, { assetMap: map });
+  await fresh.dispatch("install");
+  assert.equal(fresh.skipWaitingCalls, 0, "a fresh install never forces activation");
+
+  const navigations = [];
+  const staleClient = {
+    url: `https://llm.lazying.art/?v=${oldRelease}`,
+    async navigate(value) { navigations.push(String(value)); return this; },
+  };
+  const legacy = workerVm(source, { assetMap: map, windowClients: [staleClient] });
+  await seedRelease(legacy, oldRelease);
+  await legacy.dispatch("install");
+  assert.equal(legacy.skipWaitingCalls, 1, "a validated very old cache without a pointer escapes the legacy trap");
+  await legacy.dispatch("activate");
+  assert.deepEqual(navigations, [`https://llm.lazying.art/?v=${map.releaseVersion}`]);
+
+  const safeCurrentRelease = `release-${"e".repeat(64)}`;
+  const safeNavigations = [];
+  const safe = workerVm(source, {
+    assetMap: map,
+    windowClients: [{
+      url: "https://llm.lazying.art/",
+      async navigate(value) { safeNavigations.push(String(value)); },
+    }],
+  });
+  const vulnerableCache = await seedRelease(safe, oldRelease);
+  const safeCurrentCache = await seedRelease(safe, safeCurrentRelease, 2);
+  await (await safe.caches.open(stateCacheName)).put(activeKey, new safe.FakeResponse(JSON.stringify({
+    scopeId: map.scopeIdentity,
+    current: safeCurrentCache,
+    previous: vulnerableCache,
+  }), { contentType: "application/json" }));
+  await safe.dispatch("install");
+  assert.equal(safe.skipWaitingCalls, 0, "an allowlisted predecessor cannot force from a non-vulnerable current release");
+  await safe.dispatch("activate");
+  assert.deepEqual(safeNavigations, []);
 });
 
 test("release identity survives asynchronous MessagePort delivery", async () => {
@@ -1016,7 +1197,7 @@ test("a fresh exact-release install skips the redundant startup update and never
   environment.registration.waiting = environment.waitingWorker;
   environment.registration.dispatch("updatefound");
   installing.dispatch("statechange");
-  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(harness.document.getElementById("update-banner").hidden, true);
   harness.document.getElementById("apply-update").dispatch("click");
@@ -1105,7 +1286,7 @@ test("an unidentified legacy waiting worker is conservatively offered after the 
 });
 
 test("controller migration uses a content-versioned full navigation and defers tabs with browser-only work", async () => {
-  const environment = updateEnvironment({ waiting: false });
+  const environment = updateEnvironment();
   const safe = updateControllerHarness({ environment });
   const unsafe = updateControllerHarness({ environment });
   await Promise.all([safe.app.initialize(), unsafe.app.initialize()]);
@@ -1214,7 +1395,7 @@ test("a paused authoritative chat finalization defers update activation and cont
     chat,
   });
   await harness.app.initialize();
-  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
   harness.document.getElementById("message-input").value = "Keep this completed response recoverable";
   await harness.app.submitMessage({ preventDefault() {} });
   assert.equal(harness.document.getElementById("workspace").dataset.status, "finalizing");
@@ -1393,8 +1574,8 @@ test("Update refuses to activate while a password or draft is only browser-held"
   assert.match(harness.document.getElementById("toast").textContent, /Finish the current draft or response/u);
 });
 
-test("a staged image keeps a verified waiting worker inactive until the image is explicitly removed", async () => {
-  const environment = updateEnvironment({ waiting: false });
+test("a staged image remains in place when protected update handoff storage is unavailable", async () => {
+  const environment = updateEnvironment();
   const capability = {
     schemaVersion: "1",
     enabled: false,
@@ -1418,7 +1599,10 @@ test("a staged image keeps a verified waiting worker inactive until the image is
     prepareRun() {}, async startRun() {}, async retryRun() {}, async getRunStatus() {}, async *streamRunEvents() {},
     prepareCancellation() {}, async cancelRun() {},
   };
-  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const bytes = canonicalPngHeader();
+  let handoffSaveAttempts = 0;
+  let handoffSaveAttemptedResolve;
+  const handoffSaveAttempted = new Promise((resolve) => { handoffSaveAttemptedResolve = resolve; });
   const harness = updateControllerHarness({
     environment,
     restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
@@ -1437,29 +1621,222 @@ test("a staged image keeps a verified waiting worker inactive until the image is
     },
     createObjectUrl: () => "blob:staged-update-image",
     revokeObjectUrl() {},
+    updateHandoffStore: {
+      async save() {
+        handoffSaveAttempts += 1;
+        handoffSaveAttemptedResolve();
+        throw new TypeError("storage unavailable");
+      },
+      async take() { return null; },
+      async discard() {},
+    },
   });
   await harness.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
   const imageInput = harness.document.getElementById("image-input");
   imageInput.files = [{ name: "staged.png" }];
   imageInput.dispatch("change");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(harness.document.getElementById("image-preview").hidden, false);
-
-  const installing = environment.waitingWorker;
-  environment.registration.installing = installing;
-  environment.registration.waiting = environment.waitingWorker;
-  environment.registration.dispatch("updatefound");
-  installing.dispatch("statechange");
-  await Promise.resolve();
+  harness.document.getElementById("message-input").value = "keep this image";
 
   assert.deepEqual(environment.workerMessages, [], "a browser-held image must block automatic activation");
   assert.equal(harness.document.getElementById("update-banner").hidden, false);
   harness.document.getElementById("apply-update").dispatch("click");
+  await handoffSaveAttempted;
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(environment.workerMessages, []);
+  assert.equal(handoffSaveAttempts, 1);
+  assert.match(harness.document.getElementById("toast").textContent, /could not be protected/u);
 
   harness.document.getElementById("remove-image").dispatch("click");
-  harness.runTimers(1_000);
+  harness.document.getElementById("message-input").value = "";
+  harness.document.getElementById("message-input").dispatch("input");
+  harness.document.getElementById("apply-update").dispatch("click");
   assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
+});
+
+test("a definitively unsent image survives a confirmed stale-PWA update exactly once without redispatch", async () => {
+  const capability = {
+    schemaVersion: "1",
+    enabled: false,
+    agent: { kind: "aginti", label: "AgInTi Agent" },
+    model: { label: "LocalLLM" },
+    actions: { cancel: false, resume: false, retry: false },
+    attachments: { enabled: false },
+    artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+  };
+  const agent = {
+    async capabilities() { return capability; },
+    async listThreads() { return { threads: [] }; },
+    async *streamRunEvents() {},
+  };
+  const mutationCalls = { prepareThread: 0, createThread: 0, startRun: 0 };
+  const chat = {
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread() {
+      mutationCalls.prepareThread += 1;
+      throw new TypeError("local preparation stopped before dispatch");
+    },
+    async createThread() { mutationCalls.createThread += 1; throw new Error("must not dispatch"); },
+    async retryCreateThread() { throw new Error("must not retry"); },
+    async listThreads() { return { threads: [] }; },
+    async getThread() { throw new Error("no thread exists"); },
+    async listMessages() { return { messages: [] }; },
+    async getAttachment() { throw new Error("no attachment exists"); },
+    prepareRun() { throw new Error("must not prepare a run"); },
+    async startRun() { mutationCalls.startRun += 1; throw new Error("must not start"); },
+    async retryRun() { throw new Error("must not retry"); },
+    async getRunStatus() { throw new Error("no run exists"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("no run exists"); },
+    async cancelRun() { throw new Error("no run exists"); },
+  };
+  const bytes = canonicalPngHeader();
+  const store = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const source = updateControllerHarness({
+    environment,
+    now: () => 10_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat,
+    updateHandoffStore: store,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000200",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: () => "blob:failed-image",
+    revokeObjectUrl() {},
+  });
+  await source.app.initialize();
+  await Promise.resolve();
+  const imageInput = source.document.getElementById("image-input");
+  imageInput.files = [{ name: "failed.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "Describe this exact restored image";
+  await source.app.submitMessage({ preventDefault() {} });
+  assert.match(source.document.getElementById("toast").textContent, /not sent/u);
+  assert.equal(source.document.getElementById("image-preview").hidden, false);
+  assert.equal(source.document.getElementById("update-banner").hidden, false);
+  assert.equal(mutationCalls.createThread, 0);
+  assert.equal(mutationCalls.startRun, 0);
+
+  source.document.getElementById("apply-update").dispatch("click");
+  await store.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
+  assert.equal(store.calls.save, 1);
+  assert.equal(store.records.size, 1);
+  const encrypted = [...store.records.values()][0];
+  assert.deepEqual(Object.keys(encrypted).sort(), [
+    "ciphertext", "createdAt", "expiresAt", "handoffId", "iv", "schemaVersion", "scope", "sourceRelease", "targetRelease",
+  ]);
+  assert.doesNotMatch(JSON.stringify(encrypted), /Describe this exact restored image/u);
+
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(source.replacements.length, 1);
+  assert.match(
+    source.replacements[0],
+    new RegExp(`^https://llm\\.lazying\\.art/\\?v=${NEXT_RELEASE}#lazying-update-handoff=[a-f0-9]{64}\\.[A-Za-z0-9_-]{43}$`, "u"),
+  );
+
+  const restoredMutationCalls = { prepareThread: 0, createThread: 0, startRun: 0 };
+  const restoredChat = {
+    ...chat,
+    prepareThread() { restoredMutationCalls.prepareThread += 1; throw new Error("restore must not prepare"); },
+    async createThread() { restoredMutationCalls.createThread += 1; throw new Error("restore must not create"); },
+    async startRun() { restoredMutationCalls.startRun += 1; throw new Error("restore must not send"); },
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 10_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: restoredChat,
+    updateHandoffStore: store,
+    createObjectUrl: () => "blob:restored-image",
+    revokeObjectUrl() {},
+  });
+  assert.deepEqual(restored.historyReplacements, [`/?v=${NEXT_RELEASE}`], "the decryption key is scrubbed before async startup");
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("message-input").value, "Describe this exact restored image");
+  assert.equal(restored.document.getElementById("image-preview").hidden, false);
+  assert.equal(restored.document.getElementById("image-preview-thumbnail").src, "blob:restored-image");
+  assert.match(restored.document.getElementById("toast").textContent, /restored/u);
+  assert.deepEqual(restoredMutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  assert.equal(store.calls.take, 1);
+  assert.equal(store.records.size, 0, "the encrypted handoff is deleted before validation and restored only in memory");
+});
+
+test("corrupt, oversized, foreign-release, and foreign-account update handoffs are deleted and rejected", async (t) => {
+  const { href, record: [storageKey, encrypted] } = await stageEncryptedTextUpdateHandoff();
+  const corrupt = structuredClone(encrypted);
+  corrupt.ciphertext[0] ^= 0xff;
+  const oversized = structuredClone(encrypted);
+  oversized.ciphertext = new Uint8Array(4 * 1024 * 1024 + 160 * 1024 + 21);
+  const foreignRelease = structuredClone(encrypted);
+  foreignRelease.targetRelease = OLD_RELEASE;
+  for (const scenario of [
+    { name: "corrupt ciphertext", record: corrupt, username: "account-user" },
+    { name: "oversized ciphertext", record: oversized, username: "account-user" },
+    { name: "foreign target release", record: foreignRelease, username: "account-user" },
+    { name: "foreign account", record: structuredClone(encrypted), username: "different-account" },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const store = memoryUpdateHandoffStore([[storageKey, scenario.record]]);
+      const clients = idleAuthenticatedPwaClients();
+      const restored = updateControllerHarness({
+        waiting: false,
+        environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+        releaseId: NEXT_RELEASE,
+        locationHref: href,
+        now: () => 20_001,
+        restore: async () => ({
+          authenticated: true,
+          username: scenario.username,
+          csrfToken: "csrf-token-value-long-enough",
+        }),
+        agent: clients.agent,
+        chat: clients.chat,
+        updateHandoffStore: store,
+      });
+      await restored.app.initialize();
+      assert.equal(restored.document.getElementById("message-input").value, "");
+      assert.match(restored.document.getElementById("toast").textContent, /failed its safety checks/u);
+      assert.equal(store.calls.take, 1);
+      assert.equal(store.records.size, 0, "rejected state is still consumed exactly once");
+      assert.deepEqual(clients.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+    });
+  }
+});
+
+test("a normal safe update never creates a handoff record and activates only once", async () => {
+  const store = memoryUpdateHandoffStore();
+  const harness = updateControllerHarness({ updateHandoffStore: store });
+  await harness.app.initialize();
+  await Promise.resolve();
+  harness.document.getElementById("apply-update").dispatch("click");
+  harness.document.getElementById("apply-update").dispatch("click");
+  assert.deepEqual(harness.workerMessages, [{ type: "SKIP_WAITING" }]);
+  assert.equal(store.calls.save, 0);
+  assert.equal(store.calls.take, 0);
+  assert.equal(store.records.size, 0);
 });
 
 test("Later re-prompts after bounded deferral and a newer waiting worker bypasses the old deferral", async () => {

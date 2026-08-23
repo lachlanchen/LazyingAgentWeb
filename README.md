@@ -87,6 +87,16 @@ only after the new worker controls the tab. Activation retains the current and
 immediately previous verified shell. An offline or failed update leaves the
 current app usable.
 
+If Update is confirmed while a definitively unsent Direct Chat prompt or image
+is still in the composer, the page stores one bounded AES-GCM ciphertext in a
+dedicated IndexedDB store. Its random key exists only in the replacement
+navigation fragment, which is scrubbed before asynchronous startup. The exact
+account, scope, source/target releases, expiry, digest, and canonical image
+contract are revalidated; the record is atomically consumed once and is never
+auto-sent. Expired, malformed, and excess orphan records are pruned. Passwords,
+active sends, generations, Agent runs, and ambiguous mutations cannot use this
+handoff.
+
 Only immutable public shell assets enter Cache Storage. Login/session, Direct
 Chat, Agent, SSE, artifact, and upload traffic always bypasses it. Production
 must stage the entire immutable namespace before atomically switching the root
@@ -262,9 +272,11 @@ cannot append or finalize after losing its lease.
 Canonical attachment bytes are durable only in the owner-private Direct Chat
 database. The message ledger and browser API expose a size/dimension/MIME/SHA-256
 descriptor, never the bytes or base64. Authenticated previews are `no-store`
-responses, and image data never enters Cache Storage, localStorage, sessionStorage,
-or IndexedDB. Base64 exists only transiently in the browser's exact in-memory
-retry ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies.
+responses, and image data never enters Cache Storage, localStorage, or
+sessionStorage. IndexedDB is used only for the encrypted, expiring, one-shot
+confirmed-update handoff described above; it is not chat history or a retry
+queue. Base64 exists only transiently in the browser's exact in-memory retry
+ticket and the bounded browser-to-BFF and BFF-to-LocalLLM request bodies.
 
 The attachment table is schema v3 and is created only when vision is enabled.
 A v3-aware build can reopen the database with vision disabled. It continues to

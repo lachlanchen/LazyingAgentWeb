@@ -139,7 +139,9 @@ Direct Chat:
 - The PWA accepts exactly one JPEG or PNG and requires a text prompt. It checks
   source dimensions before decode, redraws through canvas to discard source
   metadata, and rejects canonical output above 4 MiB. No image is placed in
-  browser storage or the service-worker cache.
+  Cache Storage, localStorage, or sessionStorage. A user-confirmed PWA update
+  may place one encrypted, expiring, one-shot unsent-composer handoff in a
+  dedicated IndexedDB store; it is never history, a send queue, or auto-sent.
 - The BFF independently validates canonical base64, MIME/signature, structure,
   dimensions, metadata absence, and digest. It atomically commits the prompt,
   descriptor-bound ledger row, private BLOB, and pending generation. Public
@@ -204,6 +206,15 @@ window, is offered through **Update** or **Later**:
   after `controllerchange`.
 - A failed or offline update leaves the current app usable and retries after
   connectivity returns.
+
+A confirmed Update can carry only a definitively unsent Direct Chat composer
+across that reload. The page encrypts a bounded record with AES-GCM, keeps the
+random key only in a URL fragment, scrubs the fragment synchronously, then
+atomically takes and deletes the record before validating its account, scope,
+source/target release, age, digest, and canonical image. Restoration never
+dispatches a request. Passwords, active or ambiguous sends, generations, Agent
+runs, and other browser-held workflows remain reload blockers. Malformed,
+expired, and excess orphan ciphertexts are pruned.
 
 Before caching, the service worker requires the exact same-origin URL, status,
 MIME type, declared shell security headers, byte length, and SHA-256 for every

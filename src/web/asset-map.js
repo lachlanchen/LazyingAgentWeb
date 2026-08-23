@@ -49,6 +49,7 @@ function codeUnitCompare(left, right) {
 
 const LOCAL_MODULES = Object.freeze({
   "/assets/browser-app.js": new URL("./browser-app.js", import.meta.url),
+  "/assets/pwa-update-handoff-store.js": new URL("./pwa-update-handoff-store.js", import.meta.url),
   "/assets/cloud-session-client.js": new URL("./cloud-session-client.js", import.meta.url),
   "/assets/direct-chat-client.js": new URL("./direct-chat-client.js", import.meta.url),
   "/assets/vision-image-client.js": new URL("./vision-image-client.js", import.meta.url),

@@ -8,6 +8,7 @@ import { MessageChannel } from "node:worker_threads";
 import {
   AGENT_WEB_CACHE_PREFIX,
   AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS,
+  AGENT_WEB_MODULE_ROUTES,
   AGENT_WEB_RELEASE_ROOT,
   BRIGHT_APP_CSS,
   agentWebCacheName,
@@ -697,6 +698,25 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   for (const [name, value] of Object.entries(STANDALONE_SHELL_SECURITY_HEADERS)) {
     assert.equal(rootDescriptor.headers[name], value);
   }
+});
+
+test("the shell deterministically modulepreloads the complete immutable module graph", async () => {
+  const [first, repeated, subpath] = await Promise.all([
+    productionMap({ label: "preload", marker: "same" }),
+    productionMap({ label: "preload", marker: "same" }),
+    productionMap({ label: "preload", marker: "subpath", basePath: "/agent-ui/" }),
+  ]);
+  const preloadHrefs = (html) => [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/gu)]
+    .map((match) => match[1]);
+  const expectedRoot = AGENT_WEB_MODULE_ROUTES.map((route) => versionedAgentWebAsset(route, first.releaseVersion));
+  const expectedSubpath = AGENT_WEB_MODULE_ROUTES.map((route) => (
+    `/agent-ui${versionedAgentWebAsset(route, subpath.releaseVersion)}`
+  ));
+  assert.deepEqual(preloadHrefs(first.get("/").body), expectedRoot);
+  assert.deepEqual(preloadHrefs(repeated.get("/").body), expectedRoot);
+  assert.deepEqual(preloadHrefs(subpath.get("/agent-ui/").body), expectedSubpath);
+  assert.equal(new Set(expectedRoot).size, AGENT_WEB_MODULE_ROUTES.length);
+  for (const route of expectedRoot) assert.equal(first.has(route), true, route);
 });
 
 test("the conversation sidebar gives the thread list one bounded scroll region", () => {
@@ -2024,17 +2044,29 @@ test("an offline startup does not delay the immediate online update retry", asyn
   assert.equal(harness.registration.updateCalls, 2, "online transition must retry a failed startup check immediately");
 });
 
-test("a stalled optional service-worker registration never blocks session restore or chat startup", async () => {
+test("service-worker registration starts only after hydration and cannot block the first usable UI", async () => {
   const never = new Promise(() => {});
-  const harness = updateControllerHarness({ registerPromise: never });
+  const hydration = Promise.withResolvers();
+  const harness = updateControllerHarness({
+    controlled: false,
+    registerPromise: never,
+    restore: async () => await hydration.promise,
+  });
+  const initialization = harness.app.initialize();
+  await Promise.resolve();
+  assert.equal(harness.restoreCalls, 1);
+  assert.deepEqual(harness.serviceWorker.registerCalls, [], "cold shell installation cannot compete with session hydration");
+  hydration.resolve({ authenticated: false });
   const result = await Promise.race([
-    harness.app.initialize().then(() => "initialized"),
+    initialization.then(() => "initialized"),
     new Promise((resolve) => setImmediate(() => resolve("blocked"))),
   ]);
   assert.equal(result, "initialized");
-  assert.equal(harness.restoreCalls, 1);
   assert.equal(harness.document.getElementById("login-view").hidden, false);
   assert.equal(harness.document.getElementById("app-view").hidden, true);
+  assert.equal(harness.document.getElementById("login-submit").disabled, false);
+  await Promise.resolve();
+  assert.deepEqual(harness.serviceWorker.registerCalls, [["/sw.js", { scope: "/", updateViaCache: "none" }]]);
 });
 
 test("runtime configuration injects only normalized endpoint paths and never accepts secrets or traversal", () => {

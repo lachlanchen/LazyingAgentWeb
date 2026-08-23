@@ -416,13 +416,35 @@ export class CloudIndexStore {
         this.#assertAccountExists(accountId);
         const timestamp = nowIso(this.#clock);
         if (expiresAt <= timestamp) throw new ValidationError('expiresAt must be in the future.');
+        const existingSession = this.#database.prepare(`
+          SELECT 1 AS present FROM browser_sessions WHERE session_digest = ?
+        `).get(sessionDigest);
+        if (existingSession) {
+          // Check before capacity eviction so a caller cannot delete and
+          // silently rebind an existing oldest token with new CSRF authority.
+          throw new ConflictError('The browser-session token already exists.');
+        }
         const sessionCount = Number(this.#database.prepare(`
           SELECT count(*) AS count
           FROM browser_sessions
           WHERE account_id = ?
         `).get(accountId)?.count);
         if (sessionCount >= MAX_BROWSER_SESSIONS_PER_ACCOUNT) {
-          throw new ConflictError('The account has reached the active browser-session limit.');
+          const sessionsToEvict = sessionCount - MAX_BROWSER_SESSIONS_PER_ACCOUNT + 1;
+          const eviction = this.#database.prepare(`
+            DELETE FROM browser_sessions
+            WHERE account_id = ? AND session_digest IN (
+              SELECT session_digest
+              FROM browser_sessions
+              WHERE account_id = ?
+              -- last_seen_at is issuance-only until authentication records durable access.
+              ORDER BY created_at ASC, session_digest ASC
+              LIMIT ?
+            )
+          `).run(accountId, accountId, sessionsToEvict);
+          if (Number(eviction.changes) !== sessionsToEvict) {
+            throw new StorageCorruptionError('Browser-session admission could not make exactly one slot.');
+          }
         }
         try {
           this.#database.prepare(`

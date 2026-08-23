@@ -232,6 +232,9 @@ function harness({
   createObjectUrl,
   revokeObjectUrl,
   attachmentDecodeTimeoutMs,
+  attachmentMemoryLimitBytes,
+  attachmentDecodedMemoryLimitBytes,
+  IntersectionObserver,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
 } = {}) {
@@ -245,7 +248,11 @@ function harness({
       current.push(listener);
       windowListeners.set(name, current);
     },
+    dispatch(name, event = {}) {
+      for (const listener of windowListeners.get(name) ?? []) listener(event);
+    },
   };
+  if (IntersectionObserver !== undefined) window.IntersectionObserver = IntersectionObserver;
   const sessionClient = {
     async restore() { return restore; },
     async login(value) { return login ? await login(value) : restore; },
@@ -268,10 +275,36 @@ function harness({
     ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
     ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
     ...(attachmentDecodeTimeoutMs === undefined ? {} : { attachmentDecodeTimeoutMs }),
+    ...(attachmentMemoryLimitBytes === undefined ? {} : { attachmentMemoryLimitBytes }),
+    ...(attachmentDecodedMemoryLimitBytes === undefined ? {} : { attachmentDecodedMemoryLimitBytes }),
     wait,
     maxStreamBackoffSteps,
   });
-  return { app, document, sessionClient };
+  return { app, document, sessionClient, window };
+}
+
+function intersectionHarness() {
+  const instances = [];
+  class FakeIntersectionObserver {
+    constructor(callback, options) {
+      this.callback = callback;
+      this.options = options;
+      this.targets = new Set();
+      instances.push(this);
+    }
+    observe(target) { this.targets.add(target); }
+    unobserve(target) { this.targets.delete(target); }
+    disconnect() { this.targets.clear(); }
+    enter(target) {
+      assert.equal(this.targets.has(target), true, "only an observed attachment can enter the viewport");
+      this.callback([{ target, isIntersecting: true, intersectionRatio: 1 }]);
+    }
+  }
+  return {
+    IntersectionObserver: FakeIntersectionObserver,
+    instances,
+    latest() { return instances.at(-1); },
+  };
 }
 
 function digest(value) { return createHash("sha256").update(value, "utf8").digest("hex"); }
@@ -356,6 +389,7 @@ test("authenticated startup restore clears a typed password before hydration can
   startup.resolve({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" });
   await threadsStarted.promise;
   assert.equal(password.value, "", "an authenticated restore clears typed or autofilled secret input immediately");
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(browser.document.getElementById("login-view").hidden, true);
   assert.equal(browser.document.getElementById("logout").disabled, true, "sign-out stays guarded during hydration");
   threads.resolve({ threads: [] });
@@ -386,6 +420,7 @@ test("sign-out stays disabled while successful login hydration is pending", asyn
   browser.document.getElementById("password").value = "not-retained";
   const signingIn = browser.app.login({ preventDefault() {} });
   await threadsStarted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(browser.document.getElementById("app-view").hidden, false);
   assert.equal(browser.document.getElementById("password").value, "", "a validated login clears its secret before hydration finishes");
   assert.equal(browser.document.getElementById("logout").disabled, true);
@@ -468,6 +503,61 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   await malformed.app.initialize();
   assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+});
+
+test("chat startup overlaps capabilities with one thread list and overlaps the first verified ledger page", async () => {
+  const agentCapabilityGate = Promise.withResolvers();
+  const chatCapabilityGate = Promise.withResolvers();
+  const threadReadGate = Promise.withResolvers();
+  const messageReadGate = Promise.withResolvers();
+  const listStarted = Promise.withResolvers();
+  const threadStarted = Promise.withResolvers();
+  const messagesStarted = Promise.withResolvers();
+  const thread = chatThread({ revision: 2, ledgerHash: CHAT_HASH_B, messageCount: 2, ledgerBytes: 18 });
+  const messages = [chatMessage(1, "user", "Question"), chatMessage(2, "assistant", "Answer")];
+  let listCalls = 0;
+  let threadReads = 0;
+  const browser = harness({
+    agent: {
+      ...baseAgent(),
+      async capabilities() { return await agentCapabilityGate.promise; },
+    },
+    chat: baseChat({
+      async capabilities() { return await chatCapabilityGate.promise; },
+      async listThreads() {
+        listCalls += 1;
+        listStarted.resolve();
+        return { threads: [thread] };
+      },
+      async getThread() {
+        threadReads += 1;
+        if (threadReads === 1) {
+          threadStarted.resolve();
+          return await threadReadGate.promise;
+        }
+        return { thread };
+      },
+      async listMessages({ afterRevision, limit }) {
+        assert.equal(afterRevision, 0);
+        assert.equal(limit, 2);
+        messagesStarted.resolve();
+        return await messageReadGate.promise;
+      },
+    }),
+  });
+  const initializing = browser.app.initialize();
+  await listStarted.promise;
+  assert.equal(listCalls, 1, "the thread list starts while capability hydration is still pending");
+  chatCapabilityGate.resolve({ visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 });
+  agentCapabilityGate.resolve(capabilities());
+  await Promise.all([threadStarted.promise, messagesStarted.promise]);
+  threadReadGate.resolve({ thread });
+  messageReadGate.resolve({ messages });
+  await initializing;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(listCalls, 1, "the prefetched startup list is consumed without a duplicate sidebar refresh");
+  assert.equal(threadReads, 2, "the before/after authoritative thread proof remains intact");
+  assert.match(browser.document.getElementById("messages").textContent, /QuestionAnswer/u);
 });
 
 test("startup restores the server-owned Direct Chat thread and message ledger", async () => {
@@ -1295,6 +1385,921 @@ test("a background attachment decode timeout becomes explicit unavailable state 
   assert.ok(revokedUrls.some((url) => url.startsWith("blob:decode-timeout-")));
 });
 
+test("offscreen historical images wait for viewport entry and restore through one verified fetch at a time", async () => {
+  const observer = intersectionHarness();
+  const hashes = ["1", "2", "3", "4"].map((value) => value.repeat(64));
+  const descriptors = [1, 2].map((value) => ({
+    attachmentId: `image_viewport_${value}_xxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: 4,
+    width: 80,
+    height: 60,
+    sha256: String(value).repeat(64),
+  }));
+  const messages = [
+    chatMessage(1, "user", "First image", { messageHash: hashes[0], attachment: descriptors[0] }),
+    chatMessage(2, "assistant", "First answer", { previousHash: hashes[0], messageHash: hashes[1] }),
+    chatMessage(3, "user", "Second image", {
+      previousHash: hashes[1], messageHash: hashes[2], attachment: descriptors[1],
+    }),
+    chatMessage(4, "assistant", "Second answer", { previousHash: hashes[2], messageHash: hashes[3] }),
+  ];
+  const thread = chatThread({
+    revision: 4,
+    ledgerHash: hashes[3],
+    messageCount: 4,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const firstFetch = Promise.withResolvers();
+  const firstFetchStarted = Promise.withResolvers();
+  const secondFetchStarted = Promise.withResolvers();
+  const attachmentReads = [];
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ threadId, attachment, signal }) {
+      assert.equal(threadId, CHAT_THREAD_ID);
+      assert.equal(signal instanceof AbortSignal, true);
+      assert.equal(attachment.sha256, descriptors[attachmentReads.length].sha256);
+      attachmentReads.push(attachment.attachmentId);
+      if (attachmentReads.length === 1) {
+        firstFetchStarted.resolve();
+        return await firstFetch.promise;
+      }
+      secondFetchStarted.resolve();
+      return { bytes, descriptor: attachment };
+    },
+  });
+  const browser = harness({
+    chat,
+    IntersectionObserver: observer.IntersectionObserver,
+    createObjectUrl: (() => { let value = 0; return () => `blob:viewport-${value += 1}`; })(),
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  const observed = [...observer.latest().targets];
+  assert.equal(observed.length, 2);
+  assert.equal(attachmentReads.length, 0, "offscreen descriptors never trigger original-byte fetches");
+  const images = observed.map((article) => article.children[0]);
+  assert.deepEqual(images.map((image) => [image.loading, image.decoding, image.dataset.previewState]), [
+    ["lazy", "async", "deferred"],
+    ["lazy", "async", "deferred"],
+  ]);
+
+  observer.latest().enter(observed[0]);
+  observer.latest().enter(observed[1]);
+  await firstFetchStarted.promise;
+  assert.equal(attachmentReads.length, 1, "the second visible original waits behind the bounded queue");
+  firstFetch.resolve({ bytes, descriptor: descriptors[0] });
+  await secondFetchStarted.promise;
+  assert.equal(attachmentReads.length, 2);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(images.map((image) => image.dataset.previewState), ["ready", "ready"]);
+});
+
+async function sameThreadAttachmentMemoryCase({ blobLimit, decodedLimit }) {
+  const observer = intersectionHarness();
+  const hashes = ["5", "6", "7", "8"].map((value) => value.repeat(64));
+  const descriptors = [1, 2].map((value) => ({
+    attachmentId: `image_memory_${value}_xxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: 4,
+    width: 2,
+    height: 2,
+    sha256: String(value).repeat(64),
+  }));
+  const messages = [
+    chatMessage(1, "user", "First bounded image", { messageHash: hashes[0], attachment: descriptors[0] }),
+    chatMessage(2, "assistant", "First bounded answer", { previousHash: hashes[0], messageHash: hashes[1] }),
+    chatMessage(3, "user", "Second bounded image", {
+      previousHash: hashes[1], messageHash: hashes[2], attachment: descriptors[1],
+    }),
+    chatMessage(4, "assistant", "Second bounded answer", { previousHash: hashes[2], messageHash: hashes[3] }),
+  ];
+  const thread = chatThread({
+    revision: 4,
+    ledgerHash: hashes[3],
+    messageCount: 4,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const reads = new Map();
+  const revoked = [];
+  let nextUrl = 0;
+  const browser = harness({
+    chat: baseChat({
+      async listThreads() { return { threads: [thread] }; },
+      async getThread() { return { thread }; },
+      async listMessages({ afterRevision, limit }) {
+        return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+      },
+      async getAttachment({ attachment }) {
+        reads.set(attachment.attachmentId, (reads.get(attachment.attachmentId) ?? 0) + 1);
+        return { bytes: new Uint8Array([1, 2, 3, 4]), descriptor: attachment };
+      },
+    }),
+    IntersectionObserver: observer.IntersectionObserver,
+    attachmentMemoryLimitBytes: blobLimit,
+    attachmentDecodedMemoryLimitBytes: decodedLimit,
+    createObjectUrl() { return `blob:memory-${nextUrl += 1}`; },
+    revokeObjectUrl(url) { revoked.push(url); },
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  const articles = [...observer.latest().targets];
+  assert.equal(articles.length, 2);
+  observer.latest().enter(articles[0]);
+  observer.latest().enter(articles[1]);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  return { articles, browser, descriptors, reads, revoked };
+}
+
+test("same-thread Blob eviction revokes its rendered object URL instead of retaining private bytes", async () => {
+  const result = await sameThreadAttachmentMemoryCase({ blobLimit: 5, decodedLimit: 32 });
+  const [[firstImage, firstStatus], [secondImage]] = result.articles.map((article) => article.children);
+  assert.equal(firstImage.dataset.previewState, "deferred");
+  assert.equal(firstImage.src, "");
+  assert.equal(firstStatus.disabled, false);
+  assert.equal(secondImage.dataset.previewState, "ready");
+  assert.deepEqual(result.revoked, ["blob:memory-1"]);
+
+  firstStatus.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(result.reads.get(result.descriptors[0].attachmentId), 2, "an evicted compressed Blob is fetched again only on demand");
+  assert.equal(firstImage.dataset.previewState, "ready");
+  assert.equal(secondImage.dataset.previewState, "deferred");
+});
+
+test("the decoded-preview LRU revokes old surfaces but can reuse their still-bounded Blob", async () => {
+  const result = await sameThreadAttachmentMemoryCase({ blobLimit: 16, decodedLimit: 16 });
+  const [[firstImage, firstStatus], [secondImage]] = result.articles.map((article) => article.children);
+  assert.equal(firstImage.dataset.previewState, "deferred");
+  assert.equal(secondImage.dataset.previewState, "ready");
+  assert.deepEqual(result.revoked, ["blob:memory-1"]);
+
+  firstStatus.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(result.reads.get(result.descriptors[0].attachmentId), 1, "decoded eviction reuses the verified compressed Blob without network I/O");
+  assert.equal(firstImage.dataset.previewState, "ready");
+  assert.equal(secondImage.dataset.previewState, "deferred");
+});
+
+test("repeated failed and cancelled image turns retain at most one local preview when terminal refresh is unavailable", async () => {
+  const observer = intersectionHarness();
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const previewBlobs = new WeakSet();
+  const created = [];
+  const revoked = [];
+  const statuses = ["failed", "cancelled"];
+  const messages = [];
+  let thread = chatThread();
+  let runIndex = 0;
+  let selectionIndex = 0;
+  let failTerminalRefresh = false;
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (failTerminalRefresh) {
+        failTerminalRefresh = false;
+        throw new DirectChatTransportError("terminal refresh unavailable", {
+          code: "request_failed",
+          status: 503,
+          retryable: false,
+        });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: `generation_memory_${runIndex + 1}_xxxxxxxxxxxx`,
+        idempotencyKey: `run_memory_${runIndex + 1}_xxxxxxxxxxxxxxxx`,
+      });
+    },
+    async startRun(ticket) {
+      const previousHash = messages.at(-1)?.messageHash ?? null;
+      const messageHash = String(runIndex + 1).repeat(64);
+      const attachment = Object.freeze({
+        attachmentId: ticket.attachment.attachmentId,
+        mediaType: ticket.attachment.mediaType,
+        byteLength: ticket.attachment.byteLength,
+        width: ticket.attachment.width,
+        height: ticket.attachment.height,
+        sha256: String(runIndex + 3).repeat(64),
+      });
+      messages.push(chatMessage(messages.length + 1, "user", ticket.content, {
+        previousHash,
+        messageHash,
+        attachment,
+      }));
+      thread = chatThread({
+        revision: messages.length,
+        ledgerHash: messageHash,
+        messageCount: messages.length,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      const status = statuses[runIndex];
+      runIndex += 1;
+      failTerminalRefresh = true;
+      return {
+        request: ticket,
+        generation: chatGeneration({
+          generationId: ticket.generationId,
+          status,
+          terminal: true,
+        }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    IntersectionObserver: observer.IntersectionObserver,
+    async canonicalizeImage() {
+      selectionIndex += 1;
+      const previewBlob = new Blob([bytes], { type: "image/png" });
+      previewBlobs.add(previewBlob);
+      return Object.freeze({
+        attachmentId: `image_local_memory_${selectionIndex}_xxxxxxxx`,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 2,
+        height: 2,
+        bytes,
+        previewBlob,
+      });
+    },
+    createObjectUrl(blob) {
+      const kind = previewBlobs.has(blob) ? "composer" : "local";
+      const url = `blob:${kind}-${created.filter((value) => value.startsWith(`blob:${kind}-`)).length + 1}`;
+      created.push(url);
+      return url;
+    },
+    revokeObjectUrl(url) { revoked.push(url); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  for (let turn = 0; turn < 2; turn += 1) {
+    imageInput.files = [{ name: `terminal-${turn}.png` }];
+    imageInput.dispatch("change");
+    await new Promise((resolve) => setImmediate(resolve));
+    messageInput.value = `Terminal image ${turn}`;
+    await browser.app.submitMessage({ preventDefault() {} });
+  }
+
+  const localUrls = created.filter((url) => url.startsWith("blob:local-"));
+  assert.deepEqual(localUrls, ["blob:local-1", "blob:local-2"]);
+  assert.deepEqual(localUrls.filter((url) => !revoked.includes(url)), ["blob:local-2"], "the pre-send snapshot revokes the prior failed local preview");
+  assert.equal(new Set(revoked).size, revoked.length, "no object URL is revoked twice");
+  browser.document.getElementById("new-thread").dispatch("click");
+  assert.equal(created.every((url) => revoked.includes(url)), true, "view disposal revokes the final cancelled local preview");
+  assert.equal(new Set(revoked).size, revoked.length, "final cleanup still revokes every URL exactly once");
+});
+
+test("pre-send image reconciliation cannot race an accepted exact ticket with preview authentication recovery", async () => {
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const acceptedSecondRun = Promise.withResolvers();
+  const messages = [];
+  const secondRunTickets = [];
+  let thread = chatThread();
+  let startCount = 0;
+  let retryCount = 0;
+  let selectionCount = 0;
+  let failTerminalRefresh = false;
+  let secondRunPending = false;
+  let resumeConfirmed = false;
+  let attachmentReadsDuringPendingMutation = 0;
+  const appendCommittedUser = (ticket, hashDigit) => {
+    const previousHash = messages.at(-1)?.messageHash ?? null;
+    const messageHash = hashDigit.repeat(64);
+    messages.push(chatMessage(messages.length + 1, "user", ticket.content, {
+      previousHash,
+      messageHash,
+      attachment: Object.freeze({
+        attachmentId: ticket.attachment.attachmentId,
+        mediaType: ticket.attachment.mediaType,
+        byteLength: ticket.attachment.byteLength,
+        width: ticket.attachment.width,
+        height: ticket.attachment.height,
+        sha256: String(Number(hashDigit) + 2).repeat(64),
+      }),
+    }));
+    thread = chatThread({
+      revision: messages.length,
+      ledgerHash: messageHash,
+      messageCount: messages.length,
+      ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      currentGenerationId: ticket.generationId,
+    });
+  };
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (failTerminalRefresh) {
+        failTerminalRefresh = false;
+        throw new DirectChatTransportError("terminal refresh unavailable", {
+          code: "request_failed",
+          status: 503,
+          retryable: false,
+        });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment }) {
+      if (!resumeConfirmed) {
+        await acceptedSecondRun.promise;
+        if (secondRunPending) attachmentReadsDuringPendingMutation += 1;
+        throw new DirectChatTransportError("cosmetic preview authentication expired", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      return { bytes, descriptor: attachment };
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: `generation_race_${startCount + 1}_xxxxxxxxxxxxx`,
+        idempotencyKey: `run_race_${startCount + 1}_xxxxxxxxxxxxxxxxx`,
+      });
+    },
+    async startRun(ticket) {
+      startCount += 1;
+      appendCommittedUser(ticket, String(startCount));
+      if (startCount === 1) {
+        thread = Object.freeze({ ...thread, currentGenerationId: null });
+        failTerminalRefresh = true;
+        return {
+          request: ticket,
+          generation: chatGeneration({
+            generationId: ticket.generationId,
+            status: "failed",
+            terminal: true,
+          }),
+        };
+      }
+      secondRunTickets.push(ticket);
+      secondRunPending = true;
+      acceptedSecondRun.resolve();
+      throw new DirectChatTransportError("accepted run response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryRun(ticket) {
+      secondRunTickets.push(ticket);
+      retryCount += 1;
+      if (retryCount === 1) {
+        throw new DirectChatTransportError("session expired during exact confirmation", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      secondRunPending = false;
+      resumeConfirmed = true;
+      thread = Object.freeze({ ...thread, currentGenerationId: null });
+      return {
+        request: ticket,
+        generation: chatGeneration({
+          generationId: ticket.generationId,
+          status: "failed",
+          terminal: true,
+        }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "replacement-race-csrf-token" }),
+    async canonicalizeImage() {
+      selectionCount += 1;
+      return Object.freeze({
+        attachmentId: `image_race_${selectionCount}_xxxxxxxxxxxxxx`,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 2,
+        height: 2,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: (() => { let next = 0; return () => `blob:race-${next += 1}`; })(),
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  for (const [index, text] of ["Leave one local preview", "Confirm this exact second image"].entries()) {
+    imageInput.files = [{ name: `race-${index}.png` }];
+    imageInput.dispatch("change");
+    await new Promise((resolve) => setImmediate(resolve));
+    messageInput.value = text;
+    await browser.app.submitMessage({ preventDefault() {} });
+  }
+
+  assert.equal(startCount, 2);
+  assert.equal(retryCount, 1);
+  assert.equal(attachmentReadsDuringPendingMutation, 0, "pre-send reconciliation never starts cosmetic private reads");
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(retryCount, 1, "same-account login does not auto-confirm the accepted mutation");
+  await browser.app.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(retryCount, 2);
+  assert.equal(secondRunTickets.length, 3);
+  assert.equal(secondRunTickets.every((ticket) => ticket === secondRunTickets[0]), true, "Resume reuses the identical accepted ticket");
+  assert.equal(attachmentReadsDuringPendingMutation, 0);
+  assert.match(browser.document.getElementById("messages").textContent, /Leave one local preview[\s\S]*Confirm this exact second image/u);
+});
+
+test("an already-pending preview 401 is fenced before an accepted lost-response mutation", async () => {
+  const descriptor = Object.freeze({
+    attachmentId: "image_pending_race_xxxxxxxxxx",
+    mediaType: "image/png",
+    byteLength: 4,
+    width: 2,
+    height: 2,
+    sha256: "9".repeat(64),
+  });
+  const hashes = [CHAT_HASH_A, CHAT_HASH_B, "c".repeat(64)];
+  const messages = [
+    chatMessage(1, "user", "Earlier image", { messageHash: hashes[0], attachment: descriptor }),
+    chatMessage(2, "assistant", "Earlier answer", { previousHash: hashes[0], messageHash: hashes[1] }),
+  ];
+  let thread = chatThread({
+    revision: 2,
+    ledgerHash: hashes[1],
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const previewStarted = Promise.withResolvers();
+  const releaseLatePreview = Promise.withResolvers();
+  const exactTickets = [];
+  let previewSignal = null;
+  let previewAuthReturns = 0;
+  let retryCount = 0;
+  let resumeConfirmed = false;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment, signal }) {
+      if (resumeConfirmed) return { bytes: new Uint8Array([1, 2, 3, 4]), descriptor: attachment };
+      previewSignal = signal;
+      previewStarted.resolve();
+      await releaseLatePreview.promise;
+      previewAuthReturns += 1;
+      throw new DirectChatTransportError("late private preview authentication rejection", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: "generation_pending_preview_race_x",
+        idempotencyKey: "run_pending_preview_race_xxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      exactTickets.push(ticket);
+      messages.push(chatMessage(3, "user", ticket.content, {
+        previousHash: hashes[1],
+        messageHash: hashes[2],
+      }));
+      thread = chatThread({
+        revision: 3,
+        ledgerHash: hashes[2],
+        messageCount: 3,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+        currentGenerationId: ticket.generationId,
+      });
+      releaseLatePreview.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      throw new DirectChatTransportError("accepted response lost after preview fence", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryRun(ticket) {
+      exactTickets.push(ticket);
+      retryCount += 1;
+      if (retryCount === 1) {
+        throw new DirectChatTransportError("exact confirmation needs fresh authentication", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      resumeConfirmed = true;
+      thread = Object.freeze({ ...thread, currentGenerationId: null });
+      return {
+        request: ticket,
+        generation: chatGeneration({
+          generationId: ticket.generationId,
+          status: "failed",
+          terminal: true,
+        }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "pending-preview-race-csrf" }),
+    createObjectUrl: (() => { let next = 0; return () => `blob:pending-preview-${next += 1}`; })(),
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await previewStarted.promise;
+  const draft = "Keep this accepted exact mutation";
+  browser.document.getElementById("message-input").value = draft;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(previewSignal.aborted, true, "submit fences the already-active cosmetic fetch before mutation I/O");
+  assert.equal(previewAuthReturns, 1, "the non-cooperative preview still returned its late 401");
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("message-input").value, draft);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(retryCount, 1);
+  await browser.app.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(retryCount, 2);
+  assert.equal(exactTickets.length, 3);
+  assert.equal(exactTickets.every((ticket) => ticket === exactTickets[0]), true, "the late preview 401 cannot replace the exact mutation ticket");
+  assert.match(browser.document.getElementById("messages").textContent, /Earlier image[\s\S]*Keep this accepted exact mutation/u);
+});
+
+test("a preview fenced by an interrupted send reloads successfully on a later tap", async () => {
+  const observer = intersectionHarness();
+  const descriptor = Object.freeze({
+    attachmentId: "image_fenced_reload_xxxxxxxxx",
+    mediaType: "image/png",
+    byteLength: 4,
+    width: 2,
+    height: 2,
+    sha256: "8".repeat(64),
+  });
+  const messages = [
+    chatMessage(1, "user", "Reload this image", { messageHash: CHAT_HASH_A, attachment: descriptor }),
+    chatMessage(2, "assistant", "Reload answer", { previousHash: CHAT_HASH_A, messageHash: CHAT_HASH_B }),
+  ];
+  const thread = chatThread({
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const firstFetch = Promise.withResolvers();
+  const firstFetchStarted = Promise.withResolvers();
+  let firstSignal = null;
+  let reads = 0;
+  let failSnapshot = false;
+  let createdUrls = 0;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (failSnapshot) {
+        throw new DirectChatTransportError("send snapshot unavailable", {
+          code: "request_failed",
+          status: 503,
+          retryable: false,
+        });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment, signal }) {
+      reads += 1;
+      if (reads === 1) {
+        firstSignal = signal;
+        firstFetchStarted.resolve();
+        return await firstFetch.promise;
+      }
+      return { bytes: new Uint8Array([1, 2, 3, 4]), descriptor: attachment };
+    },
+  });
+  const browser = harness({
+    chat,
+    IntersectionObserver: observer.IntersectionObserver,
+    createObjectUrl() { createdUrls += 1; return `blob:fenced-reload-${createdUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  const article = [...observer.latest().targets][0];
+  const [image, status] = article.children;
+  observer.latest().enter(article);
+  await firstFetchStarted.promise;
+  failSnapshot = true;
+  browser.document.getElementById("message-input").value = "This send will stop before dispatch";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(firstSignal.aborted, true);
+  firstFetch.resolve({ bytes: new Uint8Array([1, 2, 3, 4]), descriptor });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(image.dataset.previewState, "deferred");
+  assert.equal(status.disabled, false);
+  assert.equal(createdUrls, 0, "the stale non-cooperative fetch cannot create a URL");
+
+  status.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 2);
+  assert.equal(createdUrls, 1);
+  assert.equal(image.dataset.previewState, "ready");
+  assert.equal(image.src, "blob:fenced-reload-1");
+});
+
+test("tap-only previews survive successful pre-send reconciliation followed by preparation failure", async () => {
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const descriptor = Object.freeze({
+    attachmentId: "image_tap_only_xxxxxxxxxxxxx",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 2,
+    height: 2,
+    sha256: "7".repeat(64),
+  });
+  const messages = [];
+  let thread = chatThread();
+  let preparations = 0;
+  let failTerminalRefresh = false;
+  let attachmentReads = 0;
+  let nextUrl = 0;
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (failTerminalRefresh) {
+        failTerminalRefresh = false;
+        throw new DirectChatTransportError("terminal snapshot unavailable", {
+          code: "request_failed",
+          status: 503,
+          retryable: false,
+        });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment }) {
+      attachmentReads += 1;
+      return { bytes, descriptor: attachment };
+    },
+    prepareRun(request) {
+      preparations += 1;
+      if (preparations === 2) throw new TypeError("second run preparation failed");
+      return Object.freeze({
+        ...request,
+        generationId: "generation_tap_only_xxxxxxxxx",
+        idempotencyKey: "run_tap_only_xxxxxxxxxxxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages.push(chatMessage(1, "user", ticket.content, {
+        messageHash: CHAT_HASH_A,
+        attachment: descriptor,
+      }));
+      thread = chatThread({
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+      });
+      failTerminalRefresh = true;
+      return {
+        request: ticket,
+        generation: chatGeneration({
+          generationId: ticket.generationId,
+          status: "failed",
+          terminal: true,
+        }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: descriptor.attachmentId,
+        mediaType: descriptor.mediaType,
+        byteLength: bytes.byteLength,
+        width: descriptor.width,
+        height: descriptor.height,
+        bytes,
+        previewBlob: new Blob([bytes], { type: descriptor.mediaType }),
+      });
+    },
+    createObjectUrl() { nextUrl += 1; return `blob:tap-only-${nextUrl}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "tap-only.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = "First failed image";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  messageInput.value = "Preparation stops after reconciliation";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(preparations, 2);
+  assert.equal(attachmentReads, 0, "pending-send reconciliation does not auto-fetch its history image");
+  const article = browser.document.getElementById("messages").children[0];
+  const [image, status] = article.children;
+  assert.equal(image.dataset.previewState, "deferred");
+  assert.equal(status.disabled, false);
+  status.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(attachmentReads, 1);
+  assert.equal(image.dataset.previewState, "ready");
+  assert.equal(image.src, "blob:tap-only-3");
+});
+
+test("the verified Blob LRU is bounded and purged on page disposal, logout, and account change", async () => {
+  const observer = intersectionHarness();
+  const threadBId = "chat_0002_yyyyyyyyyyyyyyyyyyyyyyyy";
+  const descriptors = new Map([
+    [CHAT_THREAD_ID, {
+      attachmentId: "image_cache_a_xxxxxxxxxxxx", mediaType: "image/png", byteLength: 4,
+      width: 40, height: 40, sha256: "a".repeat(64),
+    }],
+    [threadBId, {
+      attachmentId: "image_cache_b_xxxxxxxxxxxx", mediaType: "image/png", byteLength: 4,
+      width: 40, height: 40, sha256: "b".repeat(64),
+    }],
+  ]);
+  const threads = new Map([...descriptors].map(([threadId, descriptor], index) => {
+    const firstHash = index === 0 ? CHAT_HASH_A : "c".repeat(64);
+    const finalHash = index === 0 ? CHAT_HASH_B : "d".repeat(64);
+    const messages = [
+      chatMessage(1, "user", `Image ${index}`, {
+        threadId,
+        messageId: `message_cache_${index}_1_xxxxxxxxxx`,
+        messageHash: firstHash,
+        attachment: descriptor,
+      }),
+      chatMessage(2, "assistant", `Answer ${index}`, {
+        threadId,
+        messageId: `message_cache_${index}_2_xxxxxxxxxx`,
+        previousHash: firstHash,
+        messageHash: finalHash,
+      }),
+    ];
+    return [threadId, {
+      thread: chatThread({
+        threadId,
+        title: `Cache ${index}`,
+        revision: 2,
+        ledgerHash: finalHash,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      }),
+      messages,
+    }];
+  }));
+  const reads = new Map();
+  const revoked = [];
+  let nextUrl = 0;
+  const chat = baseChat({
+    async listThreads() { return { threads: [...threads.values()].map((value) => value.thread) }; },
+    async getThread(threadId) { return { thread: threads.get(threadId).thread }; },
+    async listMessages({ threadId, afterRevision, limit }) {
+      return { messages: threads.get(threadId).messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ threadId, attachment }) {
+      reads.set(threadId, (reads.get(threadId) ?? 0) + 1);
+      return { bytes: new Uint8Array([1, 2, 3, 4]), descriptor: attachment };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-b", csrfToken: "csrf-token-value-long-enough" }),
+    IntersectionObserver: observer.IntersectionObserver,
+    attachmentMemoryLimitBytes: 5,
+    createObjectUrl() { return `blob:lru-${nextUrl += 1}`; },
+    revokeObjectUrl(url) { revoked.push(url); },
+  });
+  const loadVisible = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    const target = [...observer.latest().targets][0];
+    assert.ok(target);
+    observer.latest().enter(target);
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  await browser.app.initialize();
+  await loadVisible();
+  await browser.app.openThread(threadBId, { mode: "chat" });
+  await loadVisible();
+  await browser.app.openThread(CHAT_THREAD_ID, { mode: "chat" });
+  await loadVisible();
+  assert.deepEqual(Object.fromEntries(reads), { [CHAT_THREAD_ID]: 2, [threadBId]: 1 }, "a five-byte cap retains only one four-byte Blob");
+
+  const revokedBeforeBfcache = revoked.length;
+  const bfcacheImage = browser.document.getElementById("messages").children[0].children[0];
+  browser.window.dispatch("pagehide", { persisted: true });
+  assert.equal(revoked.length, revokedBeforeBfcache, "BFCache suspension keeps the live preview usable for pageshow restoration");
+  assert.equal(bfcacheImage.dataset.previewState, "ready");
+
+  const revokedBeforePagehide = revoked.length;
+  browser.window.dispatch("pagehide", { persisted: false });
+  assert.ok(revoked.length > revokedBeforePagehide, "page disposal revokes rendered object URLs");
+  await browser.app.openThread(CHAT_THREAD_ID, { mode: "chat" });
+  await loadVisible();
+  assert.equal(reads.get(CHAT_THREAD_ID), 3, "page disposal purges the per-tab Blob cache");
+
+  await browser.app.logout();
+  browser.document.getElementById("username").value = "account-b";
+  browser.document.getElementById("password").value = "new account password";
+  await browser.app.login({ preventDefault() {} });
+  await loadVisible();
+  assert.equal(reads.get(CHAT_THREAD_ID), 4, "a new authenticated account epoch cannot reuse prior private Blobs");
+});
+
+test("leaving a thread aborts its visible attachment fetch before stale bytes can create an object URL", async () => {
+  const observer = intersectionHarness();
+  const descriptor = {
+    attachmentId: "image_abort_owner_xxxxxxxxx", mediaType: "image/png", byteLength: 4,
+    width: 40, height: 40, sha256: "f".repeat(64),
+  };
+  const messages = [
+    chatMessage(1, "user", "Abort this preview", { attachment: descriptor }),
+    chatMessage(2, "assistant", "Keep ownership strict"),
+  ];
+  const thread = chatThread({ revision: 2, ledgerHash: CHAT_HASH_B, messageCount: 2, ledgerBytes: 40 });
+  const fetchStarted = Promise.withResolvers();
+  const fetchAborted = Promise.withResolvers();
+  let createdUrls = 0;
+  const browser = harness({
+    chat: baseChat({
+      async listThreads() { return { threads: [thread] }; },
+      async getThread() { return { thread }; },
+      async listMessages({ afterRevision, limit }) {
+        return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+      },
+      async getAttachment({ signal }) {
+        fetchStarted.resolve();
+        return await new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            fetchAborted.resolve();
+            reject(new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        });
+      },
+    }),
+    IntersectionObserver: observer.IntersectionObserver,
+    createObjectUrl() { createdUrls += 1; return `blob:must-not-exist-${createdUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  observer.latest().enter([...observer.latest().targets][0]);
+  await fetchStarted.promise;
+  browser.document.getElementById("new-thread").dispatch("click");
+  await fetchAborted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(createdUrls, 0);
+  assert.equal(browser.document.getElementById("messages").children.length, 0);
+});
+
 test("completed chat navigation ignores a stalled and then out-of-order sidebar refresh", async () => {
   const messages = [
     chatMessage(1, "user", "Existing question"),
@@ -1665,6 +2670,7 @@ test("expired authentication restores the detached image first and never auto-re
   const draft = "  Preserve this private image prompt exactly.  ";
   let expired = false;
   let starts = 0;
+  let nextUrl = 0;
   const revoked = [];
   const chat = baseChat({
     async capabilities() {
@@ -1702,7 +2708,7 @@ test("expired authentication restores the detached image first and never auto-re
         previewBlob: new Blob([bytes], { type: "image/png" }),
       });
     },
-    createObjectUrl() { return "blob:auth-recovery-image"; },
+    createObjectUrl() { return `blob:auth-recovery-image-${nextUrl += 1}`; },
     revokeObjectUrl(value) { revoked.push(value); },
   });
   await browser.app.initialize();
@@ -1720,7 +2726,7 @@ test("expired authentication restores the detached image first and never auto-re
   assert.equal(browser.document.getElementById("app-view").hidden, true);
   assert.equal(messageInput.value, draft);
   assert.equal(browser.document.getElementById("image-preview").hidden, false);
-  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:auth-recovery-image");
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:auth-recovery-image-1");
   assert.equal(starts, 0);
   assert.deepEqual(browser.document.getElementById("workspace").dataset, {
     mode: "chat",
@@ -1745,7 +2751,7 @@ test("expired authentication restores the detached image first and never auto-re
   assert.equal(starts, 1);
   assert.equal(messageInput.value, "");
   assert.equal(browser.document.getElementById("image-preview").hidden, true);
-  assert.deepEqual(revoked, ["blob:auth-recovery-image"]);
+  assert.deepEqual(revoked, ["blob:auth-recovery-image-2", "blob:auth-recovery-image-1"]);
 });
 
 test("same-account capability exhaustion keeps the recovered image visible, fenced, and removable", async () => {
@@ -2287,19 +3293,30 @@ test("same-account login hydration expiry preserves an ambiguous exact-send work
 test("a committed run with a lost response survives an opaque proxy 403 and Resume renders the same existing thread", async () => {
   const thread = chatThread();
   const draft = "Confirm the exact existing-thread turn";
+  let authoritativeThread = thread;
+  let messages = [];
   let runPreparations = 0;
   let runCommits = 0;
   let runRetries = 0;
   const chat = baseChat({
-    async listThreads() { return { threads: [thread] }; },
-    async getThread() { return { thread }; },
-    async listMessages() { return { messages: [] }; },
+    async listThreads() { return { threads: [authoritativeThread] }; },
+    async getThread() { return { thread: authoritativeThread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
     prepareRun(request) {
       runPreparations += 1;
       return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_csrf_ambiguous_xxxx" });
     },
-    async startRun() {
+    async startRun(ticket) {
       runCommits += 1;
+      messages = [chatMessage(1, "user", ticket.content)];
+      authoritativeThread = chatThread({
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+      });
       throw new DirectChatTransportError("accepted response lost", {
         code: "request_timeout",
         status: 504,
@@ -3204,5 +4221,8 @@ test("browser integration has no legacy direct endpoint or browser-owned chat pe
   assert.match(source, /DirectChatBrowserClient/u);
   assert.match(source, /CloudSessionClient/u);
   assert.doesNotMatch(source, /DirectLocalLlmClient|\/v1\/chat\/completions/u);
-  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/u);
+  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB|CacheStorage|caches\.open/u);
+  const releaseReload = /function reloadForActiveUpdate\(\) \{([\s\S]*?)\n  \}/u.exec(source)?.[1] ?? "";
+  assert.match(releaseReload, /purgeAttachmentMemory\(\)/u, "release navigation purges private in-memory attachment state");
+  assert.match(source, /addEventListener\?\.\("pagehide", \(event\) => \{[\s\S]*?event\?\.persisted !== true[\s\S]*?purgeAttachmentMemory\(\)/u);
 });

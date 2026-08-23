@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 
 import {
   ConflictError,
@@ -12,7 +13,7 @@ import {
   NotFoundError,
   ValidationError
 } from '../src/index.js';
-import { canonicalJson } from '../src/validation.js';
+import { canonicalJson, digestSecret } from '../src/validation.js';
 import { createTestStore, provisionAccount } from './helpers.js';
 
 const SESSION_TOKEN = 'session-token-with-more-than-thirty-two-random-characters-0001';
@@ -25,6 +26,69 @@ function queryScalar(databasePath, sql, ...parameters) {
   } finally {
     database.close();
   }
+}
+
+function sessionInput(accountSuffix, label, overrides = {}) {
+  return {
+    accountId: `account-${accountSuffix}`,
+    sessionToken: `session-${accountSuffix}-${label}-${'s'.repeat(40)}`,
+    csrfToken: `csrf-${accountSuffix}-${label}-${'c'.repeat(40)}`,
+    expiresAt: '2099-01-01T00:00:00.000Z',
+    idempotencyKey: `browser-session-create-${accountSuffix}-${label}`,
+    ...overrides
+  };
+}
+
+function runConcurrentSessionCreate({ databasePath, input, clock, barrier }) {
+  const moduleUrl = new URL('../src/index.js', import.meta.url).href;
+  const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      let store;
+      try {
+        const { CloudIndexStore } = await import(workerData.moduleUrl);
+        store = new CloudIndexStore({
+          databasePath: workerData.databasePath,
+          clock: () => new Date(workerData.clock)
+        });
+        Atomics.add(workerData.barrier, 0, 1);
+        Atomics.notify(workerData.barrier, 0);
+        Atomics.wait(workerData.barrier, 1, 0);
+        const result = store.createBrowserSession(workerData.input);
+        parentPort.postMessage({ ok: true, result });
+      } catch (error) {
+        parentPort.postMessage({
+          ok: false,
+          error: { name: error?.name, message: error?.message, code: error?.code }
+        });
+      } finally {
+        store?.close();
+      }
+    })();
+  `;
+  const worker = new Worker(source, {
+    eval: true,
+    workerData: {
+      moduleUrl,
+      databasePath,
+      input,
+      clock,
+      barrier: new Int32Array(barrier)
+    }
+  });
+  return new Promise((resolve, reject) => {
+    worker.once('message', (message) => {
+      if (message.ok) {
+        resolve(message.result);
+        return;
+      }
+      reject(Object.assign(new Error(message.error.message), message.error));
+    });
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`Session admission worker exited with status ${code}.`));
+    });
+  });
 }
 
 test('provisions accounts idempotently and binds external identity uniquely', (t) => {
@@ -461,7 +525,7 @@ test('all persisted digests reject uppercase and non-hex values at the SQLite bo
   );
 });
 
-test('retention bounds receipts and active browser sessions per account', (t) => {
+test('retention bounds idempotency receipts per account', (t) => {
   const { databasePath, store } = createTestStore(t);
   provisionAccount(store, 'bounded');
   store.registerThread({
@@ -485,26 +549,290 @@ test('retention bounds receipts and active browser sessions per account', (t) =>
     )),
     MAX_IDEMPOTENCY_RECEIPTS_PER_ACCOUNT
   );
+});
+
+test('browser-session admission below the cap does not evict an existing session', (t) => {
+  const { databasePath, store } = createTestStore(t);
+  provisionAccount(store, 'below-cap');
+  const first = sessionInput('below-cap', 'first');
+  const second = sessionInput('below-cap', 'second');
+  const admitted = sessionInput('below-cap', 'admitted');
+  store.createBrowserSession(first);
+  store.createBrowserSession(second);
+
+  store.createBrowserSession(admitted);
+
+  assert.ok(store.authenticateBrowserSession({ sessionToken: first.sessionToken }));
+  assert.ok(store.authenticateBrowserSession({ sessionToken: second.sessionToken }));
+  assert.ok(store.authenticateBrowserSession({ sessionToken: admitted.sessionToken }));
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-below-cap'
+    )),
+    3
+  );
+});
+
+test('browser-session admission purges expired sessions before deciding whether to evict', (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'expiry-admission');
+  const expired = sessionInput('expiry-admission', 'expires-first', {
+    expiresAt: '2026-08-20T00:01:00.000Z'
+  });
+  store.createBrowserSession(expired);
+  const retained = [];
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT - 1; index += 1) {
+    const input = sessionInput('expiry-admission', `retained-${String(index).padStart(4, '0')}`);
+    retained.push(input);
+    store.createBrowserSession(input);
+  }
+  currentTime = Date.parse('2026-08-20T00:02:00.000Z');
+
+  store.createBrowserSession(sessionInput('expiry-admission', 'replacement'));
+
+  assert.equal(store.authenticateBrowserSession({ sessionToken: expired.sessionToken }), null);
+  for (const input of retained) {
+    assert.ok(store.authenticateBrowserSession({ sessionToken: input.sessionToken }));
+  }
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-expiry-admission'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+});
+
+test('browser-session admission at the cap evicts exactly the oldest issued session', (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'at-cap');
+  const sessions = [];
 
   for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT; index += 1) {
-    store.createBrowserSession({
-      accountId: 'account-bounded',
-      sessionToken: `bounded-session-${String(index).padStart(4, '0')}-${'s'.repeat(32)}`,
-      csrfToken: `bounded-csrf-${String(index).padStart(4, '0')}-${'c'.repeat(32)}`,
-      expiresAt: '2099-01-01T00:00:00.000Z',
-      idempotencyKey: `bounded-session-create-${String(index).padStart(4, '0')}`
-    });
+    const input = sessionInput('at-cap', String(index).padStart(4, '0'));
+    sessions.push(input);
+    store.createBrowserSession(input);
+    currentTime += 1_000;
   }
+  const admitted = sessionInput('at-cap', 'replacement');
+
+  const created = store.createBrowserSession(admitted);
+  assert.equal(created.accountId, 'account-at-cap');
+  assert.deepEqual(store.createBrowserSession(admitted), created);
+
+  assert.equal(store.authenticateBrowserSession({ sessionToken: sessions[0].sessionToken }), null);
+  assert.ok(store.authenticateBrowserSession({ sessionToken: sessions[1].sessionToken }));
+  assert.ok(store.authenticateBrowserSession({ sessionToken: admitted.sessionToken }));
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-at-cap'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+});
+
+test('browser-session admission at the cap cannot evict and rebind an existing token', (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'rebind');
+  const sessions = [];
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT; index += 1) {
+    const input = sessionInput('rebind', String(index).padStart(4, '0'));
+    sessions.push(input);
+    store.createBrowserSession(input);
+    currentTime += 1_000;
+  }
+  const oldest = sessions[0];
+  const replacementCsrf = `csrf-rebind-replacement-${'r'.repeat(40)}`;
+
   assert.throws(
-    () => store.createBrowserSession({
-      accountId: 'account-bounded',
-      sessionToken: `bounded-session-over-limit-${'s'.repeat(32)}`,
-      csrfToken: `bounded-csrf-over-limit-${'c'.repeat(32)}`,
-      expiresAt: '2099-01-01T00:00:00.000Z',
-      idempotencyKey: 'bounded-session-create-over-limit'
-    }),
+    () => store.createBrowserSession(sessionInput('rebind', 'replacement', {
+      sessionToken: oldest.sessionToken,
+      csrfToken: replacementCsrf,
+      idempotencyKey: 'browser-session-create-rebind-existing-token'
+    })),
     ConflictError
   );
+
+  assert.ok(store.authenticateBrowserMutation({
+    sessionToken: oldest.sessionToken,
+    csrfToken: oldest.csrfToken
+  }));
+  assert.equal(store.authenticateBrowserMutation({
+    sessionToken: oldest.sessionToken,
+    csrfToken: replacementCsrf
+  }), null);
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-rebind'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+});
+
+test('browser-session eviction is isolated to the account being admitted', (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'isolated-full');
+  provisionAccount(store, 'isolated-other');
+  const other = sessionInput('isolated-other', 'must-remain');
+  store.createBrowserSession(other);
+  currentTime += 1_000;
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT; index += 1) {
+    store.createBrowserSession(sessionInput('isolated-full', String(index).padStart(4, '0')));
+    currentTime += 1_000;
+  }
+
+  store.createBrowserSession(sessionInput('isolated-full', 'replacement'));
+
+  assert.ok(store.authenticateBrowserSession({ sessionToken: other.sessionToken }));
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-isolated-other'
+    )),
+    1
+  );
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-isolated-full'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+});
+
+test('browser-session eviction breaks equal issuance-time ties by session digest', (t) => {
+  const { store } = createTestStore(t, {
+    clock: () => new Date('2026-08-20T00:00:00.000Z')
+  });
+  provisionAccount(store, 'tie');
+  const sessions = [];
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT; index += 1) {
+    const input = sessionInput('tie', String(index).padStart(4, '0'));
+    sessions.push(input);
+    store.createBrowserSession(input);
+  }
+  const expectedEviction = sessions.toSorted((first, second) => (
+    digestSecret(first.sessionToken, 'sessionToken')
+      .localeCompare(digestSecret(second.sessionToken, 'sessionToken'))
+  ))[0];
+
+  store.createBrowserSession(sessionInput('tie', 'replacement'));
+
+  for (const input of sessions) {
+    const authenticated = store.authenticateBrowserSession({ sessionToken: input.sessionToken });
+    assert.equal(authenticated === null, input === expectedEviction);
+  }
+});
+
+test('conflicting browser-session admission preserves capacity state and does not reserve its receipt', (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'rollback-full');
+  provisionAccount(store, 'rollback-other');
+  const sessions = [];
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT; index += 1) {
+    const input = sessionInput('rollback-full', String(index).padStart(4, '0'));
+    sessions.push(input);
+    store.createBrowserSession(input);
+    currentTime += 1_000;
+  }
+  const collision = sessionInput('rollback-other', 'collision');
+  store.createBrowserSession(collision);
+  const failedIdempotencyKey = 'browser-session-create-rollback-after-eviction';
+
+  assert.throws(
+    () => store.createBrowserSession(sessionInput('rollback-full', 'collision-attempt', {
+      sessionToken: collision.sessionToken,
+      idempotencyKey: failedIdempotencyKey
+    })),
+    ConflictError
+  );
+
+  assert.ok(store.authenticateBrowserSession({ sessionToken: sessions[0].sessionToken }));
+  assert.ok(store.authenticateBrowserSession({ sessionToken: collision.sessionToken }));
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-rollback-full'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+  assert.ok(store.createBrowserSession(sessionInput('rollback-full', 'retry', {
+    idempotencyKey: failedIdempotencyKey
+  })));
+});
+
+test('concurrent and sequential browser-session admissions remain bounded', async (t) => {
+  let currentTime = Date.parse('2026-08-20T00:00:00.000Z');
+  const clock = () => new Date(currentTime);
+  const { databasePath, store } = createTestStore(t, { clock });
+  provisionAccount(store, 'serialized');
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT - 1; index += 1) {
+    store.createBrowserSession(sessionInput('serialized', `initial-${String(index).padStart(4, '0')}`));
+    currentTime += 1_000;
+  }
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const barrierView = new Int32Array(barrier);
+  const concurrentInputs = [
+    sessionInput('serialized', 'concurrent-a'),
+    sessionInput('serialized', 'concurrent-b')
+  ];
+  const admissions = concurrentInputs.map((input) => runConcurrentSessionCreate({
+    databasePath,
+    input,
+    clock: '2026-08-21T00:00:00.000Z',
+    barrier
+  }));
+  while (Atomics.load(barrierView, 0) !== concurrentInputs.length) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  Atomics.store(barrierView, 1, 1);
+  Atomics.notify(barrierView, 1, concurrentInputs.length);
+  await Promise.all(admissions);
+
+  assert.ok(store.authenticateBrowserSession({ sessionToken: concurrentInputs[0].sessionToken }));
+  assert.ok(store.authenticateBrowserSession({ sessionToken: concurrentInputs[1].sessionToken }));
+  assert.equal(
+    Number(queryScalar(
+      databasePath,
+      'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+      'account-serialized'
+    )),
+    MAX_BROWSER_SESSIONS_PER_ACCOUNT
+  );
+
+  currentTime = Date.parse('2026-08-22T00:00:00.000Z');
+  for (let index = 0; index < MAX_BROWSER_SESSIONS_PER_ACCOUNT + 5; index += 1) {
+    store.createBrowserSession(sessionInput('serialized', `sequential-${String(index).padStart(4, '0')}`));
+    currentTime += 1_000;
+    assert.equal(
+      Number(queryScalar(
+        databasePath,
+        'SELECT count(*) AS value FROM browser_sessions WHERE account_id = ?',
+        'account-serialized'
+      )),
+      MAX_BROWSER_SESSIONS_PER_ACCOUNT
+    );
+  }
 });
 
 test('maintenance purges expired sessions and receipts', (t) => {

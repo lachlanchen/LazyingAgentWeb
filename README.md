@@ -102,6 +102,20 @@ Chat, Agent, SSE, artifact, and upload traffic always bypasses it. Production
 must stage the entire immutable namespace before atomically switching the root
 HTML and stable worker response.
 
+Authenticated history and original attachment bytes remain authoritative in
+the cloud SQLite stores. The PWA may keep only a disposable, bounded per-tab
+Blob LRU for viewport-near attachment previews; it is never written to browser
+storage and is purged across authentication, account, and release boundaries.
+Historical rendered previews have a separate four-image / 64 MiB estimated
+decoded-pixel limit. Eviction revokes the object URL and leaves a tap-to-reload
+placeholder, so scrolling through a long image thread cannot retain every
+decoded surface. The one staged or just-sent composer image is transient rather
+than part of this history cache and is revoked at its existing send, view, and
+authentication boundaries.
+The server similarly caches only successful integrity-audit state, bounded by
+thread and invalidated by every local write or SQLite `data_version` change.
+It does not duplicate or relax validation of private message data.
+
 ## Public package entry point
 
 The package root exports the implemented server and storage primitives plus the
@@ -262,6 +276,12 @@ Raw browser session and CSRF tokens are never stored; `CloudIndexStore` retains
 only SHA-256 digests. An HTTP adapter derives every `accountId` from the verified
 browser session. Browser payloads and public JSON/SSE projections never choose
 or expose that owner identifier.
+
+Browser-session admission first removes expired rows. At the per-account cap,
+a successful new login atomically rotates only that account's oldest-issued
+session, with a deterministic digest tie-break; token collisions fail before
+eviction. This keeps sign-in available without deleting another account's
+session or temporarily exceeding the cap.
 
 Idempotency rows are bounded closed receipts rather than arbitrary response
 caches. Direct Chat starts a user message and its pending generation in one

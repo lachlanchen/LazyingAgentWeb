@@ -98,6 +98,43 @@ message ledger contains only the attachment MIME, size, dimensions, opaque ID,
 and SHA-256 descriptor bound into its hash. The split makes it difficult for a future
 presentation migration to silently acquire Direct Chat or Agent authority.
 
+### Private data and cache placement
+
+The browser does not persist ordinary threads, messages, generations, image
+previews, session tokens, or retry state in Cache Storage, localStorage,
+sessionStorage, or IndexedDB. Authenticated history remains authoritative in
+the cloud SQLite stores. The selected composer image and rendered attachment
+URLs are page-memory state and are revoked at view and authentication
+boundaries. Historical attachments are fetched only as their messages approach
+the viewport, with bounded concurrency and a 16 MiB per-tab Blob LRU.
+Historical object URLs and decoded surfaces have their own four-preview / 64
+MiB estimated decoded-pixel LRU. Evicting either tier revokes the affected URL
+and restores a tap-to-reload placeholder; the compressed-Blob bound therefore
+cannot be bypassed by a historical image element retaining an evicted Blob.
+Both history tiers are disposable, account-scoped by lifecycle rather than
+durable identity, and are purged on logout, authentication loss, account
+transition, or release activation. A single staged or just-sent composer image
+is separate transient page memory and is revoked at its send, view, and
+authentication boundaries. The encrypted, expiring, one-shot confirmed-update
+composer handoff described below is the only narrow IndexedDB exception.
+
+The server may reuse a completed per-thread integrity audit from a bounded
+in-process LRU. Entries are keyed by account and thread, guarded by SQLite's
+`data_version`, and cleared before and after every local write transaction.
+An external connection commit changes that version and invalidates the entire
+store-local audit cache before another result can be reused. Write
+preconditions and postconditions always bypass the cache, and opening a store
+still performs the full database audit. This cache stores only the fact that a
+specific database snapshot passed validation; it is not a second message or
+attachment store.
+
+Remembered browser sessions are independently bounded per account. Admission
+purges expired rows first; when an account is full, the same immediate
+transaction removes exactly its oldest-issued active session and inserts the
+new digest-only session. Existing-token collisions are rejected before any
+eviction, and deterministic selection plus account-qualified deletion prevents
+cross-account rotation.
+
 The attachment migration is an explicit expand/enable boundary. New and
 existing v2 databases remain at v2 while vision is disabled. First enablement
 advances the private Direct Chat database to v3 atomically. A v3-aware service

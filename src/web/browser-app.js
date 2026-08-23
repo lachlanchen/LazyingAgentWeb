@@ -38,6 +38,10 @@ const UPDATE_HANDOFF_DIGEST = /^[a-f0-9]{64}$/u;
 const UPDATE_HANDOFF_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const UPDATE_HANDOFF_ID = /^[a-f0-9]{64}$/u;
 const UPDATE_HANDOFF_KEY = /^[A-Za-z0-9_-]{43}$/u;
+const DEFAULT_ATTACHMENT_MEMORY_LIMIT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
+const ATTACHMENT_RENDERED_PREVIEW_LIMIT = 4;
+const ATTACHMENT_RESTORE_CONCURRENCY = 1;
 const updateHandoffEncoder = new TextEncoder();
 const updateHandoffDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -677,6 +681,8 @@ export function createBrowserApp({
   updateDeferralMs = 60 * 60 * 1_000,
   activationTimeoutMs = 30_000,
   attachmentDecodeTimeoutMs = 15_000,
+  attachmentMemoryLimitBytes = DEFAULT_ATTACHMENT_MEMORY_LIMIT_BYTES,
+  attachmentDecodedMemoryLimitBytes = DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES,
   now = Date.now,
   maxStreamBackoffSteps = 5,
   wait = (milliseconds, signal) => new Promise((resolve, reject) => {
@@ -743,6 +749,14 @@ export function createBrowserApp({
       || attachmentDecodeTimeoutMs > 60_000) {
     throw new TypeError("attachmentDecodeTimeoutMs must be from one millisecond through one minute");
   }
+  if (!Number.isSafeInteger(attachmentMemoryLimitBytes) || attachmentMemoryLimitBytes < 1
+      || attachmentMemoryLimitBytes > 32 * 1024 * 1024) {
+    throw new TypeError("attachmentMemoryLimitBytes must be from one byte through 32 MiB");
+  }
+  if (!Number.isSafeInteger(attachmentDecodedMemoryLimitBytes) || attachmentDecodedMemoryLimitBytes < 1
+      || attachmentDecodedMemoryLimitBytes > 64 * 1024 * 1024) {
+    throw new TypeError("attachmentDecodedMemoryLimitBytes must be from one byte through 64 MiB");
+  }
   if (typeof now !== "function") throw new TypeError("now must be a function");
   if (!Number.isSafeInteger(maxStreamBackoffSteps) || maxStreamBackoffSteps < 0 || maxStreamBackoffSteps > 20) {
     throw new TypeError("maxStreamBackoffSteps must be an integer from 0 through 20");
@@ -783,6 +797,16 @@ export function createBrowserApp({
     imageSelectionEpoch: 0,
     imageRenderEpoch: 0,
     messageImageUrls: new Set(),
+    localMessageImageUrls: new Set(),
+    attachmentBlobCache: new Map(),
+    attachmentBlobCacheBytes: 0,
+    renderedAttachmentPreviews: new Map(),
+    renderedAttachmentPreviewBytes: 0,
+    attachmentRestoreObserver: undefined,
+    attachmentRestoreObserved: new Map(),
+    attachmentRestoreQueue: [],
+    attachmentRestoreActive: 0,
+    attachmentRestoreControllers: new Set(),
     runId: null,
     agentRunStatus: null,
     presentation: null,
@@ -821,6 +845,8 @@ export function createBrowserApp({
     updateCheckAt: Number.NEGATIVE_INFINITY,
     updateFailureAt: Number.NEGATIVE_INFINITY,
     updateCheckInFlight: false,
+    updateCheckPending: false,
+    updateCheckPendingOnlineTransition: false,
   };
 
   function showToast(message) {
@@ -900,6 +926,8 @@ export function createBrowserApp({
     const recoveryUsername = normalizedSessionUsername(state.session.username);
     state.viewEpoch += 1;
     state.streamAbort?.abort();
+    clearConversation();
+    purgeAttachmentBlobCache();
     state.streamAbort = null;
     state.streamKind = null;
     state.session = Object.freeze({ authenticated: false });
@@ -1051,10 +1079,195 @@ export function createBrowserApp({
     if (changed && restoreView && state.session.authenticated) void restoreModeView({ autoOpen: true });
   }
 
-  function clearConversation() {
-    state.imageRenderEpoch += 1;
+  function resetAttachmentRestorations({ deferQueued = false } = {}) {
+    state.attachmentRestoreObserver?.disconnect?.();
+    state.attachmentRestoreObserver = undefined;
+    state.attachmentRestoreObserved.clear();
+    const queued = deferQueued ? [...state.attachmentRestoreQueue] : [];
+    state.attachmentRestoreQueue.length = 0;
+    for (const controller of state.attachmentRestoreControllers) controller.abort();
+    for (const job of queued) deferAttachmentRestorationJob(job);
+  }
+
+  function purgeAttachmentBlobCache() {
+    for (const key of [...state.attachmentBlobCache.keys()]) forgetAttachmentBlob(key);
+  }
+
+  function deferAttachmentRestorationJob(job) {
+    job.image.src = "";
+    job.image.hidden = true;
+    job.image.alt = "Attached image preview not loaded";
+    job.image.dataset.previewState = "deferred";
+    job.status.textContent = "Load attached image preview again";
+    job.status.hidden = false;
+    job.status.disabled = false;
+    job.article.dataset.attachmentState = "deferred";
+    job.started = false;
+  }
+
+  function deferRenderedAttachmentPreview(entry) {
+    deferAttachmentRestorationJob(entry.job);
+  }
+
+  function forgetRenderedAttachmentPreview(key, { defer = true, expectedUrl } = {}) {
+    const entry = state.renderedAttachmentPreviews.get(key);
+    if (entry === undefined || (expectedUrl !== undefined && entry.url !== expectedUrl)) return false;
+    state.renderedAttachmentPreviews.delete(key);
+    state.renderedAttachmentPreviewBytes -= entry.decodedBytes;
+    if (state.messageImageUrls.delete(entry.url)) revokeObjectUrl(entry.url);
+    if (defer) deferRenderedAttachmentPreview(entry);
+    return true;
+  }
+
+  function installRenderedAttachmentPreview(key, { url, image, article, status, job, attachment }) {
+    const decodedBytes = attachment.width * attachment.height * 4;
+    if (!Number.isSafeInteger(decodedBytes) || decodedBytes < 1
+        || decodedBytes > attachmentDecodedMemoryLimitBytes) return false;
+    forgetRenderedAttachmentPreview(key);
+    while (state.renderedAttachmentPreviews.size >= ATTACHMENT_RENDERED_PREVIEW_LIMIT
+        || state.renderedAttachmentPreviewBytes + decodedBytes > attachmentDecodedMemoryLimitBytes) {
+      const oldestKey = state.renderedAttachmentPreviews.keys().next().value;
+      if (oldestKey === undefined) break;
+      forgetRenderedAttachmentPreview(oldestKey);
+    }
+    state.renderedAttachmentPreviews.set(key, {
+      url, image, article, status, job, decodedBytes,
+    });
+    state.renderedAttachmentPreviewBytes += decodedBytes;
+    state.messageImageUrls.add(url);
+    return true;
+  }
+
+  function revokeRenderedAttachmentUrls() {
+    for (const key of [...state.renderedAttachmentPreviews.keys()]) {
+      forgetRenderedAttachmentPreview(key, { defer: false });
+    }
     for (const url of state.messageImageUrls) revokeObjectUrl(url);
     state.messageImageUrls.clear();
+    state.localMessageImageUrls.clear();
+  }
+
+  function purgeAttachmentMemory() {
+    resetAttachmentRestorations();
+    state.imageRenderEpoch += 1;
+    revokeRenderedAttachmentUrls();
+    purgeAttachmentBlobCache();
+  }
+
+  function attachmentBlobCacheKey(threadId, attachment) {
+    return JSON.stringify([threadId, attachment.attachmentId, attachment.sha256]);
+  }
+
+  function cachedAttachmentBlob(key, attachment) {
+    const entry = state.attachmentBlobCache.get(key);
+    if (entry === undefined) return null;
+    if (entry.mediaType !== attachment.mediaType || entry.byteLength !== attachment.byteLength
+        || entry.width !== attachment.width || entry.height !== attachment.height) {
+      forgetAttachmentBlob(key);
+      return null;
+    }
+    state.attachmentBlobCache.delete(key);
+    state.attachmentBlobCache.set(key, entry);
+    return entry.blob;
+  }
+
+  function forgetAttachmentBlob(key) {
+    const entry = state.attachmentBlobCache.get(key);
+    if (entry === undefined) return;
+    state.attachmentBlobCache.delete(key);
+    state.attachmentBlobCacheBytes -= entry.byteLength;
+    forgetRenderedAttachmentPreview(key);
+  }
+
+  function rememberAttachmentBlob(key, blob, attachment) {
+    if (!(blob instanceof Blob) || blob.size < 1 || blob.size > attachmentMemoryLimitBytes) return false;
+    forgetAttachmentBlob(key);
+    while (state.attachmentBlobCacheBytes + blob.size > attachmentMemoryLimitBytes) {
+      const oldestKey = state.attachmentBlobCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      forgetAttachmentBlob(oldestKey);
+    }
+    state.attachmentBlobCache.set(key, Object.freeze({
+      blob,
+      byteLength: blob.size,
+      mediaType: attachment.mediaType,
+      width: attachment.width,
+      height: attachment.height,
+    }));
+    state.attachmentBlobCacheBytes += blob.size;
+    return true;
+  }
+
+  function drainAttachmentRestorations() {
+    while (state.attachmentRestoreActive < ATTACHMENT_RESTORE_CONCURRENCY
+        && state.attachmentRestoreQueue.length > 0) {
+      const job = state.attachmentRestoreQueue.shift();
+      const controller = new AbortController();
+      state.attachmentRestoreActive += 1;
+      state.attachmentRestoreControllers.add(controller);
+      void Promise.resolve()
+        .then(() => job.restore(controller.signal))
+        .catch(() => { /* restoreMessageAttachment owns its visible failure state. */ })
+        .finally(() => {
+          state.attachmentRestoreControllers.delete(controller);
+          state.attachmentRestoreActive -= 1;
+          if (job.image.dataset.previewState === "loading") deferAttachmentRestorationJob(job);
+          drainAttachmentRestorations();
+        });
+    }
+  }
+
+  function startAttachmentRestoration(job) {
+    if (job.started || state.chatPendingSend !== null) return;
+    job.started = true;
+    state.attachmentRestoreObserver?.unobserve?.(job.article);
+    state.attachmentRestoreObserved.delete(job.article);
+    job.image.dataset.previewState = "loading";
+    job.article.dataset.attachmentState = "loading";
+    job.status.textContent = "Loading attached image…";
+    job.status.disabled = true;
+    state.attachmentRestoreQueue.push(job);
+    drainAttachmentRestorations();
+  }
+
+  function attachmentObserver() {
+    if (state.attachmentRestoreObserver !== undefined) return state.attachmentRestoreObserver;
+    const Observer = window?.IntersectionObserver;
+    if (typeof Observer !== "function") {
+      state.attachmentRestoreObserver = null;
+      return null;
+    }
+    try {
+      state.attachmentRestoreObserver = new Observer((entries) => {
+        for (const entry of entries ?? []) {
+          if (entry?.isIntersecting !== true && !(Number(entry?.intersectionRatio) > 0)) continue;
+          const job = state.attachmentRestoreObserved.get(entry.target);
+          if (job) startAttachmentRestoration(job);
+        }
+      }, { root: null, rootMargin: "480px 0px", threshold: 0.01 });
+    } catch {
+      state.attachmentRestoreObserver = null;
+    }
+    return state.attachmentRestoreObserver;
+  }
+
+  function scheduleAttachmentRestoration(job, { observe = true } = {}) {
+    job.status.addEventListener("click", () => startAttachmentRestoration(job));
+    if (!observe) return;
+    const observer = attachmentObserver();
+    if (observer === null) {
+      startAttachmentRestoration(job);
+      return;
+    }
+    state.attachmentRestoreObserved.set(job.article, job);
+    try { observer.observe(job.article); }
+    catch { startAttachmentRestoration(job); }
+  }
+
+  function clearConversation() {
+    resetAttachmentRestorations();
+    state.imageRenderEpoch += 1;
+    revokeRenderedAttachmentUrls();
     elements.messages.replaceChildren();
     elements.agent_plan.replaceChildren();
     elements.agent_timeline.replaceChildren();
@@ -1069,12 +1282,18 @@ export function createBrowserApp({
     state.assistantNode = null;
   }
 
+  function fenceAttachmentRestorationsForSend() {
+    state.imageRenderEpoch += 1;
+    resetAttachmentRestorations({ deferQueued: true });
+  }
+
   function restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch }) {
     return state.chat === chat && state.viewEpoch === expectedEpoch
       && state.imageRenderEpoch === expectedImageEpoch;
   }
 
-  function waitForImageDecode(image) {
+  function waitForImageDecode(image, signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
     let readiness;
     if (typeof image.decode === "function") readiness = Promise.resolve().then(() => image.decode());
     else if (image.complete === true) {
@@ -1088,23 +1307,36 @@ export function createBrowserApp({
       });
     }
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (handler, value) => {
+        if (settled) return;
+        settled = true;
+        globalThis.clearTimeout(timer);
+        signal?.removeEventListener?.("abort", aborted);
+        handler(value);
+      };
+      const aborted = () => finish(reject, signal.reason ?? new DOMException("aborted", "AbortError"));
       const timer = globalThis.setTimeout(() => {
-        reject(new TypeError("restored image decode timed out"));
+        finish(reject, new TypeError("restored image decode timed out"));
       }, attachmentDecodeTimeoutMs);
+      signal?.addEventListener?.("abort", aborted, { once: true });
+      if (signal?.aborted) aborted();
       readiness.then(
-        (value) => { globalThis.clearTimeout(timer); resolve(value); },
-        (error) => { globalThis.clearTimeout(timer); reject(error); },
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
       );
     });
   }
 
   async function restoreMessageAttachment({
-    article, image, status, threadId, attachment,
+    article, image, status, job, threadId, attachment,
     expectedEpoch = state.viewEpoch,
     expectedImageEpoch = state.imageRenderEpoch,
     chat = state.chat,
+    signal,
   }) {
     const current = () => restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch });
+    const cacheKey = attachmentBlobCacheKey(threadId, attachment);
     const unavailable = () => {
       image.src = "";
       image.hidden = true;
@@ -1112,31 +1344,56 @@ export function createBrowserApp({
       image.dataset.previewState = "unavailable";
       status.textContent = "Attached image preview unavailable";
       status.hidden = false;
+      status.disabled = true;
       article.dataset.attachmentState = "unavailable";
     };
     let url = null;
     try {
       if (!current()) return "stale";
-      const { bytes, descriptor } = await chat.getAttachment({ threadId, attachment });
+      let blob = cachedAttachmentBlob(cacheKey, attachment);
+      if (blob === null) {
+        const { bytes, descriptor } = await chat.getAttachment({ threadId, attachment, signal });
+        if (!current()) return "stale";
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== attachment.byteLength
+            || descriptor.attachmentId !== attachment.attachmentId
+            || descriptor.mediaType !== attachment.mediaType
+            || descriptor.byteLength !== attachment.byteLength
+            || descriptor.width !== attachment.width || descriptor.height !== attachment.height
+            || descriptor.sha256 !== attachment.sha256) {
+          throw new DirectChatProtocolError("Direct Chat attachment verification result is inconsistent");
+        }
+        blob = new Blob([bytes], { type: descriptor.mediaType });
+        if (!rememberAttachmentBlob(cacheKey, blob, attachment)) {
+          throw new TypeError("attached image exceeds the compressed preview memory limit");
+        }
+      }
       if (!current()) return "stale";
-      url = createObjectUrl(new Blob([bytes], { type: descriptor.mediaType }));
-      state.messageImageUrls.add(url);
+      url = createObjectUrl(blob);
+      if (!installRenderedAttachmentPreview(cacheKey, {
+        url, image, article, status, job, attachment,
+      })) {
+        revokeObjectUrl(url);
+        url = null;
+        throw new TypeError("attached image exceeds the decoded preview memory limit");
+      }
       image.src = url;
-      await waitForImageDecode(image);
+      await waitForImageDecode(image, signal);
       if (!current()) {
-        if (state.messageImageUrls.delete(url)) revokeObjectUrl(url);
+        forgetRenderedAttachmentPreview(cacheKey, { defer: false, expectedUrl: url });
         return "stale";
       }
       image.alt = "Attached image";
       image.hidden = false;
       image.dataset.previewState = "ready";
       status.hidden = true;
+      status.disabled = true;
       article.dataset.attachmentState = "ready";
       return "ready";
     } catch (error) {
-      if (url !== null && state.messageImageUrls.delete(url)) revokeObjectUrl(url);
+      if (url !== null) forgetRenderedAttachmentPreview(cacheKey, { defer: false, expectedUrl: url });
       if (!current()) return "stale";
       if (recoverChatReadAuthentication(error, captureChatReadRecovery({ threadId }))) return "stale";
+      forgetAttachmentBlob(cacheKey);
       unavailable();
       return "unavailable";
     }
@@ -1153,36 +1410,49 @@ export function createBrowserApp({
       const image = document.createElement("img");
       image.className = "message-attachment";
       image.alt = "Attached image";
+      image.loading = "lazy";
+      image.decoding = "async";
       article.appendChild(image);
       if (localAttachment !== undefined) {
         const url = createObjectUrl(new Blob([localAttachment.bytes], { type: localAttachment.mediaType }));
         state.messageImageUrls.add(url);
+        state.localMessageImageUrls.add(url);
         image.src = url;
         image.dataset.previewState = "local";
         article.dataset.attachmentState = "local";
       } else {
         image.hidden = true;
-        image.alt = "Loading attached image";
-        image.dataset.previewState = "loading";
-        article.dataset.attachmentState = "loading";
-        const status = document.createElement("span");
+        image.alt = "Attached image preview not loaded";
+        image.dataset.previewState = "deferred";
+        article.dataset.attachmentState = "deferred";
+        const status = document.createElement("button");
+        status.type = "button";
         status.className = "message-attachment-status muted";
-        status.textContent = "Loading attached image…";
-        status.setAttribute("role", "status");
+        status.textContent = "Load attached image preview";
+        status.setAttribute("aria-label", "Load attached image preview");
         article.appendChild(status);
         const restorationOwner = Object.freeze({
           expectedEpoch: state.viewEpoch,
-          expectedImageEpoch: state.imageRenderEpoch,
           chat: state.chat,
         });
-        const restoration = () => restoreMessageAttachment({
+        const job = {
           article,
           image,
           status,
-          threadId,
-          attachment,
-          ...restorationOwner,
-        });
+          started: false,
+          restore: (signal) => restoreMessageAttachment({
+            article,
+            image,
+            status,
+            job,
+            threadId,
+            attachment,
+            signal,
+            expectedImageEpoch: state.imageRenderEpoch,
+            ...restorationOwner,
+          }),
+        };
+        const restoration = (options) => scheduleAttachmentRestoration(job, options);
         if (Array.isArray(attachmentReadyTasks)) attachmentReadyTasks.push(restoration);
         else void restoration();
       }
@@ -1226,11 +1496,18 @@ export function createBrowserApp({
     if (state.mode === "agent") renderThreads();
   }
 
-  async function loadChatThreads() {
+  async function loadChatThreads({ prefetched = null } = {}) {
     const session = state.session;
     const chat = state.chat;
     const listEpoch = ++state.chatThreadListEpoch;
-    const response = await chat.listThreads({ limit: 100 });
+    let response;
+    if (prefetched?.session === session && prefetched.chat === chat) {
+      const result = await prefetched.result;
+      if (!result.succeeded) throw result.error;
+      response = result.response;
+    } else {
+      response = await chat.listThreads({ limit: 100 });
+    }
     if (state.session !== session || state.chat !== chat || state.chatThreadListEpoch !== listEpoch) return;
     state.chatThreads = [...response.threads];
     if (state.mode === "chat") renderThreads();
@@ -1437,8 +1714,15 @@ export function createBrowserApp({
     if (diagnostic.reauthenticate) requireFreshAuthentication();
   }
 
-  async function fetchChatSnapshot(threadId, signal, { expectedEpoch = state.viewEpoch } = {}) {
+  async function fetchChatSnapshot(threadId, signal, {
+    expectedEpoch = state.viewEpoch,
+    threadHint = null,
+  } = {}) {
     const owner = Object.freeze({ session: state.session, chat: state.chat, expectedEpoch });
+    const hintedRevision = threadHint?.threadId === threadId
+      && Number.isSafeInteger(threadHint.revision) && threadHint.revision > 0
+      ? threadHint.revision
+      : 0;
     const ensureOwner = () => {
       if (state.session !== owner.session || state.chat !== owner.chat || !state.session.authenticated
           || state.mode !== "chat" || state.viewEpoch !== owner.expectedEpoch) {
@@ -1453,20 +1737,33 @@ export function createBrowserApp({
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         ensureOwner();
-        const { thread: before } = await owner.chat.getThread(threadId, { signal });
+        const [beforeResponse, prefetchedFirstPage] = await Promise.all([
+          owner.chat.getThread(threadId, { signal }),
+          hintedRevision > 0
+            ? owner.chat.listMessages({
+              threadId,
+              afterRevision: 0,
+              limit: Math.min(200, hintedRevision),
+              signal,
+            })
+            : null,
+        ]);
+        const { thread: before } = beforeResponse;
         ensureOwner();
         const messages = [];
         let afterRevision = 0;
         let previousHash = null;
         let inconsistent = false;
+        let firstPage = prefetchedFirstPage;
         while (afterRevision < before.revision) {
           const remaining = before.revision - afterRevision;
-          const response = await owner.chat.listMessages({
-            threadId,
-            afterRevision,
-            limit: Math.min(200, remaining),
-            signal,
-          });
+          const response = firstPage ?? await owner.chat.listMessages({
+              threadId,
+              afterRevision,
+              limit: Math.min(200, remaining),
+              signal,
+            });
+          firstPage = null;
           ensureOwner();
           if (response.messages.length < 1 || response.messages.length > remaining) {
             inconsistent = true;
@@ -1579,6 +1876,7 @@ export function createBrowserApp({
   async function renderChatSnapshot(snapshot, {
     expectedEpoch = state.viewEpoch,
     finalization: suppliedFinalization = null,
+    restoreAttachments = true,
   } = {}) {
     clearConversation();
     state.chatThread = snapshot.thread;
@@ -1602,13 +1900,17 @@ export function createBrowserApp({
       threadId: snapshot.thread.threadId,
       attachmentReadyTasks,
     }));
-    // Attachment previews are cosmetic. Restore them serially in the
-    // background so several historical multi-megabyte images cannot hold the
-    // authoritative conversation in Finalizing or spike mobile memory.
-    void attachmentReadyTasks.reduce(
-      (previous, restoreAttachment) => previous.then(restoreAttachment),
-      Promise.resolve(),
-    );
+    // Attachment previews are cosmetic. Register them only after the
+    // authoritative conversation is usable; viewport observation then admits
+    // at most one verified original at a time on memory-constrained clients.
+    if (restoreAttachments) {
+      void attachmentReadyTasks.reduce(
+        (previous, restoreAttachment) => previous.then(restoreAttachment),
+        Promise.resolve(),
+      );
+    } else {
+      for (const restoreAttachment of attachmentReadyTasks) restoreAttachment({ observe: false });
+    }
     if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch
         || state.chatThreadId !== snapshot.thread.threadId) {
       if (ownsFinalization) abandonChatFinalization(finalization);
@@ -1627,17 +1929,21 @@ export function createBrowserApp({
   async function refreshChatThread(threadId, signal, {
     expectedEpoch = state.viewEpoch,
     finalization = null,
+    threadHint = null,
+    refreshThreadList = true,
   } = {}) {
     const session = state.session;
     const chat = state.chat;
-    const snapshot = await fetchChatSnapshot(threadId, signal, { expectedEpoch });
+    const snapshot = await fetchChatSnapshot(threadId, signal, { expectedEpoch, threadHint });
     if (state.session !== session || state.chat !== chat) return snapshot;
     state.chatThread = snapshot.thread;
     state.chatThreadId = snapshot.thread.threadId;
     if (state.mode === "chat" && state.viewEpoch === expectedEpoch) {
       await renderChatSnapshot(snapshot, { expectedEpoch, finalization });
     }
-    void loadChatThreads().catch(() => { /* The open authoritative thread remains usable. */ });
+    if (refreshThreadList) {
+      void loadChatThreads().catch(() => { /* The open authoritative thread remains usable. */ });
+    }
     return snapshot;
   }
 
@@ -1668,14 +1974,26 @@ export function createBrowserApp({
   async function finishChatGeneration(generation, controller, expectedEpoch = state.viewEpoch) {
     state.chatGeneration = generation;
     const presenting = state.mode === "chat" && state.viewEpoch === expectedEpoch;
-    if (generation.status === "completed" && presenting && state.chatThreadId === generation.threadId) {
-      const finalization = beginChatFinalization({
-        threadId: generation.threadId,
-        generationId: generation.generationId,
-        expectedEpoch,
-      });
-      await finalizeChatGeneration(finalization, controller.signal);
-      return;
+    if (presenting && state.chatThreadId === generation.threadId) {
+      if (generation.status === "completed") {
+        const finalization = beginChatFinalization({
+          threadId: generation.threadId,
+          generationId: generation.generationId,
+          expectedEpoch,
+        });
+        await finalizeChatGeneration(finalization, controller.signal);
+        return;
+      }
+      try {
+        await refreshChatThread(generation.threadId, controller.signal, { expectedEpoch });
+      } catch (error) {
+        if (recoverChatReadAuthentication(error, captureChatReadRecovery({
+          threadId: generation.threadId,
+          generationId: generation.generationId,
+        }))) return;
+        // The terminal generation remains authoritative. A later send performs
+        // another full pre-send snapshot render before appending local UI.
+      }
     }
     if (presenting) {
       elements.workspace.dataset.status = generation.status;
@@ -1771,11 +2089,19 @@ export function createBrowserApp({
     }
   }
 
-  async function openChatThread(threadId, { backgroundStream = false } = {}) {
+  async function openChatThread(threadId, {
+    backgroundStream = false,
+    threadHint = null,
+    refreshThreadList = true,
+  } = {}) {
     const expectedEpoch = state.viewEpoch;
     let generationId = null;
     try {
-      const snapshot = await refreshChatThread(threadId, undefined, { expectedEpoch });
+      const snapshot = await refreshChatThread(threadId, undefined, {
+        expectedEpoch,
+        threadHint,
+        refreshThreadList,
+      });
       if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
       generationId = snapshot.thread.currentGenerationId;
       if (!generationId) {
@@ -1853,7 +2179,10 @@ export function createBrowserApp({
     state.streamAbort?.abort();
     try {
       if (mode === "agent") await openAgentThread(threadId);
-      else await openChatThread(threadId, { backgroundStream: true });
+      else {
+        const threadHint = state.chatThreads.find((thread) => thread.threadId === threadId) ?? null;
+        await openChatThread(threadId, { backgroundStream: true, threadHint });
+      }
     } catch {
       showToast(mode === "agent"
         ? "This AgInTi thread could not be opened safely."
@@ -1865,14 +2194,14 @@ export function createBrowserApp({
     }
   }
 
-  async function restoreModeView({ autoOpen = false } = {}) {
+  async function restoreModeView({ autoOpen = false, prefetchedChatThreads = null } = {}) {
     const mode = state.mode;
     const epoch = ++state.viewEpoch;
     state.streamAbort?.abort();
     clearConversation();
     elements.conversation_title.textContent = "New conversation";
     if (mode === "agent") await loadAgentThreads();
-    else await loadChatThreads();
+    else await loadChatThreads({ prefetched: prefetchedChatThreads });
     if (epoch !== state.viewEpoch || mode !== state.mode) return;
     const preferred = mode === "agent" ? state.agentThreadId : state.chatThreadId;
     const available = currentThreads();
@@ -1880,7 +2209,11 @@ export function createBrowserApp({
     if (!autoOpen || !selected) return;
     const threadId = mode === "agent" ? selected.id : selected.threadId;
     if (mode === "agent") await openAgentThread(threadId);
-    else await openChatThread(threadId, { backgroundStream: true });
+    else await openChatThread(threadId, {
+      backgroundStream: true,
+      threadHint: selected,
+      refreshThreadList: false,
+    });
   }
 
   async function sendAgent(text) {
@@ -1975,8 +2308,20 @@ export function createBrowserApp({
         const threadId = thread?.threadId === state.chatThreadId ? thread.threadId : state.chatThreadId;
         if (!threadId) throw new TypeError("the Direct Chat thread is unavailable");
         workflow.failureStage = "snapshot";
-        thread = (await fetchChatSnapshot(threadId)).thread;
+        const snapshot = await fetchChatSnapshot(threadId);
         ensureCurrentSession();
+        if (state.localMessageImageUrls.size > 0
+            && !await renderChatSnapshot(snapshot, {
+              expectedEpoch: state.viewEpoch,
+              restoreAttachments: false,
+            })) {
+          throw new DirectChatTransportError("Direct Chat snapshot ownership changed.", {
+            code: "browser_state_changed",
+            status: 499,
+            retryable: false,
+          });
+        }
+        thread = snapshot.thread;
         workflow.thread = thread;
         state.chatThread = thread;
         if (thread.currentGenerationId) throw new TypeError("the conversation already has a generation in progress");
@@ -2132,6 +2477,7 @@ export function createBrowserApp({
     let text;
     try { text = boundedMessage(draft); }
     catch { return; }
+    if (state.mode === "chat") fenceAttachmentRestorationsForSend();
     let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
     const selected = detachedImage?.selected ?? null;
     const attachment = selected === null ? null : Object.freeze({
@@ -2233,6 +2579,7 @@ export function createBrowserApp({
     const recoveryUsername = state.authRecoveryUsername;
     const recoveryWorkflow = state.authRecoveryWorkflow;
     const recoveryGeneration = state.authRecoveryGeneration;
+    purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
     if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
     const discardedCrossAccountDraft = recoveringAuthenticationDraft
@@ -2286,6 +2633,16 @@ export function createBrowserApp({
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
       const authenticatedChat = state.chat;
+      const startupChatThreads = Object.freeze({
+        session: authenticatedSession,
+        chat: authenticatedChat,
+        result: Promise.resolve()
+          .then(() => authenticatedChat.listThreads({ limit: 100 }))
+          .then(
+            (response) => Object.freeze({ succeeded: true, response }),
+            (error) => Object.freeze({ succeeded: false, error }),
+          ),
+      });
       const readChatCapability = async () => {
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
@@ -2366,10 +2723,17 @@ export function createBrowserApp({
         await restoreModeView({
           autoOpen: updateHandoff === null
             && sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null,
+          prefetchedChatThreads: startupChatThreads,
         });
         if (restoredUpdateHandoff && updateHandoff.threadId !== null) {
           const target = state.chatThreads.find((thread) => thread.threadId === updateHandoff.threadId);
-          if (target) await openChatThread(target.threadId, { backgroundStream: true });
+          if (target) {
+            await openChatThread(target.threadId, {
+              backgroundStream: true,
+              threadHint: target,
+              refreshThreadList: false,
+            });
+          }
           else state.chatThreadId = null;
         }
       }
@@ -2505,6 +2869,7 @@ export function createBrowserApp({
     state.runId = null;
     state.agentRunStatus = null;
     clearConversation();
+    purgeAttachmentBlobCache();
     showLogin();
     loginControl({ ready: true, label: "Sign in" });
     state.logoutPending = false;
@@ -2836,6 +3201,7 @@ export function createBrowserApp({
     target.hash = state.updatePreparedHandoff === null
       ? ""
       : updateHandoffFragment(state.updatePreparedHandoff.claim);
+    purgeAttachmentMemory();
     if (typeof window?.location?.replace === "function") window.location.replace(target.href);
     else if (window?.location) window.location.href = target.href;
     return true;
@@ -2996,6 +3362,9 @@ export function createBrowserApp({
     });
     window?.addEventListener?.("online", () => { elements.offline_banner.hidden = true; connection("Connected"); });
     window?.addEventListener?.("offline", () => { elements.offline_banner.hidden = false; connection("Offline", false); });
+    window?.addEventListener?.("pagehide", (event) => {
+      if (event?.persisted !== true) purgeAttachmentMemory();
+    });
     window?.addEventListener?.("beforeinstallprompt", (event) => {
       event.preventDefault?.();
       state.installPrompt = event;
@@ -3194,10 +3563,18 @@ export function createBrowserApp({
       });
       const checkForUpdate = async ({ force = false, onlineTransition = false } = {}) => {
         const instant = Number(now());
-        if (!Number.isFinite(instant) || state.updateCheckInFlight
-            || (!force && (document?.visibilityState === "hidden" || navigator?.onLine === false
-              || instant - state.updateCheckAt < updateCheckIntervalMs
-              || (!onlineTransition && instant - state.updateFailureAt < 60_000)))) return false;
+        if (!Number.isFinite(instant)) return false;
+        const eligible = force || !(document?.visibilityState === "hidden" || navigator?.onLine === false
+          || instant - state.updateCheckAt < updateCheckIntervalMs
+          || (!onlineTransition && instant - state.updateFailureAt < 60_000));
+        if (state.updateCheckInFlight) {
+          if (eligible) {
+            state.updateCheckPending = true;
+            state.updateCheckPendingOnlineTransition ||= onlineTransition;
+          }
+          return false;
+        }
+        if (!eligible) return false;
         state.updateCheckInFlight = true;
         try {
           await registration.update?.();
@@ -3208,7 +3585,15 @@ export function createBrowserApp({
           state.updateFailureAt = instant;
           /* The installed shell remains available offline. */
         }
-        finally { state.updateCheckInFlight = false; }
+        finally {
+          state.updateCheckInFlight = false;
+          if (state.updateCheckPending) {
+            const pendingOnlineTransition = state.updateCheckPendingOnlineTransition;
+            state.updateCheckPending = false;
+            state.updateCheckPendingOnlineTransition = false;
+            void checkForUpdate({ onlineTransition: pendingOnlineTransition });
+          }
+        }
         return true;
       };
       const scheduleUpdateCheck = () => {
@@ -3226,6 +3611,27 @@ export function createBrowserApp({
     } catch { /* PWA installation is optional; chat remains usable. */ }
   }
 
+  function schedulePwaRegistration() {
+    let started = false;
+    const start = () => {
+      if (started) return;
+      started = true;
+      void registerPwa();
+    };
+    if (navigator?.serviceWorker?.controller !== null
+        && navigator?.serviceWorker?.controller !== undefined) {
+      start();
+      return;
+    }
+    if (typeof window?.requestIdleCallback === "function") {
+      try {
+        window.requestIdleCallback(start, { timeout: 1_000 });
+        return;
+      } catch { /* The zero-delay fallback still runs after hydration. */ }
+    }
+    void Promise.resolve().then(start);
+  }
+
   async function initialize() {
     if (state.initialized) return;
     state.initialized = true;
@@ -3233,7 +3639,6 @@ export function createBrowserApp({
     const theme = restoreTheme({ document });
     elements.theme_picker.value = theme;
     elements.offline_banner.hidden = navigator?.onLine !== false;
-    void registerPwa();
     try {
       await authenticated(await sessionClient.restore(), {
         preserveLoginInput: true,
@@ -3249,6 +3654,7 @@ export function createBrowserApp({
         loginControl({ ready: true, label: "Sign in" });
       }
     }
+    schedulePwaRegistration();
   }
 
   return Object.freeze({ initialize, submitMessage, login, logout, stop, resume, openThread, setMode });

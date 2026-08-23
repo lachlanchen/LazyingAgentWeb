@@ -45,6 +45,7 @@ const FAILURE_CODES = new Set([
 ]);
 const PRE_DISPATCH_FAILURE_CODES = new Set(['provider_unavailable', 'timeout']);
 const DATABASE_METADATA = new WeakMap();
+const MAX_AUDITED_THREAD_CACHE_ENTRIES = 256;
 
 export const DIRECT_CHAT_LIMITS = Object.freeze({
   threadsPerAccount: 100,
@@ -827,14 +828,19 @@ function terminalGenerationDigestInput(result) {
 }
 
 export class DirectChatStore {
+  #auditedThreads = new Map();
+  #auditDataVersion = null;
   #clock;
   #closed = false;
   #database;
   #databasePath;
   #enableVisionAttachments;
   #modelAlias;
+  #readTransactionActive = false;
+  #readTransactionDataVersion = null;
   #schemaVersion;
   #visionModelAlias;
+  #writeTransactionActive = false;
 
   constructor({
     databasePath,
@@ -913,37 +919,122 @@ export class DirectChatStore {
     if (this.#closed) throw new StorageCorruptionError('The direct-chat database is closed.');
   }
 
+  #clearAuditedThreads() {
+    this.#auditedThreads.clear();
+    this.#auditDataVersion = null;
+  }
+
+  #dataVersion() {
+    const value = Number(this.#database.prepare('PRAGMA data_version').get()?.data_version);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      this.#clearAuditedThreads();
+      throw new StorageCorruptionError('SQLite returned an invalid direct-chat data version.');
+    }
+    return value;
+  }
+
+  #auditThread(thread) {
+    // Write transactions deliberately bypass the cache. A transaction can
+    // touch several integrity-linked rows without advancing data_version on
+    // its own connection, so both its precondition and postcondition audits
+    // must inspect the actual transactional snapshot.
+    if (this.#writeTransactionActive) return auditThread(this.#database, thread);
+
+    const dataVersion = this.#readTransactionDataVersion ?? this.#dataVersion();
+    if (this.#readTransactionActive && this.#readTransactionDataVersion === null) {
+      // The owning lookup already pinned this read transaction's snapshot.
+      // Reuse one data_version guard for every thread in the same list read.
+      this.#readTransactionDataVersion = dataVersion;
+    }
+    if (this.#auditDataVersion !== dataVersion) {
+      this.#auditedThreads.clear();
+      this.#auditDataVersion = dataVersion;
+    }
+    assertStoredIdentifier(thread.account_id, 'thread.account_id');
+    assertStoredIdentifier(thread.thread_id, 'thread.thread_id');
+    const identity = canonicalJson([thread.account_id, thread.thread_id]);
+    if (this.#auditedThreads.has(identity)) {
+      // Refresh insertion order so the bounded map behaves as a small LRU.
+      this.#auditedThreads.delete(identity);
+      this.#auditedThreads.set(identity, dataVersion);
+      return null;
+    }
+
+    let result;
+    try {
+      result = auditThread(this.#database, thread);
+    } catch (error) {
+      this.#auditedThreads.delete(identity);
+      throw error;
+    }
+    // A read transaction validates its version again after COMMIT. Keep the
+    // local second check for any future caller that audits outside one.
+    if (!this.#readTransactionActive && this.#dataVersion() !== dataVersion) {
+      this.#clearAuditedThreads();
+      return result;
+    }
+    this.#auditedThreads.set(identity, dataVersion);
+    if (this.#auditedThreads.size > MAX_AUDITED_THREAD_CACHE_ENTRIES) {
+      this.#auditedThreads.delete(this.#auditedThreads.keys().next().value);
+    }
+    return result;
+  }
+
   #transaction(callback) {
     this.#assertOpen();
-    this.#database.exec('BEGIN IMMEDIATE');
+    // SQLite data_version changes only for commits made by other connections.
+    // Clear around every local write transaction and never cache its audits.
+    this.#clearAuditedThreads();
+    this.#writeTransactionActive = true;
     try {
-      const result = callback();
-      this.#database.exec('COMMIT');
-      return result;
-    } catch (error) {
       try {
-        this.#database.exec('ROLLBACK');
-      } catch {
-        // Preserve the mutation error.
+        this.#database.exec('BEGIN IMMEDIATE');
+        const result = callback();
+        this.#database.exec('COMMIT');
+        return result;
+      } catch (error) {
+        try {
+          this.#database.exec('ROLLBACK');
+        } catch {
+          // Preserve the mutation error.
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      this.#writeTransactionActive = false;
+      this.#clearAuditedThreads();
     }
   }
 
   #readTransaction(callback) {
     this.#assertOpen();
-    this.#database.exec('BEGIN');
+    this.#readTransactionActive = true;
+    this.#readTransactionDataVersion = null;
     try {
-      const result = callback();
-      this.#database.exec('COMMIT');
-      return result;
-    } catch (error) {
       try {
-        this.#database.exec('ROLLBACK');
-      } catch {
-        // Preserve the read or validation failure.
+        this.#database.exec('BEGIN');
+        const result = callback();
+        this.#database.exec('COMMIT');
+        if (this.#readTransactionDataVersion !== null
+            && this.#dataVersion() !== this.#readTransactionDataVersion) {
+          // An external WAL-capable connection may commit while a read
+          // snapshot is pinned. The result was coherent, but it must not seed
+          // cache state for the newer database version.
+          this.#clearAuditedThreads();
+        }
+        return result;
+      } catch (error) {
+        try {
+          this.#database.exec('ROLLBACK');
+        } catch {
+          // Preserve the read or validation failure.
+        }
+        this.#clearAuditedThreads();
+        throw error;
       }
-      throw error;
+    } finally {
+      this.#readTransactionDataVersion = null;
+      this.#readTransactionActive = false;
     }
   }
 
@@ -1158,7 +1249,7 @@ export class DirectChatStore {
           if (existing.title !== title.value || existing.model_alias !== this.#modelAlias) {
             throw new ConflictError('The direct-chat thread identifier already has different immutable settings.');
           }
-          auditThread(this.#database, existing);
+          this.#auditThread(existing);
           return threadView(existing);
         }
         const count = Number(this.#database.prepare(`
@@ -1182,7 +1273,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         return threadView(thread);
       }
     );
@@ -1197,7 +1288,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!row) return null;
-      auditThread(this.#database, row);
+      this.#auditThread(row);
       return threadView(row);
     });
   }
@@ -1214,7 +1305,7 @@ export class DirectChatStore {
         ORDER BY updated_at DESC, thread_id DESC
         LIMIT ?
       `).all(accountId, limit);
-      for (const row of rows) auditThread(this.#database, row);
+      for (const row of rows) this.#auditThread(row);
       return rows.map(threadView);
     });
   }
@@ -1345,7 +1436,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const existingMessage = this.#database.prepare(`
           SELECT * FROM direct_chat_messages
           WHERE account_id = ? AND thread_id = ? AND message_id = ?
@@ -1569,7 +1660,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const existing = this.#database.prepare(`
           SELECT * FROM direct_chat_messages
           WHERE account_id = ? AND thread_id = ? AND message_id = ?
@@ -1687,7 +1778,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const inferenceModelAlias = this.#schemaVersion >= 3 && this.#database.prepare(`
           SELECT 1 AS present
           FROM direct_chat_attachments AS attachment
@@ -1779,7 +1870,7 @@ export class DirectChatStore {
     let blockedMessage = null;
     const claimed = this.#transaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
       if (generation.status !== 'in_progress' || thread.current_generation_id !== generationId) {
         throw new ConflictError('Only the active in-progress generation can acquire a dispatch lease.');
@@ -1913,7 +2004,7 @@ export class DirectChatStore {
 
     return this.#transaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
       if (generation.status !== 'in_progress' || thread.current_generation_id !== generationId) {
         throw new ConflictError('Only the active in-progress generation can start dispatch.');
@@ -1994,7 +2085,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!thread) return null;
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const lease = this.#generationLease(accountId, threadId, generationId);
       if (!lease) return null;
       auditDispatchLease(lease);
@@ -2016,7 +2107,7 @@ export class DirectChatStore {
 
     return this.#transaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
       if (generation.status !== 'in_progress' || thread.current_generation_id !== generationId) {
         throw new ConflictError('Only the active in-progress generation can renew a dispatch lease.');
@@ -2071,7 +2162,7 @@ export class DirectChatStore {
 
     return this.#transaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
       const timestamp = nowIso(this.#clock);
       const existing = this.#generationLease(accountId, threadId, generationId);
@@ -2132,7 +2223,7 @@ export class DirectChatStore {
     return this.#transaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const timestamp = nowIso(this.#clock);
       this.#requireGenerationLease(
         accountId,
@@ -2251,7 +2342,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const generation = requireGeneration(this.#database, accountId, threadId, generationId);
         const timestamp = nowIso(this.#clock);
         this.#requireGenerationLease(
@@ -2382,7 +2473,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const generation = requireGeneration(this.#database, accountId, threadId, generationId);
         const timestamp = nowIso(this.#clock);
         if (targetStatus === 'failed') {
@@ -2453,7 +2544,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!thread) return null;
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const row = this.#database.prepare(`
         SELECT * FROM direct_chat_generations
         WHERE account_id = ? AND thread_id = ? AND generation_id = ?
@@ -2480,7 +2571,7 @@ export class DirectChatStore {
     const limit = assertInteger(input.limit ?? 200, 'limit', { min: 1, max: DIRECT_CHAT_LIMITS.listPage });
     return this.#readTransaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const generation = requireGeneration(this.#database, accountId, threadId, generationId);
       const rows = this.#database.prepare(`
         SELECT * FROM direct_chat_deltas
@@ -2509,7 +2600,7 @@ export class DirectChatStore {
     const limit = assertInteger(input.limit ?? 100, 'limit', { min: 1, max: DIRECT_CHAT_LIMITS.listPage });
     return this.#readTransaction(() => {
       const thread = requireThread(this.#database, accountId, threadId);
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const rows = this.#database.prepare(`
         SELECT * FROM direct_chat_messages
         WHERE account_id = ? AND thread_id = ? AND revision > ?
@@ -2556,7 +2647,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!thread) return null;
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       return attachmentFromRow(this.#database.prepare(`
         SELECT * FROM direct_chat_attachments
         WHERE account_id = ? AND thread_id = ? AND attachment_id = ?
@@ -2580,7 +2671,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!thread) return null;
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       const row = this.#database.prepare(`
         SELECT attachment.*
         FROM direct_chat_attachments AS attachment
@@ -2648,7 +2739,7 @@ export class DirectChatStore {
       },
       () => {
         const thread = requireThread(this.#database, accountId, threadId);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const existing = this.#database.prepare(`
           SELECT * FROM direct_chat_compactions
           WHERE account_id = ? AND thread_id = ? AND snapshot_id = ?
@@ -2713,7 +2804,7 @@ export class DirectChatStore {
         SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
       `).get(accountId, threadId);
       if (!thread) return null;
-      auditThread(this.#database, thread);
+      this.#auditThread(thread);
       return compactionView(this.#database.prepare(`
         SELECT * FROM direct_chat_compactions
         WHERE account_id = ? AND thread_id = ?
@@ -2777,7 +2868,7 @@ export class DirectChatStore {
       `).all(accountId, terminalBefore, remaining);
       for (const generation of candidates) {
         const thread = requireThread(this.#database, accountId, generation.thread_id);
-        auditThread(this.#database, thread);
+        this.#auditThread(thread);
         const marked = this.#database.prepare(`
           UPDATE direct_chat_generations
           SET deltas_pruned = 1, pruned_at = ?
@@ -2862,7 +2953,7 @@ export class DirectChatStore {
         ? this.#deleteExpiredReceipts(timestamp, remaining, accountId)
         : 0;
       for (const threadId of touchedThreads) {
-        auditThread(this.#database, requireThread(this.#database, accountId, threadId));
+        this.#auditThread(requireThread(this.#database, accountId, threadId));
       }
       return {
         terminalGenerationsPruned,
@@ -2909,6 +3000,7 @@ export class DirectChatStore {
       try {
         this.#database.close();
       } finally {
+        this.#clearAuditedThreads();
         this.#closed = true;
       }
     }

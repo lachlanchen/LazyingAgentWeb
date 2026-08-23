@@ -445,6 +445,9 @@ export function createAppShellHtml({
   const safeTitle = escapeHtml(boundedText(title, "title", 80));
   const safeLoginPath = escapeHtml(normalizedPath(loginPath, "loginPath"));
   const build = agentWebBuildQuery(version);
+  const modulePreloads = AGENT_WEB_MODULE_ROUTES.map((route) => (
+    `  <link rel="modulepreload" href="${base}${versionedAgentWebAsset(route, version)}">`
+  )).join("\n");
   return `<!doctype html>
 <html lang="en" data-theme="bright">
 <head>
@@ -459,6 +462,7 @@ export function createAppShellHtml({
   <meta name="lazying-agent-service-worker" content="${base}/sw.js">
   <link rel="manifest" href="${base}/manifest.webmanifest${build}">
   <link rel="stylesheet" href="${base}${versionedAgentWebAsset("/assets/app.css", version)}">
+${modulePreloads}
 </head>
 <body>
   <div id="update-banner" class="notice update-notice" role="status" hidden>A safe app update is ready. <button id="apply-update" type="button">Update</button> <button id="defer-update" type="button">Later</button></div>
@@ -667,6 +671,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .image-preview span { overflow: hidden; color: var(--muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
 .image-preview button { padding: .35rem .5rem; }
 .message-attachment { display: block; max-width: min(100%, 620px); max-height: 520px; margin-bottom: .65rem; border-radius: 12px; object-fit: contain; }
+.message-attachment-status { padding: .35rem .5rem; border-color: transparent; background: transparent; text-align: left; }
 .composer-actions { display: flex; gap: .4rem; }
 .footer-note { margin: 0; padding: 0 max(1rem, calc((100% - 850px) / 2)) .6rem; text-align: center; background: var(--surface); }
 .icon-button { display: none; }

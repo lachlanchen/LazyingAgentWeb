@@ -369,6 +369,22 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   assert.equal(CLOUD_HTTP_LIMITS.directChatJobs, 1);
 });
 
+test('outer request deadline covers the longest bounded body reader without relaxing connection limits', async (t) => {
+  const state = testState(t);
+  const { server: defaultServer } = await state.start();
+  assert.equal(defaultServer.requestTimeout, CLOUD_HTTP_LIMITS.visionBodyTimeoutMs + 30_000);
+  assert.ok(defaultServer.requestTimeout > CLOUD_HTTP_LIMITS.visionBodyTimeoutMs);
+  assert.equal(defaultServer.headersTimeout, 10_000);
+  assert.equal(defaultServer.keepAliveTimeout, 5_000);
+
+  const { server: maximumServer } = await state.start({
+    limits: { bodyTimeoutMs: 15_000, visionBodyTimeoutMs: 120_000 }
+  });
+  assert.equal(maximumServer.requestTimeout, 150_000);
+  assert.equal(maximumServer.headersTimeout, 10_000);
+  assert.equal(maximumServer.keepAliveTimeout, 5_000);
+});
+
 test('rejects framed bodies on every static GET and HEAD before waiting for payload bytes', async (t) => {
   const state = testState(t);
   const { baseUrl, publicOrigin } = await state.start();

@@ -31,6 +31,7 @@ import { createSafeRenderer } from "../src/web/safe-rendering.js";
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const CURRENT_RELEASE = `release-${"a".repeat(64)}`;
 const NEXT_RELEASE = `release-${"b".repeat(64)}`;
+const OLD_RELEASE = `release-${"0".repeat(64)}`;
 const BOOTSTRAP_IMPORTS = `
   import katex from "./katex.mjs";
   import { createBrowserApp } from "./browser-app.js";
@@ -361,13 +362,15 @@ function updateEnvironment({
   waitingReleaseId = NEXT_RELEASE,
   respondToReleaseQuery = true,
   controlled = true,
+  activeReleaseId = CURRENT_RELEASE,
+  respondToActiveReleaseQuery = true,
   onUpdate = async () => {},
   registerPromise,
 } = {}) {
   const workerMessages = [];
   const workerReleaseQueries = [];
   let serviceWorker;
-  const makeWorker = (releaseId = NEXT_RELEASE, { respond = true } = {}) => ({
+  const makeWorker = (releaseId = NEXT_RELEASE, { respond = true } = {}) => Object.assign(eventTarget(), {
     releaseId,
     throwOnPost: false,
     postMessage(value, transfer = []) {
@@ -387,17 +390,29 @@ function updateEnvironment({
   const registration = Object.assign(eventTarget(), {
     waiting: waiting ? waitingWorker : null,
     installing: null,
+    active: null,
     updateCalls: 0,
     async update() { this.updateCalls += 1; await onUpdate(this.updateCalls); },
   });
   let controllerNumber = 0;
-  const makeController = () => Object.assign(eventTarget(), {
+  const makeController = (releaseId = null, { respond = true } = {}) => Object.assign(eventTarget(), {
     scriptURL: `https://llm.lazying.art/sw.js#controller-${controllerNumber += 1}`,
+    releaseId,
     messages: [],
-    postMessage(value) { this.messages.push(value); },
+    postMessage(value, transfer = []) {
+      this.messages.push(value);
+      if (value?.type !== "GET_LAZYING_AGENT_RELEASE" || !respond || this.releaseId === null) return;
+      const response = { type: "LAZYING_AGENT_RELEASE", releaseId: this.releaseId };
+      if (transfer[0]?.postMessage) transfer[0].postMessage(response);
+      else serviceWorker.dispatch("message", { data: response, source: this });
+    },
   });
+  const activeController = controlled
+    ? makeController(activeReleaseId, { respond: respondToActiveReleaseQuery })
+    : null;
+  registration.active = activeController;
   serviceWorker = Object.assign(eventTarget(), {
-    controller: controlled ? makeController() : null,
+    controller: activeController,
     registerCalls: [],
     async register(path, options) {
       this.registerCalls.push([path, options]);
@@ -405,8 +420,9 @@ function updateEnvironment({
       return registration;
     },
   });
-  const transitionController = () => {
-    const controller = makeController();
+  const transitionController = (releaseId = null, { respond = true } = {}) => {
+    const controller = makeController(releaseId, { respond });
+    registration.active = controller;
     serviceWorker.controller = controller;
     serviceWorker.dispatch("controllerchange");
     return controller;
@@ -442,6 +458,9 @@ function updateControllerHarness({
   locationHref,
   agent,
   chat,
+  canonicalizeImage,
+  createObjectUrl,
+  revokeObjectUrl,
 } = {}) {
   const document = appDocument({ basePath });
   const shared = environment ?? updateEnvironment({ waiting, controlled, onUpdate, registerPromise });
@@ -485,6 +504,9 @@ function updateControllerHarness({
     },
     credentialSaver: async () => false,
     now,
+    ...(canonicalizeImage === undefined ? {} : { canonicalizeImage }),
+    ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
+    ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
   });
   return {
     app,
@@ -846,6 +868,7 @@ test("worker never intercepts or caches auth, Agent, LocalLLM, artifacts, POST, 
     ["/api/transport/agent/v1/artifacts/get", {}],
     ["/artifacts/private-result", {}],
     ["/api/localllm/v1/chat/completions", {}],
+    ["/api/chat/runs/start", { method: "POST" }],
     ["/agent/v1/capabilities", {}],
     ["/v1/chat/completions", {}],
     [staticAssetRoute, { method: "POST" }],
@@ -868,23 +891,28 @@ test("one tab confirms globally, all old controlled tabs navigate once, and init
   const environment = updateEnvironment();
   const confirmingTab = updateControllerHarness({ environment });
   const deferredTab = updateControllerHarness({ environment });
+  deferredTab.document.getElementById("message-input").value = "keep this tab unsafe";
   await Promise.all([confirmingTab.app.initialize(), deferredTab.app.initialize()]);
   await Promise.resolve();
   assert.equal(confirmingTab.document.getElementById("update-banner").hidden, false);
   assert.equal(deferredTab.document.getElementById("update-banner").hidden, false);
+  assert.deepEqual(environment.workerMessages, [], "an unobserved merely-different release is never assumed to be a successor");
   deferredTab.document.getElementById("defer-update").dispatch("click");
   assert.equal(deferredTab.document.getElementById("update-banner").hidden, true);
-  assert.deepEqual(environment.workerMessages, [], "Later must not activate the waiting worker");
+  assert.deepEqual(environment.workerMessages, [], "Later must not activate from the unsafe tab");
+  deferredTab.document.getElementById("message-input").value = "";
+  deferredTab.document.getElementById("message-input").dispatch("input");
 
   confirmingTab.document.getElementById("apply-update").dispatch("click");
   confirmingTab.document.getElementById("apply-update").dispatch("click");
   assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
-  environment.transitionController();
-  environment.serviceWorker.dispatch("controllerchange");
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await Promise.resolve();
   confirmingTab.runTimers(1_000);
   deferredTab.runTimers(1_000);
-  assert.deepEqual(confirmingTab.replacements, ["https://llm.lazying.art/"]);
-  assert.deepEqual(deferredTab.replacements, ["https://llm.lazying.art/"], "Later cannot veto a successor activated by another controlled tab");
+  assert.deepEqual(confirmingTab.replacements, [`https://llm.lazying.art/?v=${NEXT_RELEASE}`]);
+  assert.deepEqual(deferredTab.replacements, [`https://llm.lazying.art/?v=${NEXT_RELEASE}`], "Later cannot veto a successor activated by another controlled tab");
   assert.equal(confirmingTab.reloads, 0);
   assert.equal(deferredTab.reloads, 0);
 
@@ -892,21 +920,21 @@ test("one tab confirms globally, all old controlled tabs navigate once, and init
   const initialTab = updateControllerHarness({ environment: initialEnvironment, controlled: false });
   await initialTab.app.initialize();
   await Promise.resolve();
-  initialEnvironment.transitionController();
+  initialEnvironment.transitionController(CURRENT_RELEASE);
   assert.equal(initialTab.reloads, 0, "first control acquisition is not an app update");
 
-  const installing = eventTarget();
+  const installing = initialEnvironment.waitingWorker;
   initialEnvironment.registration.installing = installing;
   initialEnvironment.registration.waiting = initialEnvironment.waitingWorker;
   initialEnvironment.registration.dispatch("updatefound");
   installing.dispatch("statechange");
   await Promise.resolve();
-  initialTab.document.getElementById("apply-update").dispatch("click");
-  assert.deepEqual(initialEnvironment.workerMessages, [{ type: "SKIP_WAITING" }]);
-  initialEnvironment.transitionController();
-  initialEnvironment.serviceWorker.dispatch("controllerchange");
+  assert.deepEqual(initialEnvironment.workerMessages, [{ type: "SKIP_WAITING" }], "a worker observed reaching waiting is a proven successor");
+  initialEnvironment.registration.waiting = null;
+  initialEnvironment.transitionController(NEXT_RELEASE);
+  await Promise.resolve();
   initialTab.runTimers(1_000);
-  assert.deepEqual(initialTab.replacements, ["https://llm.lazying.art/"], "the same tab navigates for a later approved successor");
+  assert.deepEqual(initialTab.replacements, [`https://llm.lazying.art/?v=${NEXT_RELEASE}`], "the same tab navigates for a later approved successor");
   assert.equal(initialTab.reloads, 0);
 });
 
@@ -922,7 +950,7 @@ test("a fresh exact-release install skips the redundant startup update and never
   assert.equal(environment.registration.updateCalls, 0, "an uncontrolled first load must not race its initial install with update()");
   assert.equal(harness.document.getElementById("update-banner").hidden, true);
 
-  const installing = eventTarget();
+  const installing = environment.waitingWorker;
   environment.registration.installing = installing;
   environment.registration.waiting = environment.waitingWorker;
   environment.registration.dispatch("updatefound");
@@ -936,7 +964,7 @@ test("a fresh exact-release install skips the redundant startup update and never
   assert.equal(environment.workerReleaseQueries.length, 1);
 });
 
-test("waiting-worker release proof suppresses only the exact shell release and offers a verified successor", async () => {
+test("waiting-worker release proof suppresses the active shell and never autoactivates an unobserved different hash", async () => {
   const sameEnvironment = updateEnvironment({ waitingReleaseId: CURRENT_RELEASE });
   const same = updateControllerHarness({ environment: sameEnvironment });
   await same.app.initialize();
@@ -949,8 +977,55 @@ test("waiting-worker release proof suppresses only the exact shell release and o
   await newer.app.initialize();
   await Promise.resolve();
   assert.equal(newer.document.getElementById("update-banner").hidden, false);
+  assert.deepEqual(newerEnvironment.workerMessages, [], "release hashes have no ordering, so inequality is not successor proof");
   newer.document.getElementById("apply-update").dispatch("click");
   assert.deepEqual(newerEnvironment.workerMessages, [{ type: "SKIP_WAITING" }]);
+});
+
+test("a pre-existing stale waiting hash is offered but never activated automatically", async () => {
+  const environment = updateEnvironment({ waitingReleaseId: OLD_RELEASE });
+  const harness = updateControllerHarness({ environment });
+  await harness.app.initialize();
+  await Promise.resolve();
+
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+  assert.deepEqual(environment.workerMessages, []);
+});
+
+test("the current page release replaces a proven older active controller but not an already-current controller", async () => {
+  const upgradeEnvironment = updateEnvironment({
+    waitingReleaseId: CURRENT_RELEASE,
+    activeReleaseId: OLD_RELEASE,
+  });
+  const upgrade = updateControllerHarness({ environment: upgradeEnvironment });
+  await upgrade.app.initialize();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(upgradeEnvironment.workerMessages, [{ type: "SKIP_WAITING" }]);
+
+  const freshEnvironment = updateEnvironment({
+    waitingReleaseId: CURRENT_RELEASE,
+    activeReleaseId: CURRENT_RELEASE,
+  });
+  const fresh = updateControllerHarness({ environment: freshEnvironment });
+  await fresh.app.initialize();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(fresh.document.getElementById("update-banner").hidden, true);
+  assert.deepEqual(freshEnvironment.workerMessages, []);
+});
+
+test("a same-page waiting release stays visibly manual when the incumbent controller cannot prove its identity", async () => {
+  const environment = updateEnvironment({
+    waitingReleaseId: CURRENT_RELEASE,
+    respondToActiveReleaseQuery: false,
+  });
+  const harness = updateControllerHarness({ environment });
+  await harness.app.initialize();
+  await Promise.resolve();
+
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+  assert.deepEqual(environment.workerMessages, []);
 });
 
 test("an unidentified legacy waiting worker is conservatively offered after the bounded proof timeout", async () => {
@@ -969,7 +1044,7 @@ test("an unidentified legacy waiting worker is conservatively offered after the 
 });
 
 test("controller migration uses a content-versioned full navigation and defers tabs with browser-only work", async () => {
-  const environment = updateEnvironment();
+  const environment = updateEnvironment({ waiting: false });
   const safe = updateControllerHarness({ environment });
   const unsafe = updateControllerHarness({ environment });
   await Promise.all([safe.app.initialize(), unsafe.app.initialize()]);
@@ -1070,7 +1145,7 @@ test("a paused authoritative chat finalization defers update activation and cont
     prepareCancellation() { throw new Error("unexpected cancellation"); },
     async cancelRun() { throw new Error("unexpected cancellation"); },
   };
-  const environment = updateEnvironment();
+  const environment = updateEnvironment({ waiting: false });
   const harness = updateControllerHarness({
     environment,
     restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
@@ -1082,6 +1157,14 @@ test("a paused authoritative chat finalization defers update activation and cont
   harness.document.getElementById("message-input").value = "Keep this completed response recoverable";
   await harness.app.submitMessage({ preventDefault() {} });
   assert.equal(harness.document.getElementById("workspace").dataset.status, "finalizing");
+
+  const installing = environment.waitingWorker;
+  environment.registration.installing = installing;
+  environment.registration.waiting = environment.waitingWorker;
+  environment.registration.dispatch("updatefound");
+  installing.dispatch("statechange");
+  await Promise.resolve();
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
 
   harness.document.getElementById("apply-update").dispatch("click");
   assert.deepEqual(environment.workerMessages, [], "Finalizing cannot activate a waiting worker");
@@ -1138,7 +1221,7 @@ test("a deferred tab replaces an obsolete R2 handshake when a distinct R3 contro
   assert.equal(harness.reloads, 0);
 });
 
-test("a release-handshake timeout replaces a stale versioned URL with the stable worker scope", async () => {
+test("a release-handshake timeout never navigates until Apply verifies the exact active release", async () => {
   const staleRelease = `release-${"1".repeat(64)}`;
   const harness = updateControllerHarness({
     locationHref: `https://llm.lazying.art/?v=${staleRelease}`,
@@ -1149,9 +1232,48 @@ test("a release-handshake timeout replaces a stale versioned URL with the stable
   assert.deepEqual(controller.messages, [{ type: "GET_LAZYING_AGENT_RELEASE" }]);
 
   harness.runTimers(1_000);
+  await Promise.resolve();
 
-  assert.deepEqual(harness.replacements, ["https://llm.lazying.art/"]);
-  assert.equal(harness.reloads, 0, "the stale release query must never be reloaded");
+  assert.deepEqual(harness.replacements, [], "unknown controller identity must keep the current page intact");
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+  assert.equal(harness.document.getElementById("apply-update").disabled, false);
+
+  controller.releaseId = NEXT_RELEASE;
+  harness.document.getElementById("apply-update").dispatch("click");
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(harness.replacements, [`https://llm.lazying.art/?v=${NEXT_RELEASE}`]);
+  assert.equal(harness.reloads, 0, "neither the stale URL release nor an unversioned fallback may be loaded");
+  assert.deepEqual(controller.messages, [
+    { type: "GET_LAZYING_AGENT_RELEASE" },
+    { type: "GET_LAZYING_AGENT_RELEASE" },
+  ]);
+});
+
+test("a same-origin worker with a protocol-invalid release label cannot autoactivate or navigate", async () => {
+  const invalidRelease = "legacy-worker-v99";
+  const environment = updateEnvironment({ waitingReleaseId: invalidRelease });
+  const harness = updateControllerHarness({ environment });
+  await harness.app.initialize();
+  await Promise.resolve();
+
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+  assert.deepEqual(environment.workerMessages, [], "an invalid waiting-worker label has no successor provenance");
+
+  environment.registration.waiting = null;
+  const invalidController = environment.transitionController(invalidRelease);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(harness.replacements, []);
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+
+  harness.document.getElementById("apply-update").dispatch("click");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(harness.replacements, [], "manual retry also requires an exact release grammar proof");
+  assert.equal(harness.document.getElementById("apply-update").disabled, false);
+  assert.equal(invalidController.messages.length >= 2, true);
 });
 
 test("authoritative terminal Agent states remain update-safe while retaining their run identity", async () => {
@@ -1210,9 +1332,79 @@ test("Update refuses to activate while a password or draft is only browser-held"
   assert.match(harness.document.getElementById("toast").textContent, /Finish the current draft or response/u);
 });
 
+test("a staged image keeps a verified waiting worker inactive until the image is explicitly removed", async () => {
+  const environment = updateEnvironment({ waiting: false });
+  const capability = {
+    schemaVersion: "1",
+    enabled: false,
+    agent: { kind: "aginti", label: "AgInTi Agent" },
+    model: { label: "LocalLLM" },
+    actions: { cancel: false, resume: false, retry: false },
+    attachments: { enabled: false },
+    artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+  };
+  const agent = {
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async *streamRunEvents() {},
+  };
+  const chat = {
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread() {}, async createThread() {}, async retryCreateThread() {},
+    async listThreads() { return { threads: [] }; }, async getThread() {}, async listMessages() {}, async getAttachment() {},
+    prepareRun() {}, async startRun() {}, async retryRun() {}, async getRunStatus() {}, async *streamRunEvents() {},
+    prepareCancellation() {}, async cancelRun() {},
+  };
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const harness = updateControllerHarness({
+    environment,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000200",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: () => "blob:staged-update-image",
+    revokeObjectUrl() {},
+  });
+  await harness.app.initialize();
+  const imageInput = harness.document.getElementById("image-input");
+  imageInput.files = [{ name: "staged.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("image-preview").hidden, false);
+
+  const installing = environment.waitingWorker;
+  environment.registration.installing = installing;
+  environment.registration.waiting = environment.waitingWorker;
+  environment.registration.dispatch("updatefound");
+  installing.dispatch("statechange");
+  await Promise.resolve();
+
+  assert.deepEqual(environment.workerMessages, [], "a browser-held image must block automatic activation");
+  assert.equal(harness.document.getElementById("update-banner").hidden, false);
+  harness.document.getElementById("apply-update").dispatch("click");
+  assert.deepEqual(environment.workerMessages, []);
+
+  harness.document.getElementById("remove-image").dispatch("click");
+  harness.runTimers(1_000);
+  assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
+});
+
 test("Later re-prompts after bounded deferral and a newer waiting worker bypasses the old deferral", async () => {
   let instant = 10;
   const harness = updateControllerHarness({ now: () => instant });
+  harness.document.getElementById("message-input").value = "keep the waiting worker unsafe";
   await harness.app.initialize();
   await Promise.resolve();
   harness.document.getElementById("defer-update").dispatch("click");
@@ -1223,7 +1415,7 @@ test("Later re-prompts after bounded deferral and a newer waiting worker bypasse
 
   harness.document.getElementById("defer-update").dispatch("click");
   const newerWorker = harness.makeWorker(`release-${"c".repeat(64)}`);
-  const installing = eventTarget();
+  const installing = newerWorker;
   harness.registration.installing = installing;
   harness.registration.dispatch("updatefound");
   harness.registration.waiting = newerWorker;
@@ -1235,9 +1427,9 @@ test("Later re-prompts after bounded deferral and a newer waiting worker bypasse
 
 test("failed update activation re-enables controls and never leaves a dead banner", async () => {
   const failedPost = updateControllerHarness();
+  failedPost.waitingWorker.throwOnPost = true;
   await failedPost.app.initialize();
   await Promise.resolve();
-  failedPost.waitingWorker.throwOnPost = true;
   failedPost.document.getElementById("apply-update").dispatch("click");
   assert.equal(failedPost.document.getElementById("apply-update").disabled, false);
   assert.equal(failedPost.document.getElementById("defer-update").disabled, false);
@@ -1262,14 +1454,14 @@ test("updatefound shows a visible prompt only after the successor reaches waitin
   await harness.app.initialize();
   await Promise.resolve();
   assert.equal(harness.document.getElementById("update-banner").hidden, true);
-  const installing = eventTarget();
+  const installing = harness.waitingWorker;
   harness.registration.installing = installing;
   harness.registration.dispatch("updatefound");
   harness.registration.waiting = harness.waitingWorker;
   installing.dispatch("statechange");
   await Promise.resolve();
   assert.equal(harness.document.getElementById("update-banner").hidden, false);
-  assert.deepEqual(harness.workerMessages, []);
+  assert.deepEqual(harness.workerMessages, [{ type: "SKIP_WAITING" }], "an idle safe tab activates a verified waiting worker automatically");
 });
 
 test("foreground and periodic update checks are online-only and throttled", async () => {

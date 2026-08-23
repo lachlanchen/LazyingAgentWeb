@@ -296,7 +296,7 @@ function requestAttachment(value) {
   if (!['image/jpeg', 'image/png'].includes(attachment.mediaType)
       || typeof attachment.data !== "string" || attachment.data.length < 4
       || attachment.data.length > VISION_BASE64_LIMIT || attachment.data.length % 4 !== 0
-      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(attachment.data)) {
+      || !boundedBase64(attachment.data)) {
     throw new TypeError("prepared run attachment is invalid");
   }
   return Object.freeze({
@@ -306,15 +306,40 @@ function requestAttachment(value) {
   });
 }
 
+function boundedBase64(value) {
+  let padding = 0;
+  if (value.endsWith("=")) padding = value.endsWith("==") ? 2 : 1;
+  const contentLength = value.length - padding;
+  if ((padding === 0 && contentLength % 4 !== 0)
+      || (padding === 1 && contentLength % 4 !== 3)
+      || (padding === 2 && contentLength % 4 !== 2)) return false;
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = value.charCodeAt(index);
+    if (!((code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+        || (code >= 48 && code <= 57) || code === 43 || code === 47)) return false;
+  }
+  return true;
+}
+
 function bytesToBase64(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > VISION_IMAGE_LIMIT) {
     throw new TypeError("attachment bytes are invalid");
   }
-  const chunks = [];
-  for (let offset = 0; offset < bytes.byteLength; offset += 32 * 1024) {
-    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32 * 1024)));
+  // Keep both the temporary binary string and every spread call small. A
+  // single multi-megabyte binary join materially increases peak memory in a
+  // mobile PWA before JSON serialization makes the required wire copy.
+  const encoded = [];
+  const encodingChunkBytes = 12 * 1024; // Divisible by three, so only the final chunk is padded.
+  const spreadChunkBytes = 1024;
+  for (let offset = 0; offset < bytes.byteLength; offset += encodingChunkBytes) {
+    const end = Math.min(offset + encodingChunkBytes, bytes.byteLength);
+    let binary = "";
+    for (let cursor = offset; cursor < end; cursor += spreadChunkBytes) {
+      binary += String.fromCharCode(...bytes.subarray(cursor, Math.min(cursor + spreadChunkBytes, end)));
+    }
+    encoded.push(btoa(binary));
   }
-  return btoa(chunks.join(""));
+  return encoded.join("");
 }
 
 async function sha256Bytes(bytes) {
@@ -652,10 +677,12 @@ async function responseFailure(response) {
       if (typeof error.code === "string" && ERROR_CODE.test(error.code)) code = error.code;
     } catch { code = "request_failed"; }
   }
+  const status = Number.isSafeInteger(response?.status) ? response.status : 503;
   return new DirectChatTransportError("Direct Chat request was not accepted.", {
     code,
-    status: Number.isSafeInteger(response?.status) ? response.status : 503,
-    retryable: [408, 425, 429].includes(response?.status) || response?.status >= 500,
+    status,
+    retryable: ["request_aborted", "request_error"].includes(code)
+      || [408, 425, 429].includes(status) || status >= 500,
   });
 }
 

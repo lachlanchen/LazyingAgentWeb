@@ -41,6 +41,7 @@ const DYNAMIC_CACHE_CONTROL = 'no-store';
 const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
 const REMEMBERED_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const GLOBAL_DISPATCH_RETRY_MS = 250;
+const REQUEST_BODY_TIMEOUT_MARGIN_MS = 30_000;
 const SAFE_FAILURE_CODES = new Set([
   'provider_unavailable',
   'timeout',
@@ -1548,7 +1549,10 @@ export function createCloudRequestHandler({
     releaseId: { value: assets.releaseId, enumerable: true },
     closeBackgroundJobs: { value: closeGenerationJobs, enumerable: true },
     activeDirectChatJobs: { get: () => jobs.size, enumerable: true },
-    activeStreams: { get: () => streamGate.active, enumerable: true }
+    activeStreams: { get: () => streamGate.active, enumerable: true },
+    maximumBodyReadTimeoutMs: {
+      value: Math.max(limits.bodyTimeoutMs, limits.visionBodyTimeoutMs)
+    }
   });
   return handler;
 }
@@ -1568,7 +1572,10 @@ export function createCloudServer(options) {
     uniqueHeaders: ['content-length', 'content-type', 'cache-control']
   }, handler);
   server.headersTimeout = 10_000;
-  server.requestTimeout = 20_000;
+  // Node's outer request deadline begins before the route-level body reader.
+  // Keep a bounded allowance for headers/authentication ahead of the longest
+  // accepted body window so mobile vision uploads reach the stricter reader.
+  server.requestTimeout = handler.maximumBodyReadTimeoutMs + REQUEST_BODY_TIMEOUT_MARGIN_MS;
   server.keepAliveTimeout = 5_000;
   server.maxHeadersCount = 64;
   server.on('close', () => { void handler.closeBackgroundJobs(); });

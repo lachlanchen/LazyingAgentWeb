@@ -8,6 +8,7 @@ export const AGENT_WEB_MODULE_ROUTES = Object.freeze([
   "/assets/cloud-session-client.js",
   "/assets/direct-chat-client.js",
   "/assets/vision-image-client.js",
+  "/assets/vision-image-sanitizer.js",
   "/assets/aginti-client.js",
   "/assets/aginti-protocol.js",
   "/assets/presentation-state.js",

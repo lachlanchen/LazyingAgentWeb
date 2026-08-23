@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import test from 'node:test';
 
 import { ValidationError } from '../src/errors.js';
@@ -42,6 +43,19 @@ function pngRequest(bytes = Buffer.from(createPwaIcon(192))) {
   };
 }
 
+function appendInsideFirstIdat(bytes, trailing) {
+  const typeOffset = bytes.indexOf(Buffer.from('IDAT', 'ascii'));
+  const lengthOffset = typeOffset - 4;
+  const dataLength = bytes.readUInt32BE(lengthOffset);
+  const dataStart = typeOffset + 4;
+  const chunkEnd = dataStart + dataLength + 4;
+  return Buffer.concat([
+    bytes.subarray(0, lengthOffset),
+    pngChunk('IDAT', Buffer.concat([bytes.subarray(dataStart, dataStart + dataLength), trailing])),
+    bytes.subarray(chunkEnd)
+  ]);
+}
+
 test('accepts one canonical PNG or JPEG and returns a private byte record plus public descriptor', () => {
   const png = validateVisionAttachmentRequest(pngRequest());
   assert.equal(png.mediaType, 'image/png');
@@ -66,7 +80,7 @@ test('accepts one canonical PNG or JPEG and returns a private byte record plus p
   assert.deepEqual([jpeg.width, jpeg.height, jpeg.byteLength], [1, 1, 160]);
 });
 
-test('rejects noncanonical base64, media mismatch, metadata, corruption, and unsafe dimensions', () => {
+test('rejects noncanonical base64, media mismatch, corruption, unknown data, and unsafe dimensions', () => {
   const png = Buffer.from(createPwaIcon(192));
   const invalidRequests = [
     { ...pngRequest(), extra: true },
@@ -90,7 +104,9 @@ test('rejects noncanonical base64, media mismatch, metadata, corruption, and uns
     pngChunk('tEXt', Buffer.from('author\0private value', 'latin1')),
     png.subarray(iendOffset)
   ]);
-  assert.throws(() => validateVisionAttachmentRequest(pngRequest(withMetadata)), /metadata/u);
+  const sanitizedMetadata = validateVisionAttachmentRequest(pngRequest(withMetadata));
+  assert.deepEqual(sanitizedMetadata.content, png);
+  assert.equal(sanitizedMetadata.byteLength, png.byteLength);
 
   const withUnknownAncillaryData = Buffer.concat([
     png.subarray(0, iendOffset),
@@ -108,22 +124,26 @@ test('rejects noncanonical base64, media mismatch, metadata, corruption, and uns
     Buffer.from([0xff, 0xe1, 0x00, 0x04, 0x00, 0x00]),
     jpeg.subarray(2)
   ]);
-  assert.throws(() => validateVisionAttachmentRequest({
+  assert.deepEqual(validateVisionAttachmentRequest({
     attachmentId: ATTACHMENT_ID,
     mediaType: 'image/jpeg',
     data: jpegWithExif.toString('base64')
-  }), /metadata/u);
+  }).content, jpeg);
 
   const jpegWithApp3 = Buffer.concat([
     jpeg.subarray(0, 2),
     Buffer.from([0xff, 0xe3, 0x00, 0x04, 0x00, 0x00]),
     jpeg.subarray(2)
   ]);
-  assert.throws(() => validateVisionAttachmentRequest({
+  assert.deepEqual(validateVisionAttachmentRequest({
     attachmentId: ATTACHMENT_ID,
     mediaType: 'image/jpeg',
     data: jpegWithApp3.toString('base64')
-  }), /metadata/u);
+  }).content, jpeg);
+
+  const corruptedMetadata = Buffer.from(withMetadata);
+  corruptedMetadata[iendOffset + 12] ^= 1;
+  assert.throws(() => validateVisionAttachmentRequest(pngRequest(corruptedMetadata)), /checksum/u);
 
   const unsafeDimensions = Buffer.from(png);
   unsafeDimensions.writeUInt32BE(VISION_ATTACHMENT_LIMITS.maximumEdge + 1, 16);
@@ -149,4 +169,19 @@ test('revalidates durable bytes and refuses a descriptor or digest mismatch', ()
   const corrupted = Buffer.from(stored.content);
   corrupted[corrupted.byteLength - 20] ^= 1;
   assert.throws(() => validateStoredVisionAttachment({ ...stored, content: corrupted }), ValidationError);
+});
+
+test('rejects CRC-valid trailing bytes and a concatenated zlib stream inside IDAT', () => {
+  const png = Buffer.from(createPwaIcon(192));
+  const withTrailingPayload = appendInsideFirstIdat(png, Buffer.from('non-pixel-payload', 'ascii'));
+  assert.throws(
+    () => validateVisionAttachmentRequest(pngRequest(withTrailingPayload)),
+    /trailing bytes/u
+  );
+
+  const withSecondStream = appendInsideFirstIdat(png, deflateSync(Buffer.from('second-zlib-stream', 'ascii')));
+  assert.throws(
+    () => validateVisionAttachmentRequest(pngRequest(withSecondStream)),
+    /trailing bytes/u
+  );
 });

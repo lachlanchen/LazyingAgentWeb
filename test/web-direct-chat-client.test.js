@@ -287,6 +287,57 @@ test("vision capabilities, canonical image retries, and authenticated previews s
   assert.equal(calls[3].options.headers.get("x-csrf-token"), CSRF);
 });
 
+test("maximum-size image base64 uses bounded mobile intermediates and stays canonical", () => {
+  const bytes = new Uint8Array(4 * 1024 * 1024);
+  for (let index = 0; index < bytes.byteLength; index += 1) bytes[index] = index & 0xff;
+  const originalBtoa = globalThis.btoa;
+  let calls = 0;
+  let maximumInput = 0;
+  try {
+    globalThis.btoa = (value) => {
+      calls += 1;
+      maximumInput = Math.max(maximumInput, value.length);
+      return originalBtoa(value);
+    };
+    const client = new DirectChatBrowserClient(clientOptions());
+    const request = client.prepareRun({
+      threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
+      content: "Describe the maximum-size image.",
+      expectedRevision: 0,
+      expectedHash: null,
+      attachment: {
+        attachmentId: "image_0000000000000099",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 4_096,
+        height: 4_096,
+        bytes,
+      },
+    });
+    assert.ok(calls > 1);
+    assert.ok(maximumInput <= 12 * 1024, `largest btoa input was ${maximumInput} bytes`);
+    assert.equal(request.attachment.data.length, Math.ceil(bytes.byteLength / 3) * 4);
+    assert.deepEqual(Buffer.from(request.attachment.data, "base64"), Buffer.from(bytes));
+  } finally {
+    globalThis.btoa = originalBtoa;
+  }
+});
+
+test("server body-abort envelopes remain retryable for the app's exact idempotent ticket", async () => {
+  for (const code of ["request_aborted", "request_error"]) {
+    const client = new DirectChatBrowserClient(clientOptions({
+      fetchImpl: async () => jsonResponse({ error: { code, message: "Body read stopped." } }, { status: 400 }),
+    }));
+    await assert.rejects(
+      () => client.listThreads(),
+      (error) => error instanceof DirectChatTransportError
+        && error.code === code
+        && error.status === 400
+        && error.retryable === true,
+    );
+  }
+});
+
 test("attachment previews reject dishonest metadata, digest changes, and oversized streams", async () => {
   const bytes = Buffer.from(createPwaIcon(192));
   const descriptor = {

@@ -52,6 +52,7 @@ const LOCAL_MODULES = Object.freeze({
   "/assets/cloud-session-client.js": new URL("./cloud-session-client.js", import.meta.url),
   "/assets/direct-chat-client.js": new URL("./direct-chat-client.js", import.meta.url),
   "/assets/vision-image-client.js": new URL("./vision-image-client.js", import.meta.url),
+  "/assets/vision-image-sanitizer.js": new URL("./vision-image-sanitizer.js", import.meta.url),
   "/assets/aginti-client.js": new URL("./aginti-client.js", import.meta.url),
   "/assets/aginti-protocol.js": new URL("./aginti-protocol.js", import.meta.url),
   "/assets/presentation-state.js": new URL("./presentation-state.js", import.meta.url),

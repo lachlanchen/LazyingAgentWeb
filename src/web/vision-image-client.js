@@ -1,3 +1,5 @@
+import { sanitizeVisionImageBytes } from "./vision-image-sanitizer.js";
+
 export const BROWSER_VISION_IMAGE_LIMITS = Object.freeze({
   sourceBytes: 8 * 1024 * 1024,
   canonicalBytes: 4 * 1024 * 1024,
@@ -6,6 +8,7 @@ export const BROWSER_VISION_IMAGE_LIMITS = Object.freeze({
 });
 
 const ACCEPTED_TYPES = new Set(["image/jpeg", "image/png"]);
+const PNG_SIGNATURE = Object.freeze([137, 80, 78, 71, 13, 10, 26, 10]);
 const JPEG_SOF_MARKERS = new Set([
   0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
   0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
@@ -26,8 +29,7 @@ function checkedDimensions(width, height) {
 }
 
 function pngDimensions(bytes) {
-  const signature = [137, 80, 78, 71, 13, 10, 26, 10];
-  if (bytes.byteLength < 24 || signature.some((value, index) => bytes[index] !== value)
+  if (bytes.byteLength < 24 || PNG_SIGNATURE.some((value, index) => bytes[index] !== value)
       || bytes[12] !== 73 || bytes[13] !== 72 || bytes[14] !== 68 || bytes[15] !== 82) {
     fail("selected file is not a valid PNG image");
   }
@@ -68,6 +70,8 @@ export function inspectVisionImageBytes(bytes, mediaType) {
   if (!ACCEPTED_TYPES.has(mediaType)) fail("image must be JPEG or PNG");
   return mediaType === "image/png" ? pngDimensions(bytes) : jpegDimensions(bytes);
 }
+
+export { sanitizeVisionImageBytes };
 
 function canvasBlob(canvas, mediaType) {
   return new Promise((resolve, reject) => {
@@ -117,11 +121,15 @@ export async function canonicalizeVisionImage(file, {
     }
     context.drawImage(bitmap, 0, 0, decoded.width, decoded.height);
     const blob = await canvasBlob(canvas, file.type);
-    if (blob.type !== file.type || blob.size < 1 || blob.size > BROWSER_VISION_IMAGE_LIMITS.canonicalBytes) {
+    if (blob.type !== file.type || blob.size < 1 || blob.size > BROWSER_VISION_IMAGE_LIMITS.sourceBytes) {
       fail("canonical image exceeds 4 MiB; choose a smaller image");
     }
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    if (bytes.byteLength !== blob.size) fail("canonical image changed while it was read");
+    const canvasBytes = new Uint8Array(await blob.arrayBuffer());
+    if (canvasBytes.byteLength !== blob.size) fail("canonical image changed while it was read");
+    const bytes = sanitizeVisionImageBytes(canvasBytes, blob.type);
+    if (bytes.byteLength > BROWSER_VISION_IMAGE_LIMITS.canonicalBytes) {
+      fail("canonical image exceeds 4 MiB; choose a smaller image");
+    }
     const canonical = inspectVisionImageBytes(bytes, blob.type);
     if (canonical.width !== decoded.width || canonical.height !== decoded.height) {
       fail("canonical image dimensions changed unexpectedly");
@@ -133,7 +141,7 @@ export async function canonicalizeVisionImage(file, {
       width: canonical.width,
       height: canonical.height,
       bytes,
-      previewBlob: blob,
+      previewBlob: new Blob([bytes], { type: blob.type }),
     });
   } finally {
     bitmap?.close?.();

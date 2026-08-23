@@ -706,6 +706,342 @@ test("two sequential normal turns advance the authoritative ledger without dupli
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
 });
 
+test("accepted generation stream authentication expiry shows sign-in and reconnects the exact run read-only", async () => {
+  let thread = null;
+  let messages = [];
+  let generation = chatGeneration();
+  let creates = 0;
+  let starts = 0;
+  let runRetries = 0;
+  let streams = 0;
+  let statuses = 0;
+  const streamPaused = Promise.withResolvers();
+  const releaseExpiredStream = Promise.withResolvers();
+  const chat = baseChat({
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_stream_reauth_x" });
+    },
+    async createThread(ticket) {
+      creates += 1;
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async retryCreateThread() { throw new Error("thread retry must not run"); },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_stream_reauth_xxxxx" });
+    },
+    async startRun(ticket) {
+      starts += 1;
+      messages = [chatMessage(1, "user", ticket.content)];
+      thread = chatThread({
+        title: thread.title,
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+        currentGenerationId: CHAT_GENERATION_ID,
+      });
+      return { request: ticket, generation };
+    },
+    async retryRun() { runRetries += 1; throw new Error("run retry must not run"); },
+    async getRunStatus({ threadId, generationId }) {
+      statuses += 1;
+      assert.equal(threadId, CHAT_THREAD_ID);
+      assert.equal(generationId, CHAT_GENERATION_ID);
+      return { generation };
+    },
+    async *streamRunEvents({ afterSequence, onCursor }) {
+      streams += 1;
+      if (streams === 1) {
+        assert.equal(afterSequence, 0);
+        await onCursor({ afterSequence: 1 });
+        yield { type: "delta", delta: { content: "Part" }, afterSequence: 1 };
+        streamPaused.resolve();
+        await releaseExpiredStream.promise;
+        throw new DirectChatTransportError("session expired during stream", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      assert.equal(afterSequence, 1, "same-account recovery resumes from the last verified cursor");
+      await onCursor({ afterSequence: 2 });
+      yield { type: "delta", delta: { content: "ial" }, afterSequence: 2 };
+      messages = [messages[0], chatMessage(2, "assistant", "Partial")];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      generation = chatGeneration({ status: "completed", terminal: true });
+      yield { type: "generation", generation, afterSequence: 2 };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "stream-recovery-csrf-token" }),
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Start one durable generation";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await streamPaused.promise;
+  browser.document.getElementById("message-input").value = "Keep this browser-only follow-up draft";
+  releaseExpiredStream.resolve();
+  await submission;
+
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("app-view").hidden, true);
+  assert.match(browser.document.getElementById("login-error").textContent, /session expired/iu);
+  assert.equal(browser.document.getElementById("message-input").value, "Keep this browser-only follow-up draft");
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(browser.document.getElementById("message-input").value, "Keep this browser-only follow-up draft");
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+  assert.equal(streams, 2);
+  assert.equal(statuses, 1);
+  assert.match(browser.document.getElementById("messages").textContent, /Start one durable generationPartial/u);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("a different account cannot inherit an expired stream cursor, output, thread, or browser-only draft", async () => {
+  let thread = null;
+  let messages = [];
+  let switchedAccount = false;
+  let creates = 0;
+  let starts = 0;
+  let streams = 0;
+  let statusReads = 0;
+  let oldThreadReadsAfterSwitch = 0;
+  const streamPaused = Promise.withResolvers();
+  const releaseExpiredStream = Promise.withResolvers();
+  const chat = baseChat({
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_cross_stream_x" });
+    },
+    async createThread(ticket) {
+      creates += 1;
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: switchedAccount ? [] : (thread ? [thread] : []) }; },
+    async getThread() {
+      if (switchedAccount) oldThreadReadsAfterSwitch += 1;
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_cross_stream_xxxxx" });
+    },
+    async startRun(ticket) {
+      starts += 1;
+      messages = [chatMessage(1, "user", ticket.content)];
+      thread = chatThread({
+        title: thread.title,
+        revision: 1,
+        ledgerHash: CHAT_HASH_A,
+        messageCount: 1,
+        ledgerBytes: messages[0].contentBytes,
+        currentGenerationId: CHAT_GENERATION_ID,
+      });
+      return { request: ticket, generation: chatGeneration() };
+    },
+    async getRunStatus() { statusReads += 1; return { generation: chatGeneration() }; },
+    async *streamRunEvents({ onCursor }) {
+      streams += 1;
+      await onCursor({ afterSequence: 1 });
+      yield { type: "delta", delta: { content: "private partial output" }, afterSequence: 1 };
+      streamPaused.resolve();
+      await releaseExpiredStream.promise;
+      throw new DirectChatTransportError("session expired during stream", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => {
+      switchedAccount = true;
+      return { authenticated: true, username: "different-account", csrfToken: "different-account-csrf-token" };
+    },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "old account generation prompt";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await streamPaused.promise;
+  browser.document.getElementById("message-input").value = "old account browser-only draft";
+  releaseExpiredStream.resolve();
+  await submission;
+
+  browser.document.getElementById("username").value = "different-account";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+  assert.doesNotMatch(browser.document.getElementById("messages").textContent, /old account|private partial/iu);
+  assert.equal(browser.document.getElementById("thread-list").children.length, 0);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.equal(oldThreadReadsAfterSwitch, 0);
+  assert.equal(statusReads, 0);
+  assert.equal(streams, 1);
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.match(browser.document.getElementById("toast").textContent, /previous account/iu);
+});
+
+test("completed generation finalization authentication expiry signs in and restores without replaying mutations", async () => {
+  let thread = null;
+  let messages = [];
+  const generation = chatGeneration({ status: "completed", terminal: true });
+  let finalizationExpired = false;
+  let postLoginSnapshotFailures = 0;
+  let creates = 0;
+  let starts = 0;
+  let runRetries = 0;
+  let statuses = 0;
+  let threadReads = 0;
+  const chat = baseChat({
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_finalize_reauth_x" });
+    },
+    async createThread(ticket) {
+      creates += 1;
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async retryCreateThread() { throw new Error("thread retry must not run"); },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() {
+      threadReads += 1;
+      if (finalizationExpired) throw new DirectChatTransportError("csrf expired during finalization", {
+        code: "csrf_rejected",
+        status: 403,
+        retryable: false,
+      });
+      if (postLoginSnapshotFailures > 0) {
+        postLoginSnapshotFailures -= 1;
+        throw new DirectChatTransportError("temporary snapshot outage after sign-in", {
+          code: "request_failed",
+          status: 503,
+          retryable: true,
+        });
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_finalize_reauth_xxx" });
+    },
+    async startRun(ticket) {
+      starts += 1;
+      messages = [chatMessage(1, "user", ticket.content), chatMessage(2, "assistant", "Final answer")];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      finalizationExpired = true;
+      return { request: ticket, generation };
+    },
+    async retryRun() { runRetries += 1; throw new Error("run retry must not run"); },
+    async getRunStatus({ threadId, generationId }) {
+      statuses += 1;
+      assert.equal(threadId, CHAT_THREAD_ID);
+      assert.equal(generationId, CHAT_GENERATION_ID);
+      return { generation };
+    },
+  });
+  const browser = harness({
+    chat,
+    agent: baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "finalize-recovery-csrf-token" }),
+  });
+  await browser.app.initialize();
+  browser.app.setMode("chat");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Complete exactly once";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("app-view").hidden, true);
+  assert.match(browser.document.getElementById("login-error").textContent, /server-owned generation/iu);
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+
+  finalizationExpired = false;
+  postLoginSnapshotFailures = 3;
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+  assert.equal(statuses, 0, "a transient post-login snapshot outage cannot fall through to status or mutation replay");
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+
+  const readsBeforeBlockedActions = threadReads;
+  const titleBeforeBlockedActions = browser.document.getElementById("conversation-title").textContent;
+  const laterDraft = "Keep this later draft while recovery is locked";
+  browser.document.getElementById("message-input").value = laterDraft;
+  assert.equal(browser.document.getElementById("new-thread").disabled, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("agent-mode").disabled, true);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, true);
+  browser.document.getElementById("new-thread").dispatch("click");
+  await browser.app.openThread(CHAT_THREAD_ID, { mode: "chat" });
+  browser.app.setMode("agent");
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(browser.document.getElementById("conversation-title").textContent, titleBeforeBlockedActions);
+  assert.equal(browser.document.getElementById("message-input").value, laterDraft);
+  assert.equal(threadReads, readsBeforeBlockedActions, "locked navigation cannot read or replace the recovered thread");
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+  assert.equal(statuses, 0);
+
+  await browser.app.resume();
+
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(runRetries, 0);
+  assert.equal(statuses, 1);
+  assert.equal(browser.document.getElementById("message-input").value, laterDraft);
+  assert.match(browser.document.getElementById("messages").textContent, /Complete exactly onceFinal answer/u);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("new-thread").disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+});
+
 test("PWA image control canonicalizes exactly one file, sends it once, and renders only authenticated previews", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const imagePrompt = "Describe the private image.\nFocus\ton its colors.";
@@ -1181,6 +1517,13 @@ test("a local image-run preparation failure cannot create an empty thread and re
   assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:retry-image");
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.match(browser.document.getElementById("toast").textContent, /image message was not sent[\s\S]*still ready/iu);
+  assert.deepEqual(browser.document.getElementById("workspace").dataset, {
+    mode: "chat",
+    status: "idle",
+    failureStage: "local_preparation",
+    failureCode: "run_ticket_invalid",
+    failureOperation: "local_run",
+  });
   assert.deepEqual(revokedUrls, [], "the restored preview keeps its original live object URL");
 
   await browser.app.submitMessage({ preventDefault() {} });
@@ -1201,6 +1544,7 @@ test("an existing-thread snapshot outage restores the exact image draft before a
   let failReads = false;
   let prepareRuns = 0;
   let startRuns = 0;
+  const waits = [];
   const revokedUrls = [];
   const chat = baseChat({
     async capabilities() {
@@ -1240,6 +1584,7 @@ test("an existing-thread snapshot outage restores the exact image draft before a
     },
     createObjectUrl() { return "blob:snapshot-retry-image"; },
     revokeObjectUrl(value) { revokedUrls.push(value); },
+    async wait(delay) { waits.push(delay); },
   });
   await browser.app.initialize();
   const imageInput = browser.document.getElementById("image-input");
@@ -1259,7 +1604,748 @@ test("an existing-thread snapshot outage restores the exact image draft before a
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
   assert.match(browser.document.getElementById("toast").textContent, /not sent[\s\S]*still ready/iu);
+  assert.deepEqual(waits, [250, 500]);
+  assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "snapshot");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "snapshot_unavailable");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureOperation, "snapshot");
   assert.deepEqual(revokedUrls, []);
+});
+
+test("a retryable snapshot transport failure backs off once and dispatches exactly one run", async () => {
+  const thread = chatThread();
+  let failNextSnapshot = false;
+  let snapshotFailures = 0;
+  let prepareRuns = 0;
+  let startRuns = 0;
+  const waits = [];
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (failNextSnapshot && snapshotFailures === 0) {
+        snapshotFailures += 1;
+        throw new DirectChatTransportError("temporary transport loss", {
+          code: "request_failed",
+          status: 503,
+          retryable: true,
+        });
+      }
+      return { thread };
+    },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) {
+      prepareRuns += 1;
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_snapshot_retry_once" });
+    },
+    async startRun(ticket) {
+      startRuns += 1;
+      return { request: ticket, generation: chatGeneration({ status: "failed", terminal: true }) };
+    },
+  });
+  const browser = harness({ chat, async wait(delay) { waits.push(delay); } });
+  await browser.app.initialize();
+  failNextSnapshot = true;
+  browser.document.getElementById("message-input").value = "Retry only the read";
+
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(snapshotFailures, 1);
+  assert.deepEqual(waits, [250]);
+  assert.equal(prepareRuns, 1);
+  assert.equal(startRuns, 1);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureStage, undefined);
+});
+
+test("expired authentication restores the detached image first and never auto-resends after same-account login", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const thread = chatThread();
+  const draft = "  Preserve this private image prompt exactly.  ";
+  let expired = false;
+  let starts = 0;
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (expired) throw new DirectChatTransportError("expired", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+      return { thread };
+    },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_auth_recovery_xxxxx" });
+    },
+    async startRun(ticket) {
+      starts += 1;
+      return { request: ticket, generation: chatGeneration({ status: "failed", terminal: true }) };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "replacement-csrf-token-value" }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000006",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:auth-recovery-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "private.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = draft;
+  expired = true;
+
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("app-view").hidden, true);
+  assert.equal(messageInput.value, draft);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:auth-recovery-image");
+  assert.equal(starts, 0);
+  assert.deepEqual(browser.document.getElementById("workspace").dataset, {
+    mode: "chat",
+    status: "idle",
+    failureStage: "authentication",
+    failureCode: "authentication_required",
+    failureOperation: "snapshot",
+  });
+  assert.doesNotMatch(JSON.stringify(browser.document.getElementById("workspace").dataset), /private|0000000000000006/iu);
+  assert.deepEqual(revoked, []);
+
+  expired = false;
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(messageInput.value, draft);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(starts, 0, "successful reauthentication never auto-dispatches the preserved request");
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts, 1);
+  assert.equal(messageInput.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.deepEqual(revoked, ["blob:auth-recovery-image"]);
+});
+
+test("same-account capability exhaustion keeps the recovered image visible, fenced, and removable", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const thread = chatThread();
+  const draft = "Keep this image while capability reads recover";
+  let expired = false;
+  let capabilityOutage = false;
+  let capabilityReads = 0;
+  const waits = [];
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      capabilityReads += 1;
+      if (capabilityOutage) throw new DirectChatTransportError("capability unavailable", {
+        code: "request_failed",
+        status: 503,
+        retryable: true,
+      });
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (expired) throw new DirectChatTransportError("expired", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+      return { thread };
+    },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) { return Object.freeze(request); },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "replacement-capability-csrf" }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000009",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:capability-recovery-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+    async wait(delay) { waits.push(delay); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "recover.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = draft;
+  expired = true;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  expired = false;
+  capabilityOutage = true;
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(capabilityReads, 4, "startup plus three bounded recovery capability reads");
+  assert.deepEqual(waits, [250, 500]);
+  assert.equal(messageInput.value, draft);
+  assert.equal(messageInput.disabled, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("remove-image").disabled, false);
+  assert.deepEqual(revoked, []);
+  assert.match(browser.document.getElementById("toast").textContent, /remains visible and unsent/iu);
+
+  browser.document.getElementById("remove-image").dispatch("click");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(messageInput.value, draft);
+  assert.equal(messageInput.disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.deepEqual(revoked, ["blob:capability-recovery-image"]);
+});
+
+test("same-account vision disablement keeps the recovered image visible until explicit removal", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const thread = chatThread();
+  const draft = "Keep this image when vision is authoritatively unavailable";
+  let expired = false;
+  let visionInput = true;
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      return visionInput
+        ? { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 }
+        : { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (expired) throw new DirectChatTransportError("expired", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+      return { thread };
+    },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) { return Object.freeze(request); },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "replacement-no-vision-csrf" }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000010",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:no-vision-recovery-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "recover.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = draft;
+  expired = true;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  expired = false;
+  visionInput = false;
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(messageInput.value, draft);
+  assert.equal(messageInput.disabled, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("remove-image").disabled, false);
+  assert.deepEqual(revoked, []);
+  assert.match(browser.document.getElementById("toast").textContent, /Image sending is unavailable/iu);
+
+  browser.document.getElementById("remove-image").dispatch("click");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(messageInput.value, draft);
+  assert.equal(messageInput.disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.deepEqual(revoked, ["blob:no-vision-recovery-image"]);
+});
+
+test("expired authentication never carries a private draft or image into a different account", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const thread = chatThread();
+  let expired = false;
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (expired) throw new DirectChatTransportError("expired", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+      return { thread };
+    },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) { return Object.freeze(request); },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "different-user", csrfToken: "different-csrf-token-value" }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000007",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:cross-account-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "private.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = "Private old-account draft";
+  expired = true;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  expired = false;
+  browser.document.getElementById("username").value = "different-user";
+  browser.document.getElementById("password").value = "different password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(messageInput.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.deepEqual(revoked, ["blob:cross-account-image"]);
+  assert.match(browser.document.getElementById("toast").textContent, /cleared before switching accounts/iu);
+});
+
+test("a different account cannot inherit an ambiguous committed thread ticket or its locked image", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  let thread = null;
+  let differentAccount = false;
+  let threadCommits = 0;
+  let createRetries = 0;
+  let starts = 0;
+  const revoked = [];
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_cross_account_x" });
+    },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_cross_account_xxxx" });
+    },
+    async createThread(ticket) {
+      threadCommits += 1;
+      thread = chatThread({ title: ticket.title });
+      throw new DirectChatTransportError("accepted response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryCreateThread() {
+      createRetries += 1;
+      throw new DirectChatTransportError("session expired", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+    },
+    async listThreads() { return { threads: differentAccount ? [] : (thread ? [thread] : []) }; },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    async startRun() { starts += 1; throw new Error("cross-account workflow must not dispatch"); },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "different-user", csrfToken: "different-account-csrf-token" }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_0000000000000008",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:ambiguous-cross-account-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "private.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  messageInput.value = "Private ambiguous old-account draft";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(threadCommits, 1);
+  assert.equal(createRetries, 1);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(messageInput.disabled, true);
+
+  differentAccount = true;
+  browser.document.getElementById("username").value = "different-user";
+  browser.document.getElementById("password").value = "different password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(messageInput.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.deepEqual(revoked, ["blob:ambiguous-cross-account-image"]);
+  await browser.app.resume();
+  assert.equal(createRetries, 1);
+  assert.equal(starts, 0);
+});
+
+test("a rejected CSRF token returns to sign-in with the exact draft and no automatic redispatch", async () => {
+  const thread = chatThread();
+  const draft = "  Keep this CSRF-recovery draft exactly.\n  ";
+  let starts = 0;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) {
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_csrf_recovery_xxxxx" });
+    },
+    async startRun() {
+      starts += 1;
+      throw new DirectChatTransportError("csrf rejected", {
+        code: "csrf_rejected",
+        status: 403,
+        retryable: false,
+      });
+    },
+  });
+  const browser = harness({ chat });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = draft;
+
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(starts, 1);
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("message-input").value, draft);
+  assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "csrf");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "csrf_rejected");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureOperation, "run_dispatch");
+  await Promise.resolve();
+  assert.equal(starts, 1, "reauthentication recovery never auto-resends a rejected mutation");
+});
+
+test("a committed thread with a lost response survives repeated auth expiry and resumes only its exact tickets", async () => {
+  const draft = "  Confirm this exact new-thread send after sign-in.  ";
+  let thread = null;
+  let threadPreparations = 0;
+  let runPreparations = 0;
+  let threadCommits = 0;
+  let createRetries = 0;
+  let starts = 0;
+  let logins = 0;
+  const chat = baseChat({
+    prepareThread({ title }) {
+      threadPreparations += 1;
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_auth_ambiguous_x" });
+    },
+    prepareRun(request) {
+      runPreparations += 1;
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_auth_ambiguous_xxxx" });
+    },
+    async createThread(ticket) {
+      threadCommits += 1;
+      thread = chatThread({ title: ticket.title });
+      throw new DirectChatTransportError("accepted response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryCreateThread(ticket) {
+      createRetries += 1;
+      if (createRetries <= 2) {
+        throw new DirectChatTransportError("session expired", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    async startRun(ticket) {
+      starts += 1;
+      return { request: ticket, generation: chatGeneration({ status: "failed", terminal: true }) };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => {
+      logins += 1;
+      return { authenticated: true, username: "account-user", csrfToken: `replacement-csrf-token-${logins}` };
+    },
+  });
+  await browser.app.initialize();
+  const messageInput = browser.document.getElementById("message-input");
+  messageInput.value = draft;
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(threadCommits, 1);
+  assert.equal(createRetries, 1);
+  assert.equal(starts, 0);
+  assert.equal(messageInput.value, draft);
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.match(browser.document.getElementById("toast").textContent, /may already exist[\s\S]*Resume/iu);
+
+  for (let recovery = 0; recovery < 2; recovery += 1) {
+    browser.document.getElementById("username").value = "account-user";
+    browser.document.getElementById("password").value = "replacement password";
+    await browser.app.login({ preventDefault() {} });
+    assert.equal(starts, 0, "login never auto-confirms or dispatches the preserved workflow");
+    assert.equal(threadPreparations, 1);
+    assert.equal(runPreparations, 1);
+    assert.equal(messageInput.value, draft);
+    assert.equal(messageInput.disabled, true);
+    assert.equal(browser.document.getElementById("resume-run").hidden, false);
+    await browser.app.resume();
+    if (recovery === 0) {
+      assert.equal(browser.document.getElementById("login-view").hidden, false, "a second expiry keeps the same ticket recoverable");
+      assert.equal(createRetries, 2);
+      assert.equal(starts, 0);
+    }
+  }
+
+  assert.equal(threadCommits, 1, "the authoritative thread mutation occurred exactly once");
+  assert.equal(createRetries, 3);
+  assert.equal(threadPreparations, 1);
+  assert.equal(runPreparations, 1);
+  assert.equal(starts, 1);
+  assert.equal(messageInput.value, "");
+});
+
+test("same-account login hydration expiry preserves an ambiguous exact-send workflow across another login", async () => {
+  const draft = "Keep the original exact ticket through repeated login hydration";
+  let thread = null;
+  let logins = 0;
+  let listAuthenticationFailures = 0;
+  let threadPreparations = 0;
+  let runPreparations = 0;
+  let threadCommits = 0;
+  let createRetries = 0;
+  let starts = 0;
+  const createTickets = [];
+  const runTickets = [];
+  const chat = baseChat({
+    prepareThread({ title }) {
+      threadPreparations += 1;
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_create_login_hydration_x" });
+    },
+    prepareRun(request) {
+      runPreparations += 1;
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_login_hydration_xxxx" });
+    },
+    async createThread(ticket) {
+      createTickets.push(ticket);
+      threadCommits += 1;
+      thread = chatThread({ title: ticket.title });
+      throw new DirectChatTransportError("accepted response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryCreateThread(ticket) {
+      createTickets.push(ticket);
+      createRetries += 1;
+      if (createRetries === 1) {
+        throw new DirectChatTransportError("session expired after ambiguous commit", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      return { request: ticket, thread };
+    },
+    async listThreads() {
+      if (logins === 1 && listAuthenticationFailures === 0) {
+        listAuthenticationFailures += 1;
+        throw new DirectChatTransportError("session expired during login hydration", {
+          code: "authentication_required",
+          status: 401,
+          retryable: false,
+        });
+      }
+      return { threads: thread ? [thread] : [] };
+    },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    async startRun(ticket) {
+      runTickets.push(ticket);
+      starts += 1;
+      return { request: ticket, generation: chatGeneration({ status: "failed", terminal: true }) };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => {
+      logins += 1;
+      return { authenticated: true, username: "account-user", csrfToken: `hydration-csrf-token-${logins}` };
+    },
+  });
+  await browser.app.initialize();
+  const messageInput = browser.document.getElementById("message-input");
+  messageInput.value = draft;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(threadCommits, 1);
+  assert.equal(createRetries, 1);
+  assert.equal(starts, 0);
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+
+  assert.equal(listAuthenticationFailures, 1);
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(messageInput.value, draft);
+  assert.equal(threadCommits, 1);
+  assert.equal(createRetries, 1, "login hydration never retries the ambiguous mutation");
+  assert.equal(starts, 0);
+
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "second replacement password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("app-view").hidden, false);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.equal(messageInput.disabled, true);
+  assert.equal(createRetries, 1, "a successful login also never auto-confirms the mutation");
+  await browser.app.resume();
+
+  assert.equal(threadPreparations, 1);
+  assert.equal(runPreparations, 1);
+  assert.equal(threadCommits, 1);
+  assert.equal(createRetries, 2);
+  assert.equal(starts, 1);
+  assert.equal(createTickets.every((ticket) => ticket === createTickets[0]), true);
+  assert.equal(runTickets.length, 1);
+  assert.equal(messageInput.value, "");
+});
+
+test("a committed run with a lost response survives an opaque proxy 403 and Resume renders the same existing thread", async () => {
+  const thread = chatThread();
+  const draft = "Confirm the exact existing-thread turn";
+  let runPreparations = 0;
+  let runCommits = 0;
+  let runRetries = 0;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    prepareRun(request) {
+      runPreparations += 1;
+      return Object.freeze({ ...request, generationId: CHAT_GENERATION_ID, idempotencyKey: "run_start_csrf_ambiguous_xxxx" });
+    },
+    async startRun() {
+      runCommits += 1;
+      throw new DirectChatTransportError("accepted response lost", {
+        code: "request_timeout",
+        status: 504,
+        retryable: true,
+      });
+    },
+    async retryRun(ticket) {
+      runRetries += 1;
+      if (runRetries === 1) {
+        throw new DirectChatTransportError("opaque proxy rejection", {
+          code: "request_failed",
+          status: 403,
+          retryable: false,
+        });
+      }
+      return { request: ticket, generation: chatGeneration({ status: "failed", terminal: true }) };
+    },
+  });
+  const browser = harness({
+    chat,
+    login: async () => ({ authenticated: true, username: "account-user", csrfToken: "replacement-csrf-run-token" }),
+  });
+  await browser.app.initialize();
+  const messageInput = browser.document.getElementById("message-input");
+  messageInput.value = draft;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(runCommits, 1);
+  assert.equal(runRetries, 1);
+  assert.equal(runPreparations, 1);
+  assert.equal(messageInput.value, draft);
+  assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "authoritative_rejection");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "request_rejected");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureOperation, "run_dispatch");
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+
+  browser.document.getElementById("username").value = "account-user";
+  browser.document.getElementById("password").value = "replacement password";
+  await browser.app.login({ preventDefault() {} });
+  assert.equal(runRetries, 1, "same-account login never auto-retries the mutation");
+  assert.equal(messageInput.disabled, true);
+  await browser.app.resume();
+
+  assert.equal(runCommits, 1);
+  assert.equal(runRetries, 2);
+  assert.equal(runPreparations, 1);
+  assert.equal(messageInput.value, "");
+  assert.match(browser.document.getElementById("messages").textContent, /Confirm the exact existing-thread turn/u);
+  assert.equal(browser.document.getElementById("conversation-title").textContent, thread.title);
 });
 
 test("an authoritative run rejection releases its ticket and restores the exact composer draft", async () => {
@@ -1293,7 +2379,10 @@ test("an authoritative run rejection releases its ticket and restores the exact 
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
   assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
-  assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent");
+  assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent · Conversation changed");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "authoritative_conflict");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "conflict");
+  assert.equal(browser.document.getElementById("workspace").dataset.failureOperation, "run_dispatch");
   assert.match(browser.document.getElementById("toast").textContent, /not sent[\s\S]*composer/iu);
 });
 
@@ -1697,7 +2786,7 @@ test("Resume releases an ambiguous run when its exact retry receives an authorit
   assert.equal(messageInput.value, draft);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
   assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
-  assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent");
+  assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent · Conversation changed");
   assert.match(browser.document.getElementById("toast").textContent, /rejected before it ran/iu);
 });
 

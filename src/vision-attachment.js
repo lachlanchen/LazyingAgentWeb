@@ -3,11 +3,11 @@ import { inflateSync } from 'node:zlib';
 
 import { ValidationError } from './errors.js';
 import { assertExactKeys, assertIdentifier } from './validation.js';
+import { sanitizeVisionImageBytes } from './web/vision-image-sanitizer.js';
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
-const PNG_METADATA_CHUNKS = new Set(['eXIf', 'iCCP', 'iTXt', 'tEXt', 'zTXt']);
+const PNG_METADATA_CHUNKS = new Set(['caBX', 'eXIf', 'iCCP', 'iTXt', 'tEXt', 'zTXt']);
 const PNG_RENDERING_CHUNKS = new Map([
   ['cHRM', 32],
   ['gAMA', 4],
@@ -22,6 +22,17 @@ const JPEG_SOF_MARKERS = new Set([
   0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
   0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf
 ]);
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value >>> 1) ^ (0xedb88320 & -(value & 1));
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
 
 export const VISION_ATTACHMENT_LIMITS = Object.freeze({
   bytes: 4 * 1024 * 1024,
@@ -39,13 +50,25 @@ function invalid(message) {
   throw new ValidationError(message);
 }
 
+function boundedBase64(value) {
+  let padding = 0;
+  if (value.endsWith('=')) padding = value.endsWith('==') ? 2 : 1;
+  const contentLength = value.length - padding;
+  if ((padding === 0 && contentLength % 4 !== 0)
+      || (padding === 1 && contentLength % 4 !== 3)
+      || (padding === 2 && contentLength % 4 !== 2)) return false;
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = value.charCodeAt(index);
+    if (!((code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+        || (code >= 48 && code <= 57) || code === 43 || code === 47)) return false;
+  }
+  return true;
+}
+
 function crc32(bytes) {
   let crc = 0xffffffff;
   for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
-    }
+    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
@@ -150,12 +173,17 @@ function inspectPng(bytes) {
   const samplesPerPixel = new Map([[0, 1], [2, 3], [3, 1], [4, 2], [6, 4]]).get(colorType);
   const rowBytes = Math.ceil((width * samplesPerPixel * bitDepth) / 8);
   const expectedInflatedBytes = (rowBytes + 1) * height;
+  const compressed = Buffer.concat(idatChunks);
   let pixels;
+  let compressedBytesRead;
   try {
-    pixels = inflateSync(Buffer.concat(idatChunks), { maxOutputLength: expectedInflatedBytes });
+    const inflated = inflateSync(compressed, { maxOutputLength: expectedInflatedBytes, info: true });
+    pixels = inflated.buffer;
+    compressedBytesRead = inflated.engine?.bytesWritten;
   } catch (error) {
     invalid(`attachment PNG image data is invalid: ${error?.code ?? 'decode failed'}.`);
   }
+  if (compressedBytesRead !== compressed.byteLength) invalid('attachment PNG image data contains trailing bytes.');
   if (pixels.byteLength !== expectedInflatedBytes) invalid('attachment PNG decoded size is invalid.');
   for (let row = 0; row < height; row += 1) {
     if (pixels[row * (rowBytes + 1)] > 4) invalid('attachment PNG scanline filter is invalid.');
@@ -288,11 +316,17 @@ export function validateVisionAttachmentRequest(value) {
   }
   if (typeof value.data !== 'string' || value.data.length < 4
       || value.data.length > VISION_ATTACHMENT_LIMITS.encodedBytes
-      || value.data.length % 4 !== 0 || !BASE64_PATTERN.test(value.data)) {
+      || value.data.length % 4 !== 0 || !boundedBase64(value.data)) {
     invalid('attachment data must be canonical bounded base64.');
   }
-  const content = Buffer.from(value.data, 'base64');
-  if (content.toString('base64') !== value.data) invalid('attachment data must be canonical bounded base64.');
+  const submitted = Buffer.from(value.data, 'base64');
+  if (submitted.toString('base64') !== value.data) invalid('attachment data must be canonical bounded base64.');
+  let content;
+  try {
+    content = Buffer.from(sanitizeVisionImageBytes(submitted, value.mediaType));
+  } catch (error) {
+    invalid(`attachment image framing or metadata is invalid: ${error?.message ?? 'sanitization failed'}.`);
+  }
   const { width, height } = inspectBytes(value.mediaType, content);
   const contentSha256 = createHash('sha256').update(content).digest('hex');
   return Object.freeze({

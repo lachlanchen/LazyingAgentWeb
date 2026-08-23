@@ -17,6 +17,13 @@ import { canonicalizeVisionImage } from "./vision-image-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
+const AUTHENTICATION_FAILURE_CODES = new Set(["authentication_required", "invalid_session"]);
+const BODY_REJECTION_CODES = new Set([
+  "invalid_attachment", "invalid_json", "request_aborted", "request_error", "request_too_large",
+]);
+const SAFE_CHAT_FAILURE_OPERATIONS = new Set([
+  "local_thread", "local_run", "thread_dispatch", "snapshot", "run_dispatch", "before_run_dispatch",
+]);
 
 class LocalChatNotSentError extends Error {
   constructor(stage, cause) {
@@ -58,6 +65,10 @@ function sessionEnvelope(value) {
   if (typeof session.csrfToken !== "string" || session.csrfToken.length < 16 || session.csrfToken.length > 1_024
       || /[\u0000-\u001f\u007f]/u.test(session.csrfToken)) throw new TypeError("session CSRF token is invalid");
   return Object.freeze({ authenticated: true, username: session.username, csrfToken: session.csrfToken });
+}
+
+function normalizedSessionUsername(value) {
+  return String(value).normalize("NFC");
 }
 
 function logoutEnvelope(value) {
@@ -127,6 +138,108 @@ function prepareLocalChat(stage, operation) {
   catch (error) { throw new LocalChatPreparationError(stage, error); }
 }
 
+function chatFailureCause(error) {
+  return error instanceof LocalChatNotSentError && error.cause !== undefined ? error.cause : error;
+}
+
+function isChatAuthenticationRejection(error) {
+  const cause = chatFailureCause(error);
+  return AUTHENTICATION_FAILURE_CODES.has(cause?.code)
+    || cause?.code === "csrf_rejected"
+    || cause?.status === 401;
+}
+
+function isChatAuthenticationAfterAmbiguousDispatch(error) {
+  const cause = chatFailureCause(error);
+  return isChatAuthenticationRejection(error) || cause?.status === 403;
+}
+
+function chatFailureDiagnostic(error) {
+  const cause = chatFailureCause(error);
+  const operation = SAFE_CHAT_FAILURE_OPERATIONS.has(error?.stage) ? error.stage : "before_run_dispatch";
+  const sourceCode = typeof cause?.code === "string" ? cause.code : "request_failed";
+  const status = Number.isSafeInteger(cause?.status) ? cause.status : 0;
+  if (error instanceof LocalChatPreparationError) {
+    return Object.freeze({
+      stage: "local_preparation",
+      code: operation === "local_thread" ? "thread_ticket_invalid" : "run_ticket_invalid",
+      operation,
+      label: "Local preparation",
+      reauthenticate: false,
+    });
+  }
+  if (AUTHENTICATION_FAILURE_CODES.has(sourceCode) || status === 401) {
+    return Object.freeze({
+      stage: "authentication",
+      code: sourceCode === "invalid_session" ? "invalid_session" : "authentication_required",
+      operation,
+      label: "Sign-in required",
+      reauthenticate: true,
+    });
+  }
+  if (sourceCode === "csrf_rejected") {
+    return Object.freeze({
+      stage: "csrf",
+      code: "csrf_rejected",
+      operation,
+      label: "Security token expired",
+      reauthenticate: true,
+    });
+  }
+  if (["request_timeout", "dependency_timeout"].includes(sourceCode) || [408, 504].includes(status)) {
+    return Object.freeze({
+      stage: "network_timeout",
+      code: sourceCode === "dependency_timeout" ? "dependency_timeout" : "request_timeout",
+      operation,
+      label: "Network timeout",
+      reauthenticate: false,
+    });
+  }
+  if (["conflict", "idempotency_conflict"].includes(sourceCode) || status === 409) {
+    return Object.freeze({
+      stage: "authoritative_conflict",
+      code: sourceCode === "idempotency_conflict" ? "idempotency_conflict" : "conflict",
+      operation,
+      label: "Conversation changed",
+      reauthenticate: false,
+    });
+  }
+  if (BODY_REJECTION_CODES.has(sourceCode) || status === 413) {
+    return Object.freeze({
+      stage: "body_rejection",
+      code: BODY_REJECTION_CODES.has(sourceCode) ? sourceCode : "request_too_large",
+      operation,
+      label: "Image upload rejected",
+      reauthenticate: false,
+    });
+  }
+  if (operation === "snapshot") {
+    return Object.freeze({
+      stage: "snapshot",
+      code: cause instanceof DirectChatProtocolError ? "snapshot_protocol" : "snapshot_unavailable",
+      operation,
+      label: "Conversation refresh",
+      reauthenticate: false,
+    });
+  }
+  if (cause?.retryable === true) {
+    return Object.freeze({
+      stage: "network",
+      code: "network_unavailable",
+      operation,
+      label: "Network unavailable",
+      reauthenticate: false,
+    });
+  }
+  return Object.freeze({
+    stage: "authoritative_rejection",
+    code: "request_rejected",
+    operation,
+    label: "Request rejected",
+    reauthenticate: false,
+  });
+}
+
 function normalizedBrowserPath(value, name, { trailingSlash = false } = {}) {
   if (typeof value !== "string" || value.length > 160 || !/^\/[A-Za-z0-9._~/-]*$/u.test(value) || value.includes("//")
       || value.split("/").some((part) => part === "." || part === "..")) {
@@ -145,7 +258,8 @@ function metaContent(document, name) {
 }
 
 function validAgentRelease(value) {
-  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._~-]{0,95}$/u.test(value);
+  return typeof value === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._~-]{0,23}-[a-f0-9]{64}$/u.test(value);
 }
 
 function agentReleaseMessage(value) {
@@ -307,6 +421,11 @@ export function createBrowserApp({
     chatOutput: "",
     chatPendingSend: null,
     chatFinalization: null,
+    chatFailureDiagnostic: null,
+    authRecoveryPending: false,
+    authRecoveryUsername: null,
+    authRecoveryWorkflow: null,
+    authRecoveryGeneration: null,
     selectedImage: null,
     selectedImageUrl: null,
     imagePreparing: false,
@@ -335,6 +454,9 @@ export function createBrowserApp({
     updateController: null,
     updateTargetRelease: null,
     updateKnownWorkerReleases: new WeakMap(),
+    updateObservedWaitingWorkers: new WeakSet(),
+    updateActiveControllerRelease: null,
+    retryUpdateControllerRelease: null,
     updateReleaseQueries: new Map(),
     updateReleaseTimer: null,
     updateSafetyTimer: null,
@@ -354,6 +476,26 @@ export function createBrowserApp({
   function connection(label, online = true) {
     elements.connection_state.textContent = label;
     elements.connection_state.dataset.online = online ? "true" : "false";
+  }
+
+  function clearChatFailureDiagnostic() {
+    state.chatFailureDiagnostic = null;
+    for (const key of ["failureStage", "failureCode", "failureOperation"]) {
+      delete elements.connection_state.dataset[key];
+      delete elements.workspace.dataset[key];
+    }
+  }
+
+  function applyChatFailureDiagnostic(error) {
+    const diagnostic = chatFailureDiagnostic(error);
+    state.chatFailureDiagnostic = diagnostic;
+    for (const target of [elements.connection_state, elements.workspace]) {
+      target.dataset.failureStage = diagnostic.stage;
+      target.dataset.failureCode = diagnostic.code;
+      target.dataset.failureOperation = diagnostic.operation;
+    }
+    connection(`Request not sent · ${diagnostic.label}`, false);
+    return diagnostic;
   }
 
   function loginControl({ ready, label }) {
@@ -377,6 +519,66 @@ export function createBrowserApp({
     elements.app_view.hidden = false;
     elements.signed_in_user.textContent = state.session.username;
     elements.login_error.hidden = true;
+  }
+
+  function captureChatReadRecovery({
+    threadId = state.chatThreadId ?? state.chatGeneration?.threadId ?? null,
+    generationId = state.chatGeneration?.generationId ?? null,
+  } = {}) {
+    if (typeof threadId !== "string" || threadId.length < 1) return null;
+    const generation = state.chatGeneration?.generationId === generationId ? state.chatGeneration : null;
+    return Object.freeze({
+      threadId,
+      thread: state.chatThread?.threadId === threadId ? state.chatThread : null,
+      generationId: typeof generationId === "string" && generationId.length > 0 ? generationId : null,
+      generation,
+      afterSequence: Number.isSafeInteger(state.chatAfterSequence) && state.chatAfterSequence >= 0
+        ? state.chatAfterSequence
+        : 0,
+      output: typeof state.chatOutput === "string" ? state.chatOutput : "",
+    });
+  }
+
+  function requireFreshAuthentication({ workflow = null, generationRecovery = null } = {}) {
+    if (!state.session.authenticated) return false;
+    const recoveryUsername = normalizedSessionUsername(state.session.username);
+    state.viewEpoch += 1;
+    state.streamAbort?.abort();
+    state.streamAbort = null;
+    state.streamKind = null;
+    state.session = Object.freeze({ authenticated: false });
+    state.agent = null;
+    state.chat = null;
+    state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
+    state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
+    state.agentThreads = [];
+    state.chatThreadListEpoch += 1;
+    state.chatThreads = [];
+    state.agentThreadId = null;
+    state.chatThreadId = null;
+    state.chatThread = null;
+    state.chatGeneration = null;
+    state.chatPendingSend = workflow;
+    state.chatFinalization = null;
+    state.runId = null;
+    state.agentRunStatus = null;
+    state.mode = "chat";
+    state.authRecoveryPending = true;
+    state.authRecoveryUsername = recoveryUsername;
+    state.authRecoveryWorkflow = workflow;
+    state.authRecoveryGeneration = generationRecovery;
+    elements.resume_run.hidden = workflow === null;
+    elements.logout.disabled = true;
+    showLogin(generationRecovery !== null
+      ? "Your session expired. Sign in again to reconnect to the server-owned generation; your draft and image are preserved."
+      : "Your session expired. Sign in again; your unsent draft and image are preserved.");
+    loginControl({ ready: true, label: "Sign in" });
+    return true;
+  }
+
+  function recoverChatReadAuthentication(error, recovery) {
+    return isChatAuthenticationRejection(error)
+      && requireFreshAuthentication({ workflow: null, generationRecovery: recovery });
   }
 
   function detachSelectedImage() {
@@ -420,7 +622,8 @@ export function createBrowserApp({
   }
 
   function interactionLocked() {
-    return state.busy || state.logoutPending || state.chatFinalization !== null;
+    return state.busy || state.logoutPending || state.chatFinalization !== null
+      || state.authRecoveryGeneration !== null;
   }
 
   function updateImageControl() {
@@ -428,21 +631,30 @@ export function createBrowserApp({
       && state.chatCapabilities.visionInput === true;
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const locked = interactionLocked();
-    if (!available && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
+    const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImage !== null;
+    const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
+      && state.chatPendingSend?.ambiguousMutation !== undefined
+      && state.selectedImage !== null;
+    const fencedImage = preservingAuthenticationDraft || preservingAmbiguousImage;
+    if (!available && !fencedImage && (state.imagePreparing || state.selectedImage !== null)) clearSelectedImage();
     elements.add_image.hidden = !available;
     elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend;
-    elements.remove_image.disabled = !available || locked || pendingChatSend
+    elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
       || (state.selectedImage === null && !state.imagePreparing);
-    elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend;
-    elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend;
-    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend;
-    elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked;
-    elements.chat_mode.disabled = !state.session.authenticated || locked;
+    elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+      || preservingAuthenticationDraft;
+    elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+      || preservingAuthenticationDraft;
+    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend || preservingAuthenticationDraft;
+    elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
+      || preservingAuthenticationDraft;
+    elements.chat_mode.disabled = !state.session.authenticated || locked || preservingAuthenticationDraft;
     elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend ? "true" : "false");
     elements.workspace.setAttribute("aria-busy", state.chatFinalization === null ? "false" : "true");
     for (const button of elements.thread_list.children ?? []) {
       button.disabled = locked || pendingChatSend;
     }
+    scheduleSafeUpdateReload();
   }
 
   function currentThreads() {
@@ -561,9 +773,10 @@ export function createBrowserApp({
       status.hidden = true;
       article.dataset.attachmentState = "ready";
       return "ready";
-    } catch {
+    } catch (error) {
       if (url !== null && state.messageImageUrls.delete(url)) revokeObjectUrl(url);
       if (!current()) return "stale";
+      if (recoverChatReadAuthentication(error, captureChatReadRecovery({ threadId }))) return "stale";
       unavailable();
       return "unavailable";
     }
@@ -795,13 +1008,20 @@ export function createBrowserApp({
     }
   }
 
-  async function exactMutation(dispatch, retry) {
-    try { return await dispatch(); }
+  async function exactMutation(dispatch, retry, { onAmbiguous = () => {}, onConfirmed = () => {} } = {}) {
+    try {
+      const result = await dispatch();
+      onConfirmed();
+      return result;
+    }
     catch (error) {
       if (error?.retryable !== true) throw error;
+      onAmbiguous(error);
       connection("Retrying the same durable request", false);
       await wait(250);
-      return await retry();
+      const result = await retry();
+      onConfirmed();
+      return result;
     }
   }
 
@@ -813,7 +1033,7 @@ export function createBrowserApp({
       && error.status < 499;
   }
 
-  function releaseRejectedChatWorkflow(workflow) {
+  function releaseRejectedChatWorkflow(workflow, error) {
     const composer = workflow.lockedComposer ?? workflow.recoveryComposer;
     if (composer !== null && composer !== undefined) {
       if (!elements.message_input.value || elements.message_input.value === workflow.text
@@ -835,50 +1055,82 @@ export function createBrowserApp({
     elements.resume_run.hidden = true;
     renderThreads();
     updateImageControl();
-    connection("Request not sent", false);
+    const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
+      workflow.failureStage ?? "before_run_dispatch",
+      error,
+    ));
     showToast(composer?.image
       ? "The image message was rejected before it ran. Its prompt and image are ready to edit or retry."
       : "The message was rejected before it ran. Its prompt is ready to edit or retry.");
+    if (diagnostic.reauthenticate) requireFreshAuthentication();
   }
 
-  async function fetchChatSnapshot(threadId, signal) {
-    const chat = state.chat;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { thread: before } = await chat.getThread(threadId, { signal });
-      const messages = [];
-      let afterRevision = 0;
-      let previousHash = null;
-      let inconsistent = false;
-      while (afterRevision < before.revision) {
-        const remaining = before.revision - afterRevision;
-        const response = await chat.listMessages({
-          threadId,
-          afterRevision,
-          limit: Math.min(200, remaining),
-          signal,
+  async function fetchChatSnapshot(threadId, signal, { expectedEpoch = state.viewEpoch } = {}) {
+    const owner = Object.freeze({ session: state.session, chat: state.chat, expectedEpoch });
+    const ensureOwner = () => {
+      if (state.session !== owner.session || state.chat !== owner.chat || !state.session.authenticated
+          || state.mode !== "chat" || state.viewEpoch !== owner.expectedEpoch) {
+        throw new DirectChatTransportError("Direct Chat snapshot ownership changed.", {
+          code: "browser_state_changed",
+          status: 499,
+          retryable: false,
         });
-        if (response.messages.length < 1 || response.messages.length > remaining) {
-          inconsistent = true;
-          break;
-        }
-        for (const message of response.messages) {
-          if (message.previousHash !== previousHash) {
+      }
+      if (signal?.aborted) throw signal.reason ?? new DOMException("request aborted", "AbortError");
+    };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        ensureOwner();
+        const { thread: before } = await owner.chat.getThread(threadId, { signal });
+        ensureOwner();
+        const messages = [];
+        let afterRevision = 0;
+        let previousHash = null;
+        let inconsistent = false;
+        while (afterRevision < before.revision) {
+          const remaining = before.revision - afterRevision;
+          const response = await owner.chat.listMessages({
+            threadId,
+            afterRevision,
+            limit: Math.min(200, remaining),
+            signal,
+          });
+          ensureOwner();
+          if (response.messages.length < 1 || response.messages.length > remaining) {
             inconsistent = true;
             break;
           }
-          messages.push(message);
-          afterRevision = message.revision;
-          previousHash = message.messageHash;
+          for (const message of response.messages) {
+            if (message.previousHash !== previousHash) {
+              inconsistent = true;
+              break;
+            }
+            messages.push(message);
+            afterRevision = message.revision;
+            previousHash = message.messageHash;
+          }
+          if (inconsistent) break;
         }
-        if (inconsistent) break;
+        const { thread: after } = await owner.chat.getThread(threadId, { signal });
+        ensureOwner();
+        const stable = before.revision === after.revision
+          && before.ledgerHash === after.ledgerHash
+          && before.currentGenerationId === after.currentGenerationId;
+        const complete = messages.length === after.revision
+          && (after.revision === 0 ? after.ledgerHash === null : previousHash === after.ledgerHash);
+        if (!inconsistent && stable && complete) return Object.freeze({ thread: after, messages: Object.freeze(messages) });
+      } catch (error) {
+        if (error?.retryable !== true || attempt >= 2) throw error;
+        ensureOwner();
+        await wait(250 * (2 ** attempt), signal);
+        ensureOwner();
+        continue;
       }
-      const { thread: after } = await chat.getThread(threadId, { signal });
-      const stable = before.revision === after.revision
-        && before.ledgerHash === after.ledgerHash
-        && before.currentGenerationId === after.currentGenerationId;
-      const complete = messages.length === after.revision
-        && (after.revision === 0 ? after.ledgerHash === null : previousHash === after.ledgerHash);
-      if (!inconsistent && stable && complete) return Object.freeze({ thread: after, messages: Object.freeze(messages) });
+      if (attempt < 2) {
+        ensureOwner();
+        await wait(250 * (2 ** attempt), signal);
+        ensureOwner();
+      }
     }
     throw new DirectChatProtocolError("Direct Chat changed while its authoritative snapshot was being read");
   }
@@ -989,6 +1241,7 @@ export function createBrowserApp({
       elements.workspace.dataset.status = "idle";
       elements.run_state.textContent = "Idle";
     }
+    clearChatFailureDiagnostic();
     renderThreads();
     return true;
   }
@@ -999,7 +1252,7 @@ export function createBrowserApp({
   } = {}) {
     const session = state.session;
     const chat = state.chat;
-    const snapshot = await fetchChatSnapshot(threadId, signal);
+    const snapshot = await fetchChatSnapshot(threadId, signal, { expectedEpoch });
     if (state.session !== session || state.chat !== chat) return snapshot;
     state.chatThread = snapshot.thread;
     state.chatThreadId = snapshot.thread.threadId;
@@ -1023,7 +1276,11 @@ export function createBrowserApp({
         throw new DirectChatProtocolError("Direct Chat finalization did not include the completed assistant message");
       }
       state.chatThread = snapshot.thread;
-    } catch {
+    } catch (error) {
+      if (recoverChatReadAuthentication(error, captureChatReadRecovery({
+        threadId: finalization.threadId,
+        generationId: finalization.generationId,
+      }))) return false;
       pauseChatFinalization(finalization);
       return false;
     }
@@ -1119,6 +1376,10 @@ export function createBrowserApp({
       }
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (recoverChatReadAuthentication(error, captureChatReadRecovery({
+        threadId: generation.threadId,
+        generationId: generation.generationId,
+      }))) return;
       elements.resume_run.hidden = false;
       connection("Chat stream interrupted", false);
       showToast("The generation is still server-owned. Resume reconnects without dispatching it again.");
@@ -1134,31 +1395,71 @@ export function createBrowserApp({
 
   async function openChatThread(threadId, { backgroundStream = false } = {}) {
     const expectedEpoch = state.viewEpoch;
-    const snapshot = await refreshChatThread(threadId, undefined, { expectedEpoch });
-    if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
-    const generationId = snapshot.thread.currentGenerationId;
-    if (!generationId) {
-      state.chatGeneration = null;
+    let generationId = null;
+    try {
+      const snapshot = await refreshChatThread(threadId, undefined, { expectedEpoch });
+      if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
+      generationId = snapshot.thread.currentGenerationId;
+      if (!generationId) {
+        state.chatGeneration = null;
+        state.chatAfterSequence = 0;
+        state.chatOutput = "";
+        return;
+      }
+      const { generation } = await state.chat.getRunStatus({ threadId, generationId });
+      if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
+      state.chatGeneration = generation;
       state.chatAfterSequence = 0;
       state.chatOutput = "";
+      if (generation.terminal) {
+        elements.workspace.dataset.status = generation.status;
+        elements.run_state.textContent = statusLabel(generation.status);
+        return;
+      }
+      const stream = streamChatGeneration(generation);
+      if (backgroundStream) {
+        void stream.catch(() => {});
+        return;
+      }
+      await stream;
+    } catch (error) {
+      if (recoverChatReadAuthentication(error, captureChatReadRecovery({ threadId, generationId }))) return;
+      throw error;
+    }
+  }
+
+  async function reconnectRecoveredChat(recovery) {
+    const expectedEpoch = state.viewEpoch;
+    const snapshot = await refreshChatThread(recovery.threadId, undefined, { expectedEpoch });
+    if (!state.session.authenticated || state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
+    const generationId = recovery.generationId ?? snapshot.thread.currentGenerationId;
+    if (generationId === null) {
+      state.chatGeneration = null;
       return;
     }
-    const { generation } = await state.chat.getRunStatus({ threadId, generationId });
-    if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
+    const { generation } = await state.chat.getRunStatus({
+      threadId: recovery.threadId,
+      generationId,
+    });
+    if (!state.session.authenticated || state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
     state.chatGeneration = generation;
-    state.chatAfterSequence = 0;
-    state.chatOutput = "";
     if (generation.terminal) {
+      const finalAssistant = snapshot.messages.at(-1);
+      if (generation.status === "completed"
+          && (finalAssistant?.role !== "assistant" || finalAssistant.generationId !== generation.generationId)) {
+        await finishChatGeneration(generation, new AbortController(), expectedEpoch);
+        return;
+      }
       elements.workspace.dataset.status = generation.status;
       elements.run_state.textContent = statusLabel(generation.status);
+      elements.resume_run.hidden = true;
+      connection("Connected");
       return;
     }
-    const stream = streamChatGeneration(generation);
-    if (backgroundStream) {
-      void stream.catch(() => {});
-      return;
-    }
-    await stream;
+    await streamChatGeneration(generation, {
+      afterSequence: recovery.generationId === generation.generationId ? recovery.afterSequence : 0,
+      output: recovery.generationId === generation.generationId ? recovery.output : "",
+    });
   }
 
   async function openThread(threadId, { mode = state.mode } = {}) {
@@ -1235,13 +1536,13 @@ export function createBrowserApp({
     let thread = state.chatThread;
     if (!workflow.threadTicket && !state.chatThreadId) {
       workflow.threadTicket = prepareLocalChat(
-        "thread",
+        "local_thread",
         () => chat.prepareThread({ title: conversationTitle(workflow.text) }),
       );
     }
     if (workflow.threadTicket && !workflow.runTicket) {
       workflow.runTicket = prepareLocalChat(
-        "run",
+        "local_run",
         () => chat.prepareRun({
           threadId: workflow.threadTicket.threadId,
           content: workflow.text,
@@ -1252,6 +1553,7 @@ export function createBrowserApp({
       );
     }
     if (workflow.threadTicket && !workflow.thread) {
+      workflow.failureStage = "thread_dispatch";
       const firstDispatch = workflow.threadDispatched
         ? () => chat.retryCreateThread(workflow.threadTicket)
         : () => chat.createThread(workflow.threadTicket);
@@ -1259,6 +1561,12 @@ export function createBrowserApp({
       const created = await exactMutation(
         firstDispatch,
         () => chat.retryCreateThread(workflow.threadTicket),
+        {
+          onAmbiguous() { workflow.ambiguousMutation = "thread_dispatch"; },
+          onConfirmed() {
+            if (workflow.ambiguousMutation === "thread_dispatch") workflow.ambiguousMutation = null;
+          },
+        },
       );
       ensureCurrentSession();
       thread = created.thread;
@@ -1276,18 +1584,26 @@ export function createBrowserApp({
       started = await exactMutation(
         () => chat.retryRun(workflow.runTicket),
         () => chat.retryRun(workflow.runTicket),
+        {
+          onAmbiguous() { workflow.ambiguousMutation = "run_dispatch"; },
+          onConfirmed() {
+            if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
+          },
+        },
       );
       ensureCurrentSession();
     } else {
       if (!workflow.runTicket) {
         const threadId = thread?.threadId === state.chatThreadId ? thread.threadId : state.chatThreadId;
         if (!threadId) throw new TypeError("the Direct Chat thread is unavailable");
+        workflow.failureStage = "snapshot";
         thread = (await fetchChatSnapshot(threadId)).thread;
         ensureCurrentSession();
+        workflow.thread = thread;
         state.chatThread = thread;
         if (thread.currentGenerationId) throw new TypeError("the conversation already has a generation in progress");
         workflow.runTicket = prepareLocalChat(
-          "run",
+          "local_run",
           () => chat.prepareRun({
             threadId: thread.threadId,
             content: workflow.text,
@@ -1297,10 +1613,17 @@ export function createBrowserApp({
           }),
         );
       }
+      workflow.failureStage = "run_dispatch";
       workflow.runDispatched = true;
       started = await exactMutation(
         () => chat.startRun(workflow.runTicket),
         () => chat.retryRun(workflow.runTicket),
+        {
+          onAmbiguous() { workflow.ambiguousMutation = "run_dispatch"; },
+          onConfirmed() {
+            if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
+          },
+        },
       );
       ensureCurrentSession();
     }
@@ -1313,6 +1636,7 @@ export function createBrowserApp({
     }
     workflow.recoveryComposer = null;
     state.chatPendingSend = null;
+    clearChatFailureDiagnostic();
     renderThreads();
     state.chatGeneration = started.generation;
     state.chatAfterSequence = 0;
@@ -1340,11 +1664,20 @@ export function createBrowserApp({
       runDispatched: false,
       lockedComposer: null,
       recoveryComposer: null,
+      failureStage: "before_run_dispatch",
+      ambiguousMutation: null,
     };
     state.chatPendingSend = workflow;
     renderThreads();
     try { await continueChatSend(workflow); }
     catch (error) {
+      const authenticationAfterAmbiguousDispatch = workflow.ambiguousMutation !== null
+        && isChatAuthenticationAfterAmbiguousDispatch(error);
+      if (authenticationAfterAmbiguousDispatch) {
+        elements.resume_run.hidden = false;
+        renderThreads();
+        throw error;
+      }
       const authoritativeRejection = isAuthoritativeChatRejection(error);
       const notSent = error instanceof LocalChatNotSentError || authoritativeRejection
         || (!workflow.runDispatched && (!workflow.threadDispatched || workflow.thread !== null));
@@ -1356,7 +1689,7 @@ export function createBrowserApp({
       }
       renderThreads();
       throw notSent && !(error instanceof LocalChatNotSentError)
-        ? new LocalChatNotSentError("before_run_dispatch", error)
+        ? new LocalChatNotSentError(workflow.failureStage, error)
         : error;
     }
   }
@@ -1416,6 +1749,7 @@ export function createBrowserApp({
     const submissionSession = state.session;
     const submissionMode = state.mode;
     const submissionChat = state.chat;
+    clearChatFailureDiagnostic();
     const draft = elements.message_input.value;
     let text;
     try { text = boundedMessage(draft); }
@@ -1446,14 +1780,38 @@ export function createBrowserApp({
       if (state.mode === "chat" && state.chatPendingSend) {
         state.chatPendingSend.recoveryComposer = Object.freeze({ draft, image: selected });
       }
-      if (state.mode === "chat" && error instanceof LocalChatNotSentError) {
+      const ambiguousAuthenticationWorkflow = state.mode === "chat"
+        && state.chatPendingSend?.ambiguousMutation !== null
+        && state.chatPendingSend?.ambiguousMutation !== undefined
+        && isChatAuthenticationAfterAmbiguousDispatch(error)
+        ? state.chatPendingSend
+        : null;
+      if (ambiguousAuthenticationWorkflow !== null) {
         elements.message_input.value = draft;
         const imageRestored = restoreDetachedImage(detachedImage);
         detachedImage = null;
-        connection("Request not sent", false);
+        ambiguousAuthenticationWorkflow.lockedComposer = Object.freeze({
+          draft,
+          image: imageRestored ? selected : null,
+        });
+        const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
+          ambiguousAuthenticationWorkflow.ambiguousMutation,
+          error,
+        ));
+        connection(`Send confirmation paused · ${diagnostic.label}`, false);
+        showToast(imageRestored
+          ? "Sign in again. This exact image send may already exist; Resume confirms it without creating a duplicate."
+          : "Sign in again. This exact send may already exist; Resume confirms it without creating a duplicate.");
+        requireFreshAuthentication({ workflow: ambiguousAuthenticationWorkflow });
+      } else if (state.mode === "chat" && error instanceof LocalChatNotSentError) {
+        elements.message_input.value = draft;
+        const imageRestored = restoreDetachedImage(detachedImage);
+        detachedImage = null;
+        const diagnostic = applyChatFailureDiagnostic(error);
         showToast(imageRestored
           ? "This image message was not sent. Your prompt and image are still ready; edit or retry them."
           : "This message was not sent. Your prompt is still in the composer; edit it and try again.");
+        if (diagnostic.reauthenticate) requireFreshAuthentication();
       } else if (state.mode === "chat" && state.chatPendingSend && !state.chatPendingSend.runDispatched) {
         elements.message_input.value = draft;
         const imageRestored = restoreDetachedImage(detachedImage);
@@ -1493,8 +1851,33 @@ export function createBrowserApp({
     preserveLoginInput = false,
     clearPasswordOnAuthenticated = false,
   } = {}) {
+    const recoveringAuthenticationDraft = state.authRecoveryPending;
+    const recoveryUsername = state.authRecoveryUsername;
+    const recoveryWorkflow = state.authRecoveryWorkflow;
+    const recoveryGeneration = state.authRecoveryGeneration;
     state.session = sessionEnvelope(session);
     if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
+    const discardedCrossAccountDraft = recoveringAuthenticationDraft
+      && normalizedSessionUsername(state.session.username) !== recoveryUsername;
+    if (discardedCrossAccountDraft) {
+      elements.message_input.value = "";
+      clearSelectedImage();
+      if (recoveryWorkflow !== null) {
+        recoveryWorkflow.text = "";
+        recoveryWorkflow.attachment = null;
+        recoveryWorkflow.threadTicket = null;
+        recoveryWorkflow.runTicket = null;
+        recoveryWorkflow.lockedComposer = null;
+        recoveryWorkflow.recoveryComposer = null;
+        recoveryWorkflow.ambiguousMutation = null;
+      }
+      state.authRecoveryPending = false;
+      state.authRecoveryUsername = null;
+      state.authRecoveryWorkflow = null;
+      state.authRecoveryGeneration = null;
+    }
+    const sameAccountRecoveryWorkflow = discardedCrossAccountDraft ? null : recoveryWorkflow;
+    const sameAccountRecoveryGeneration = discardedCrossAccountDraft ? null : recoveryGeneration;
     const authenticatedSession = state.session;
     if (clearPasswordOnAuthenticated) elements.password.value = "";
     elements.logout.disabled = true;
@@ -1505,10 +1888,12 @@ export function createBrowserApp({
       state.chatThreadListEpoch += 1;
       state.chatThreads = [];
       state.agentThreadId = null;
-      state.chatThreadId = null;
-      state.chatThread = null;
-      state.chatGeneration = null;
-      state.chatPendingSend = null;
+      state.chatThreadId = sameAccountRecoveryGeneration?.threadId ?? null;
+      state.chatThread = sameAccountRecoveryGeneration?.thread ?? null;
+      state.chatGeneration = sameAccountRecoveryGeneration?.generation ?? null;
+      state.chatAfterSequence = sameAccountRecoveryGeneration?.afterSequence ?? 0;
+      state.chatOutput = sameAccountRecoveryGeneration?.output ?? "";
+      state.chatPendingSend = sameAccountRecoveryWorkflow;
       state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
@@ -1522,26 +1907,83 @@ export function createBrowserApp({
         "capabilities", "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages", "getAttachment",
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
-      const [rawAgentCapability, rawChatCapability] = await Promise.all([
+      const authenticatedChat = state.chat;
+      const readChatCapability = async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const value = chatCapabilityEnvelope(await authenticatedChat.capabilities());
+            return { succeeded: true, value };
+          } catch {
+            if (attempt < 2) await wait(250 * (2 ** attempt));
+          }
+        }
+        return {
+          succeeded: false,
+          value: Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }),
+        };
+      };
+      const [rawAgentCapability, chatCapabilityProbe] = await Promise.all([
         Promise.resolve().then(() => state.agent.capabilities()).catch(() => FAIL_CLOSED_AGENT_CAPABILITIES),
-        Promise.resolve().then(() => state.chat.capabilities()).catch(() => ({
-          visionInput: false, visionMediaTypes: [], maximumImageBytes: 0,
-        })),
+        readChatCapability(),
       ]);
       let capability;
       try { capability = validateAgentCapabilities(rawAgentCapability); }
       catch { capability = FAIL_CLOSED_AGENT_CAPABILITIES; }
-      let chatCapability;
-      try { chatCapability = chatCapabilityEnvelope(rawChatCapability); }
-      catch { chatCapability = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }); }
+      const chatCapabilityVerified = chatCapabilityProbe.succeeded;
+      const chatCapability = chatCapabilityProbe.value;
       if (state.session !== authenticatedSession || !state.session.authenticated) return;
       state.capabilities = capability;
       state.chatCapabilities = chatCapability;
+      if (sameAccountRecoveryWorkflow?.thread) {
+        state.chatThread = sameAccountRecoveryWorkflow.thread;
+        state.chatThreadId = sameAccountRecoveryWorkflow.thread.threadId;
+      }
       showApp();
-      setMode(selectDefaultMode(capability), { restoreView: false });
-      connection("Connected");
-      try { await restoreModeView({ autoOpen: true }); }
-      catch {
+      setMode(recoveringAuthenticationDraft && !discardedCrossAccountDraft
+        ? "chat"
+        : selectDefaultMode(capability), { restoreView: false });
+      const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
+        && state.selectedImage !== null && chatCapability.visionInput !== true
+        && sameAccountRecoveryWorkflow === null;
+      state.authRecoveryPending = recoveryImageNeedsUserAction;
+      state.authRecoveryUsername = recoveryImageNeedsUserAction
+        ? normalizedSessionUsername(state.session.username)
+        : null;
+      state.authRecoveryWorkflow = null;
+      state.authRecoveryGeneration = sameAccountRecoveryGeneration;
+      clearChatFailureDiagnostic();
+      updateImageControl();
+      if (sameAccountRecoveryWorkflow !== null) {
+        connection("Signed in · exact send ready to confirm");
+      } else if (sameAccountRecoveryGeneration !== null) {
+        connection("Signed in · reconnecting to LocalLLM", false);
+      } else if (recoveryImageNeedsUserAction) {
+        connection(chatCapabilityVerified
+          ? "Signed in · image sending unavailable"
+          : "Signed in · image capability unavailable", false);
+      } else {
+        connection(recoveringAuthenticationDraft && !discardedCrossAccountDraft
+          ? "Signed in · unsent draft ready"
+          : "Connected");
+      }
+      if (discardedCrossAccountDraft) {
+        showToast("The previous account’s unsent draft and image were cleared before switching accounts.");
+      } else if (recoveryImageNeedsUserAction) {
+        showToast(chatCapabilityVerified
+          ? "Image sending is unavailable. Your staged image remains visible; remove it to continue without the image."
+          : "Image capability could not be confirmed. Your staged image remains visible and unsent; remove it only to continue without the image.");
+      }
+      try {
+        await restoreModeView({
+          autoOpen: sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null,
+        });
+      }
+      catch (error) {
+        if (state.mode === "chat" && isChatAuthenticationRejection(error)
+            && requireFreshAuthentication({
+              workflow: sameAccountRecoveryWorkflow,
+              generationRecovery: sameAccountRecoveryGeneration,
+            })) return;
         if (state.mode === "agent") state.agentThreads = [];
         else {
           state.chatThreadListEpoch += 1;
@@ -1549,6 +1991,40 @@ export function createBrowserApp({
         }
         renderThreads();
         connection(state.mode === "agent" ? "Agent unavailable" : "Chat unavailable", false);
+      }
+      if (sameAccountRecoveryWorkflow !== null && state.session === authenticatedSession) {
+        state.chatPendingSend = sameAccountRecoveryWorkflow;
+        if (sameAccountRecoveryWorkflow.thread !== null) {
+          state.chatThread = sameAccountRecoveryWorkflow.thread;
+          state.chatThreadId = sameAccountRecoveryWorkflow.thread.threadId;
+          elements.conversation_title.textContent = sameAccountRecoveryWorkflow.thread.title || "New conversation";
+        }
+        elements.resume_run.hidden = false;
+        connection("Signed in · exact send ready to confirm");
+        updateImageControl();
+        renderThreads();
+      } else if (sameAccountRecoveryGeneration !== null
+          && state.session === authenticatedSession && state.session.authenticated) {
+        try {
+          await reconnectRecoveredChat(sameAccountRecoveryGeneration);
+          if (state.session === authenticatedSession && state.session.authenticated) {
+            state.authRecoveryGeneration = null;
+            updateImageControl();
+            renderThreads();
+          }
+        } catch (error) {
+          if (recoverChatReadAuthentication(error, sameAccountRecoveryGeneration)) return;
+          state.chatThreadId = sameAccountRecoveryGeneration.threadId;
+          state.chatThread = sameAccountRecoveryGeneration.thread;
+          state.chatGeneration = sameAccountRecoveryGeneration.generation;
+          state.authRecoveryGeneration = sameAccountRecoveryGeneration;
+          if (sameAccountRecoveryGeneration.thread !== null) {
+            elements.conversation_title.textContent = sameAccountRecoveryGeneration.thread.title || "New conversation";
+          }
+          elements.resume_run.hidden = false;
+          connection("Generation connection paused", false);
+          showToast("The server-owned generation could not reconnect yet. Resume retries only authenticated reads.");
+        }
       }
     } finally {
       if (state.session === authenticatedSession && state.session.authenticated
@@ -1611,6 +2087,11 @@ export function createBrowserApp({
     state.imagePreparing = false;
     elements.message_input.value = "";
     state.session = Object.freeze({ authenticated: false });
+    state.authRecoveryPending = false;
+    state.authRecoveryUsername = null;
+    state.authRecoveryWorkflow = null;
+    state.authRecoveryGeneration = null;
+    clearChatFailureDiagnostic();
     state.agent = null;
     state.chat = null;
     state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
@@ -1677,7 +2158,13 @@ export function createBrowserApp({
     updateImageControl();
     try {
       if (state.mode === "chat") {
-        if (state.chatFinalization) {
+        if (state.authRecoveryGeneration) {
+          const recovery = state.authRecoveryGeneration;
+          await reconnectRecoveredChat(recovery);
+          if (state.session.authenticated && state.authRecoveryGeneration === recovery) {
+            state.authRecoveryGeneration = null;
+          }
+        } else if (state.chatFinalization) {
           const finalization = state.chatFinalization;
           const controller = new AbortController();
           state.streamAbort?.abort();
@@ -1700,8 +2187,26 @@ export function createBrowserApp({
         await streamAgentRun(run);
       }
     } catch (error) {
-      if (state.mode === "chat" && state.chatPendingSend && isAuthoritativeChatRejection(error)) {
-        releaseRejectedChatWorkflow(state.chatPendingSend);
+      const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;
+      const ambiguousAuthenticationWorkflow = state.mode === "chat"
+        && state.chatPendingSend?.ambiguousMutation !== null
+        && state.chatPendingSend?.ambiguousMutation !== undefined
+        && isChatAuthenticationAfterAmbiguousDispatch(error)
+        ? state.chatPendingSend
+        : null;
+      if (authenticatedReadRecovery !== null
+          && recoverChatReadAuthentication(error, authenticatedReadRecovery)) {
+        /* The exact server-owned read descriptor remains available after same-account sign-in. */
+      } else if (ambiguousAuthenticationWorkflow !== null) {
+        const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
+          ambiguousAuthenticationWorkflow.ambiguousMutation,
+          error,
+        ));
+        connection(`Send confirmation paused · ${diagnostic.label}`, false);
+        showToast("Sign in again, then Resume the same exact send. No new request was created.");
+        requireFreshAuthentication({ workflow: ambiguousAuthenticationWorkflow });
+      } else if (state.mode === "chat" && state.chatPendingSend && isAuthoritativeChatRejection(error)) {
+        releaseRejectedChatWorkflow(state.chatPendingSend, error);
       } else {
         showToast(state.mode === "chat"
           ? "The durable LocalLLM request could not reconnect yet."
@@ -1737,6 +2242,7 @@ export function createBrowserApp({
       state.chatOutput = "";
     }
     clearSelectedImage();
+    clearChatFailureDiagnostic();
     updateImageControl();
     elements.conversation_title.textContent = "New conversation";
     clearConversation();
@@ -1745,7 +2251,7 @@ export function createBrowserApp({
 
   function updateReloadSafe() {
     if (state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null || state.imagePreparing
-        || state.selectedImage || state.chatPendingSend
+        || state.selectedImage || state.chatPendingSend || state.authRecoveryGeneration !== null
         || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
         || (state.runId && !TERMINAL.has(state.agentRunStatus))
         || state.streamAbort || String(elements.message_input.value ?? "").length > 0) return false;
@@ -1762,35 +2268,61 @@ export function createBrowserApp({
 
   function reloadForActiveUpdate() {
     if (!state.updateControllerChanged || state.updateReloaded || !updateReloadSafe()) return false;
-    if (state.updateTargetRelease === null && state.updateReleaseTimer !== null) return false;
+    if (!validAgentRelease(state.updateTargetRelease)) return false;
     state.updateReloaded = true;
     clearUpdateReloadTimers();
     const releaseId = state.updateTargetRelease;
     const target = new URL(workerScope, window.location.href);
-    if (validAgentRelease(releaseId)) {
-      target.search = `?v=${encodeURIComponent(releaseId)}`;
-    }
+    target.search = `?v=${encodeURIComponent(releaseId)}`;
     target.hash = "";
     if (typeof window?.location?.replace === "function") window.location.replace(target.href);
     else if (window?.location) window.location.href = target.href;
     return true;
   }
 
+  function waitingUpdateCanActivateAutomatically() {
+    const worker = state.updateRegistration?.waiting;
+    if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return false;
+    if (worker === state.updateDeferredWorker && Number(now()) < state.updateDeferredUntil) return false;
+    const releaseId = state.updateKnownWorkerReleases.get(worker);
+    if (!validAgentRelease(releaseId)) return false;
+    if (validAgentRelease(state.updateActiveControllerRelease)
+        && state.updateActiveControllerRelease === releaseId) return false;
+    if (state.updateObservedWaitingWorkers.has(worker)) return true;
+    return releaseId === currentRelease
+      && validAgentRelease(state.updateActiveControllerRelease)
+      && state.updateActiveControllerRelease !== currentRelease;
+  }
+
   function scheduleSafeUpdateReload() {
-    if (!state.updateControllerChanged || state.updateReloaded || state.updateSafetyTimer !== null) return;
-    if (reloadForActiveUpdate()) return;
+    if (state.updateReloaded || state.updateSafetyTimer !== null) return;
+    if (state.updateControllerChanged) {
+      if (!validAgentRelease(state.updateTargetRelease)) return;
+      if (reloadForActiveUpdate()) return;
+    } else if (waitingUpdateCanActivateAutomatically()) {
+      if (updateReloadSafe()) {
+        activateWaitingUpdate({ announceUnsafe: false });
+        return;
+      }
+    } else return;
     state.updateSafetyTimer = window?.setTimeout?.(() => {
       state.updateSafetyTimer = null;
       scheduleSafeUpdateReload();
     }, 1_000) ?? null;
   }
 
-  function activateWaitingUpdate() {
+  function activateWaitingUpdate({ announceUnsafe = true } = {}) {
     if (state.updateControllerChanged) {
       if (!updateReloadSafe()) {
         elements.update_banner.hidden = false;
-        showToast("Finish the current draft or response before reloading the updated app.");
+        if (announceUnsafe) showToast("Finish the current draft or response before reloading the updated app.");
         scheduleSafeUpdateReload();
+        return false;
+      }
+      if (!validAgentRelease(state.updateTargetRelease)) {
+        elements.update_banner.hidden = false;
+        elements.apply_update.disabled = true;
+        void state.retryUpdateControllerRelease?.({ announceFailure: announceUnsafe });
         return false;
       }
       return reloadForActiveUpdate();
@@ -1799,7 +2331,8 @@ export function createBrowserApp({
     if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return false;
     if (!updateReloadSafe()) {
       elements.update_banner.hidden = false;
-      showToast("Finish the current draft or response before activating the update.");
+      if (announceUnsafe) showToast("Finish the current draft or response before activating the update.");
+      scheduleSafeUpdateReload();
       return false;
     }
     state.updateConfirmed = true;
@@ -1843,6 +2376,12 @@ export function createBrowserApp({
     elements.remove_image.addEventListener("click", () => {
       if (interactionLocked() || state.chatPendingSend) return;
       clearSelectedImage();
+      if (state.authRecoveryPending && state.session.authenticated) {
+        state.authRecoveryPending = false;
+        state.authRecoveryUsername = null;
+        state.authRecoveryWorkflow = null;
+        connection("Connected");
+      }
       updateImageControl();
     });
     elements.logout.addEventListener("click", () => { void logout(); });
@@ -1854,13 +2393,15 @@ export function createBrowserApp({
     elements.theme_picker.addEventListener("change", () => applyTheme(elements.theme_picker.value, { document }));
     elements.open_sidebar.addEventListener("click", () => { elements.sidebar.dataset.open = "true"; elements.sidebar_scrim.hidden = false; });
     elements.sidebar_scrim.addEventListener("click", () => { elements.sidebar.dataset.open = "false"; elements.sidebar_scrim.hidden = true; });
-    elements.apply_update.addEventListener("click", activateWaitingUpdate);
+    elements.apply_update.addEventListener("click", () => { activateWaitingUpdate(); });
     elements.defer_update.addEventListener("click", () => {
       const worker = state.updateRegistration?.waiting;
       if (!worker || worker !== state.updateOfferedWorker || state.updateConfirmed) return;
       state.updateDeferredWorker = worker;
       state.updateDeferredUntil = Number(now()) + updateDeferralMs;
       elements.update_banner.hidden = true;
+      if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+      state.updateSafetyTimer = null;
       if (state.updateDeferralTimer !== null) window?.clearTimeout?.(state.updateDeferralTimer);
       state.updateDeferralTimer = window?.setTimeout?.(() => {
         state.updateDeferralTimer = null;
@@ -1939,11 +2480,39 @@ export function createBrowserApp({
         }
         return promise;
       };
+      const queryActiveUpdateRelease = async ({ announceFailure = false } = {}) => {
+        const controller = state.updateController;
+        if (!state.updateControllerChanged || controller === null || state.updateReloaded) return false;
+        const releaseId = await queryWorkerRelease(controller);
+        if (state.updateController !== controller || !state.updateControllerChanged || state.updateReloaded) return false;
+        if (!validAgentRelease(releaseId)) {
+          state.updateTargetRelease = null;
+          elements.update_banner.hidden = false;
+          elements.apply_update.disabled = false;
+          elements.defer_update.disabled = false;
+          if (announceFailure) showToast("The updated app version could not be verified yet. Retry keeps this page open safely.");
+          return false;
+        }
+        state.updateActiveControllerRelease = releaseId;
+        state.updateTargetRelease = releaseId;
+        elements.apply_update.disabled = false;
+        elements.defer_update.disabled = false;
+        if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+        state.updateSafetyTimer = null;
+        scheduleSafeUpdateReload();
+        return true;
+      };
+      state.retryUpdateControllerRelease = queryActiveUpdateRelease;
       navigator.serviceWorker.addEventListener?.("message", (event) => {
         const releaseId = agentReleaseMessage(event?.data);
         if (releaseId === null) return;
         state.updateReleaseQueries.get(event.source)?.finish(releaseId);
-        if (!state.updateControllerChanged || event.source !== state.updateController) return;
+        if (event.source !== state.updateController) return;
+        state.updateActiveControllerRelease = releaseId;
+        if (!state.updateControllerChanged) {
+          state.showUpdatePrompt?.();
+          return;
+        }
         state.updateTargetRelease = releaseId;
         if (state.updateReleaseTimer !== null) window?.clearTimeout?.(state.updateReleaseTimer);
         state.updateReleaseTimer = null;
@@ -1956,6 +2525,7 @@ export function createBrowserApp({
         if (nextController === observedController) return;
         observedController = nextController;
         state.updateController = nextController;
+        state.updateActiveControllerRelease = null;
         state.updateTargetRelease = null;
         clearUpdateReloadTimers();
         if (!hadController) {
@@ -1972,19 +2542,20 @@ export function createBrowserApp({
         elements.apply_update.disabled = false;
         elements.defer_update.disabled = false;
         elements.update_banner.hidden = false;
-        try { nextController.postMessage?.({ type: "GET_LAZYING_AGENT_RELEASE" }); } catch { /* Fallback below. */ }
-        const expectedController = nextController;
-        state.updateReleaseTimer = window?.setTimeout?.(() => {
-          if (state.updateController !== expectedController || state.updateReloaded) return;
-          state.updateReleaseTimer = null;
-          scheduleSafeUpdateReload();
-        }, 1_000) ?? null;
-        scheduleSafeUpdateReload();
+        void queryActiveUpdateRelease();
       });
       const registration = await navigator.serviceWorker.register(workerPath, { scope: workerScope, updateViaCache: "none" });
       const offerWaitingWorker = (waiting, releaseId) => {
         if (registration.waiting !== waiting) return;
-        if (releaseId === currentRelease) {
+        const activeControllerIsCurrentPage = releaseId === currentRelease
+          && state.updateActiveControllerRelease === currentRelease;
+        const noIncumbentWorker = observedController === null && registration.active == null;
+        const currentPageReplacesActiveController = releaseId === currentRelease
+          && validAgentRelease(state.updateActiveControllerRelease)
+          && state.updateActiveControllerRelease !== currentRelease;
+        if (releaseId === currentRelease
+            && !currentPageReplacesActiveController
+            && (activeControllerIsCurrentPage || noIncumbentWorker)) {
           if (state.updateOfferedWorker === waiting) state.updateOfferedWorker = null;
           if (state.updateDeferredWorker === waiting) {
             state.updateDeferredWorker = null;
@@ -2007,6 +2578,7 @@ export function createBrowserApp({
         state.updateRegistration = registration;
         state.updateOfferedWorker = waiting;
         elements.update_banner.hidden = false;
+        scheduleSafeUpdateReload();
       };
       const ready = () => {
         const waiting = registration.waiting;
@@ -2025,9 +2597,20 @@ export function createBrowserApp({
         void queryWorkerRelease(waiting).then((releaseId) => offerWaitingWorker(waiting, releaseId));
       };
       state.showUpdatePrompt = ready;
+      if (observedController !== null) {
+        void queryWorkerRelease(observedController).then((releaseId) => {
+          if (state.updateController !== observedController) return;
+          state.updateActiveControllerRelease = releaseId;
+          ready();
+        });
+      }
       ready();
       registration.addEventListener?.("updatefound", () => {
-        registration.installing?.addEventListener?.("statechange", ready);
+        const installing = registration.installing;
+        installing?.addEventListener?.("statechange", () => {
+          if (registration.waiting === installing) state.updateObservedWaitingWorkers.add(installing);
+          ready();
+        });
       });
       const checkForUpdate = async ({ force = false, onlineTransition = false } = {}) => {
         const instant = Number(now());

@@ -2054,13 +2054,27 @@ export function createBrowserApp({
       state.runId = null;
       state.agentRunStatus = null;
       elements.conversation_title.textContent = thread.title;
-      thread.messages.forEach((message) => messageNode(message.role, message.content, { runId: message.runId }));
+      const runs = persistedThreadRuns(thread);
+      const missingAssistantRuns = new Set(
+        runs.filter((requested) => !requested.persisted).map((requested) => requested.runId)
+      );
+      thread.messages.forEach((message, index) => {
+        messageNode(message.role, message.content, { runId: message.runId });
+        const next = thread.messages[index + 1];
+        if (missingAssistantRuns.has(message.runId) && next?.runId !== message.runId) {
+          // Failed, cancelled, and live runs do not necessarily have a
+          // persisted assistant message. Reserve their chronological position
+          // before replay so an older run cannot be appended after a resumed
+          // successor's stored answer and artifacts.
+          messageNode("assistant", "", { runId: message.runId });
+          missingAssistantRuns.delete(message.runId);
+        }
+      });
       renderThreads();
       if (thread.authority.lastCompaction) {
         elements.context_indicator.hidden = false;
         elements.context_indicator_text.textContent = `${thread.authority.lastCompaction.compactedMessages} earlier messages were compacted by AgInTi.`;
       }
-      const runs = persistedThreadRuns(thread);
       for (const requested of runs) {
         const requestedRunId = requested.runId;
         const { run } = await agent.runStatus(requestedRunId);

@@ -956,6 +956,17 @@ test("Agent reload restores an older failed run after its resumed successor comp
   const failedEvents = await verifiedEvents([["run.failed", {}]]);
   const completedEvents = await verifiedEvents([
     ["output.delta", { text: "Corrected run completed" }],
+    ["artifact.created", { artifact: {
+      id: ARTIFACT_ID,
+      title: "Corrected plot",
+      kind: "plot",
+      spec: {
+        schemaVersion: "1",
+        type: "line",
+        labels: ["A", "B"],
+        series: [{ name: "Value", data: [1, 2] }],
+      },
+    } }],
     ["output.completed", {}],
     ["run.completed", {}],
   ], { runId: SECOND_RUN_ID });
@@ -1004,6 +1015,19 @@ test("Agent reload restores an older failed run after its resumed successor comp
     assistants.find((node) => node.dataset.runId === SECOND_RUN_ID).textContent,
     /Corrected run completed/u
   );
+  assert.deepEqual(
+    browser.document.getElementById("messages").children.map((node) => [node.dataset.role, node.dataset.runId]),
+    [
+      ["user", RUN_ID],
+      ["assistant", RUN_ID],
+      ["user", SECOND_RUN_ID],
+      ["assistant", SECOND_RUN_ID],
+    ],
+    "a missing failed-run assistant is reserved before the resumed successor chronology"
+  );
+  const successor = assistants.find((node) => node.dataset.runId === SECOND_RUN_ID);
+  assert.equal(successor.children.find((node) => node.className === "message-artifacts")?.children.length, 1);
+  assert.match(successor.textContent, /Corrected plot/u);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
 });
 

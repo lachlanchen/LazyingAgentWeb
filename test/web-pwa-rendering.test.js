@@ -803,6 +803,18 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   );
 });
 
+test("mobile sidebar and send controls expose comfortable touch targets", () => {
+  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
+  assert.ok(mobileStart >= 0);
+  assert.ok(mobileEnd > mobileStart);
+  const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
+  const touchTargetRule = /#open-sidebar,\s*#send-message\s*\{([^}]*)\}/u.exec(mobileCss);
+  assert.ok(touchTargetRule);
+  assert.match(touchTargetRule[1], /min-width:\s*48px;/u);
+  assert.match(touchTargetRule[1], /min-height:\s*48px;/u);
+});
+
 test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and clears only after authority", async () => {
   const now = "2026-08-24T08:00:00.000Z";
   const hashA = "a".repeat(64);

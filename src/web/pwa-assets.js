@@ -696,6 +696,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .sidebar[data-open="true"] { transform: translateX(0); }
   .sidebar-scrim { position: fixed; inset: 0; z-index: 3; display: block; border: 0; border-radius: 0; background: rgb(0 0 0 / 30%); }
   .icon-button { display: inline-grid; }
+  #open-sidebar, #send-message { min-width: 48px; min-height: 48px; }
   .theme-label { display: none; }
   .topbar { gap: .45rem; }
   .mode-switch button { padding-inline: .55rem; }

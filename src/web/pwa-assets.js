@@ -751,3 +751,24 @@ export function restoreTheme({
   } catch { /* Bright remains the fail-safe default. */ }
   return applyTheme(theme, { document, storage });
 }
+
+const WORKSPACE_MODES = new Set(["agent", "chat"]);
+
+export function rememberWorkspaceMode(mode, {
+  storage = globalThis.localStorage,
+} = {}) {
+  if (!WORKSPACE_MODES.has(mode)) throw new TypeError("workspace mode must be agent or chat");
+  try { storage?.setItem("lazying-agent-workspace-mode", mode); } catch { /* Mode preference is optional. */ }
+  return mode;
+}
+
+export function restoreWorkspaceMode({
+  storage = globalThis.localStorage,
+} = {}) {
+  try {
+    const stored = storage?.getItem("lazying-agent-workspace-mode");
+    return WORKSPACE_MODES.has(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}

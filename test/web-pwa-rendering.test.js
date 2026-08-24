@@ -20,7 +20,9 @@ import {
   createPwaManifest,
   normalizeAgentWebBasePath,
   offerPasswordManagerSave,
+  rememberWorkspaceMode,
   restoreTheme,
+  restoreWorkspaceMode,
   versionedAgentWebAsset,
 } from "../src/web/pwa-assets.js";
 import { createBrowserApp } from "../src/web/browser-app.js";
@@ -2504,6 +2506,29 @@ test("theme persistence stores only the theme and keeps bright as the fail-safe 
   assert.equal(applyTheme("dark", { document, storage }), "dark");
   assert.equal(document.documentElement.dataset.theme, "dark");
   assert.throws(() => applyTheme("credential", { document, storage }), /theme/u);
+});
+
+test("workspace mode persistence stores only a bounded non-private preference", () => {
+  const values = new Map();
+  const storage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, value); },
+  };
+  assert.equal(restoreWorkspaceMode({ storage }), null);
+  assert.equal(rememberWorkspaceMode("chat", { storage }), "chat");
+  assert.equal(restoreWorkspaceMode({ storage }), "chat");
+  assert.deepEqual([...values], [["lazying-agent-workspace-mode", "chat"]]);
+  assert.equal(rememberWorkspaceMode("agent", { storage }), "agent");
+  assert.equal(restoreWorkspaceMode({ storage }), "agent");
+  values.set("lazying-agent-workspace-mode", "credential");
+  assert.equal(restoreWorkspaceMode({ storage }), null);
+  assert.throws(() => rememberWorkspaceMode("credential", { storage }), /workspace mode/u);
+  const unavailable = {
+    getItem() { throw new Error("storage unavailable"); },
+    setItem() { throw new Error("storage unavailable"); },
+  };
+  assert.equal(restoreWorkspaceMode({ storage: unavailable }), null);
+  assert.equal(rememberWorkspaceMode("chat", { storage: unavailable }), "chat");
 });
 
 test("password saving delegates to the browser Credential Management API without app storage", async () => {

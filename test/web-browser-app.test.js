@@ -609,6 +609,45 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
 });
 
+test("a user-selected Chat workspace survives reload without an automatic Agent handoff changing it", {
+  concurrency: false,
+}, async (t) => {
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const values = new Map();
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem(key) { return values.get(key) ?? null; },
+      setItem(key, value) { values.set(key, value); },
+    },
+  });
+  t.after(() => {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, "localStorage", previousStorage);
+  });
+  const completed = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run() }; },
+    async *streamRunEvents() { yield { event: completed, cursor: { seq: completed.seq, hash: completed.hash } }; },
+  };
+  const first = harness({ agent });
+  await first.app.initialize();
+  assert.equal(first.document.getElementById("workspace").dataset.mode, "agent");
+  first.app.setMode("chat", { restoreView: false });
+  assert.equal(values.get("lazying-agent-workspace-mode"), "chat");
+  first.document.getElementById("message-input").value = "Run this Python code\n```python\nprint(1)\n```";
+  await first.app.submitMessage({ preventDefault() {} });
+  assert.equal(first.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(values.get("lazying-agent-workspace-mode"), "chat", "one execution handoff is not a preference change");
+
+  const reloaded = harness({ agent });
+  await reloaded.app.initialize();
+  assert.equal(reloaded.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(reloaded.document.getElementById("chat-mode").getAttribute("aria-pressed"), "true");
+});
+
 test("explicit plot and code-run prompts in Direct Chat hand off to Agent with unmistakable controls", async () => {
   const events = await verifiedEvents([
     ["output.delta", { text: "Rendered plot" }],
@@ -1071,12 +1110,15 @@ test("Agent resume binds a new run to the exact failed predecessor before openin
   });
   let streams = 0;
   let resumes = 0;
+  let resumeArguments = null;
   const agent = {
     ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
     async createThread() { return { thread: agentThread() }; },
     async startRun() { return { run: run("running") }; },
-    async resumeRun(runId) {
+    async resumeRun(...args) {
       resumes += 1;
+      resumeArguments = args;
+      const [runId] = args;
       assert.equal(runId, RUN_ID);
       return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
     },
@@ -1098,9 +1140,314 @@ test("Agent resume binds a new run to the exact failed predecessor before openin
   await browser.app.resume();
 
   assert.equal(resumes, 1);
+  assert.equal(resumeArguments[0], RUN_ID);
+  assert.equal(resumeArguments[1], undefined, "an empty composer preserves the input-less Resume RPC");
+  assert.match(resumeArguments[2].idempotency, /^agent_resume_[A-Za-z0-9._~-]+$/u);
   assert.equal(streams, 2);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
   assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(
+    browser.document.getElementById("messages").children.filter((node) => node.dataset.role === "user").length,
+    1,
+    "input-less Resume does not invent a second user message",
+  );
+});
+
+test("Agent Resume submits a corrected failed or cancelled draft only after its exact successor is accepted", async () => {
+  for (const [terminalStatus, terminalType] of [["failed", "run.failed"], ["cancelled", "run.cancelled"]]) {
+    const terminal = await verifiedEvent({ seq: 1, type: terminalType, payload: {}, previousHash: ZERO_HASH });
+    const completed = await verifiedEvent({
+      seq: 1,
+      type: "run.completed",
+      payload: {},
+      previousHash: ZERO_HASH,
+      runId: SECOND_RUN_ID,
+    });
+    const response = Promise.withResolvers();
+    const entered = Promise.withResolvers();
+    const correctedDraft = "  Run this corrected Python code.  ";
+    let streams = 0;
+    const agent = {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun() { return { run: run("running") }; },
+      async resumeRun(...args) {
+        entered.resolve(args);
+        return await response.promise;
+      },
+      async *streamRunEvents() {
+        streams += 1;
+        const event = streams === 1 ? terminal : completed;
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    };
+    const browser = harness({ agent });
+    await browser.app.initialize();
+    browser.document.getElementById("message-input").value = `Create a ${terminalStatus} run`;
+    await browser.app.submitMessage({ preventDefault() {} });
+    assert.equal(browser.document.getElementById("workspace").dataset.status, terminalStatus);
+
+    const input = browser.document.getElementById("message-input");
+    input.value = correctedDraft;
+    const resuming = browser.app.resume();
+    const resumeArguments = await entered.promise;
+    assert.deepEqual(
+      resumeArguments.slice(0, 2),
+      [RUN_ID, correctedDraft.trim()],
+      `${terminalStatus} Resume sends the validated optional replacement input`,
+    );
+    assert.match(resumeArguments[2].idempotency, /^agent_resume_[A-Za-z0-9._~-]+$/u);
+    assert.equal(input.value, correctedDraft, "the draft remains intact while mutation acceptance is unknown");
+    assert.equal(
+      browser.document.getElementById("messages").children.filter((node) => node.dataset.role === "user").length,
+      1,
+      "no speculative successor user message is rendered",
+    );
+
+    response.resolve({ run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) });
+    await resuming;
+
+    const users = browser.document.getElementById("messages").children
+      .filter((node) => node.dataset.role === "user");
+    assert.equal(input.value, "");
+    assert.equal(users.length, 2);
+    assert.equal(users.at(-1).dataset.runId, SECOND_RUN_ID);
+    assert.equal(users.at(-1).textContent, correctedDraft.trim());
+    assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  }
+});
+
+test("Agent corrected Resume preserves its exact draft across ambiguous or mismatched acceptance", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  for (const candidate of [
+    {
+      label: "ambiguous transport",
+      resume: async () => { throw Object.assign(new Error("response unavailable"), { retryable: true }); },
+    },
+    {
+      label: "mismatched predecessor",
+      resume: async () => ({ run: run("running", { id: SECOND_RUN_ID, previousRunId: null }) }),
+    },
+  ]) {
+    const correctedDraft = `  Correct ${candidate.label}.  `;
+    let streams = 0;
+    let resumes = 0;
+    const agent = {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun() { return { run: run("running") }; },
+      async resumeRun(runId, text) {
+        resumes += 1;
+        assert.deepEqual([runId, text], [RUN_ID, correctedDraft.trim()]);
+        return await candidate.resume();
+      },
+      async *streamRunEvents() {
+        streams += 1;
+        yield { event: failed, cursor: { seq: failed.seq, hash: failed.hash } };
+      },
+    };
+    const browser = harness({ agent });
+    await browser.app.initialize();
+    browser.document.getElementById("message-input").value = "Create a failed run";
+    await browser.app.submitMessage({ preventDefault() {} });
+    const input = browser.document.getElementById("message-input");
+    input.value = correctedDraft;
+
+    await browser.app.resume();
+
+    assert.equal(resumes, 1, candidate.label);
+    assert.equal(streams, 1, `${candidate.label} never opens an unowned successor stream`);
+    assert.equal(input.value, correctedDraft, `${candidate.label} preserves the exact composer draft`);
+    assert.equal(
+      browser.document.getElementById("messages").children.filter((node) => node.dataset.role === "user").length,
+      1,
+      `${candidate.label} does not render an unconfirmed user message`,
+    );
+    assert.match(browser.document.getElementById("toast").textContent, /could not resume/iu, candidate.label);
+  }
+});
+
+test("Agent corrected Resume retries one ambiguous mutation with the same body and idempotency key", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const completed = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
+  const calls = [];
+  let streams = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(...args) {
+      calls.push(args);
+      if (calls.length === 1) throw Object.assign(new Error("response unavailable"), { retryable: true });
+      return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      const event = streams === 1 ? failed : completed;
+      yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Create a failed run";
+  await browser.app.submitMessage({ preventDefault() {} });
+  const input = browser.document.getElementById("message-input");
+  const correctedDraft = "  Corrected exact request.  ";
+  input.value = correctedDraft;
+
+  await browser.app.resume();
+
+  assert.equal(calls.length, 1);
+  assert.equal(input.value, correctedDraft);
+  assert.equal(input.disabled, false, "the exact pending correction remains editable");
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("new-thread").disabled, true);
+  assert.equal(browser.document.getElementById("chat-mode").disabled, true);
+  const laterDraft = "A later draft must survive acceptance";
+  input.value = laterDraft;
+
+  await browser.app.resume();
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].slice(0, 2), [RUN_ID, correctedDraft.trim()]);
+  assert.deepEqual(calls[1].slice(0, 2), [RUN_ID, correctedDraft.trim()]);
+  assert.equal(calls[0][2].idempotency, calls[1][2].idempotency);
+  assert.match(calls[0][2].idempotency, /^agent_resume_[A-Za-z0-9._~-]+$/u);
+  assert.equal(input.value, laterDraft, "acceptance never consumes composer work created after the ticket");
+  const users = browser.document.getElementById("messages").children
+    .filter((node) => node.dataset.role === "user");
+  assert.equal(users.length, 2);
+  assert.equal(users.at(-1).textContent, correctedDraft.trim());
+  assert.equal(users.at(-1).dataset.runId, SECOND_RUN_ID);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+});
+
+test("Agent corrected Resume retains one ticket across a mismatched success response", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const completed = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
+  const calls = [];
+  let streams = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(...args) {
+      calls.push(args);
+      return calls.length === 1
+        ? { run: run("running", { id: SECOND_RUN_ID, previousRunId: null }) }
+        : { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      const event = streams === 1 ? failed : completed;
+      yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Create a failed run";
+  await browser.app.submitMessage({ preventDefault() {} });
+  const input = browser.document.getElementById("message-input");
+  input.value = "Correct the mismatched run";
+
+  await browser.app.resume();
+  await browser.app.resume();
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].slice(0, 2), calls[1].slice(0, 2));
+  assert.equal(calls[0][2].idempotency, calls[1][2].idempotency);
+  assert.equal(streams, 2, "the mismatched response cannot open an unowned stream");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("a definitive Agent Resume rejection releases its ticket before a new attempt", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const completed = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
+  const calls = [];
+  let streams = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(...args) {
+      calls.push(args);
+      if (calls.length === 1) {
+        throw Object.assign(new Error("resume rejected"), {
+          code: "INVALID_REQUEST",
+          status: 400,
+          retryable: false,
+        });
+      }
+      return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      const event = streams === 1 ? failed : completed;
+      yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Create a failed run";
+  await browser.app.submitMessage({ preventDefault() {} });
+  const input = browser.document.getElementById("message-input");
+  input.value = "Correct after a definitive rejection";
+
+  await browser.app.resume();
+  assert.equal(input.disabled, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  await browser.app.resume();
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].slice(0, 2), calls[1].slice(0, 2));
+  assert.notEqual(calls[0][2].idempotency, calls[1][2].idempotency);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Agent corrected Resume rejects an invalid non-empty draft before dispatch", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun() { resumes += 1; throw new Error("invalid draft must not dispatch"); },
+    async *streamRunEvents() { yield { event: failed, cursor: { seq: failed.seq, hash: failed.hash } }; },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Create a failed run";
+  await browser.app.submitMessage({ preventDefault() {} });
+  const input = browser.document.getElementById("message-input");
+  for (const invalidDraft of ["   \n", "corrected\u0000draft"]) {
+    input.value = invalidDraft;
+
+    await browser.app.resume();
+
+    assert.equal(resumes, 0);
+    assert.equal(input.value, invalidDraft);
+    assert.equal(browser.document.getElementById("resume-run").hidden, false);
+    assert.equal(browser.document.getElementById("resume-run").disabled, false);
+    assert.match(browser.document.getElementById("toast").textContent, /invalid or too large[\s\S]*no run was resumed/iu);
+  }
 });
 
 test("terminal cancel response waits for the verified cancelled event without aborting its stream", async () => {
@@ -3690,6 +4037,58 @@ test("a stale restored-image decode revokes its object URL even when replacement
 
   assert.deepEqual(revokedUrls, ["blob:stale-restored-image"]);
   assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/iu);
+});
+
+test("a confirmed logout suppresses a stale Direct Chat history failure without restoring private UI", async () => {
+  const messages = [
+    chatMessage(1, "user", "Private question"),
+    chatMessage(2, "assistant", "Private answer"),
+  ];
+  const thread = chatThread({
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const finalRead = Promise.withResolvers();
+  const finalReadStarted = Promise.withResolvers();
+  let guardedRead = 0;
+  let deferSnapshot = false;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() {
+      if (deferSnapshot && ++guardedRead === 2) {
+        finalReadStarted.resolve();
+        return await finalRead.promise;
+      }
+      return { thread };
+    },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+  });
+  const browser = harness({ chat });
+  await browser.app.initialize();
+  const toast = browser.document.getElementById("toast");
+  toast.textContent = "signed-out sentinel";
+  toast.hidden = true;
+  deferSnapshot = true;
+
+  const opening = browser.app.openThread(CHAT_THREAD_ID);
+  await finalReadStarted.promise;
+  await browser.app.logout();
+  finalRead.reject(new DirectChatTransportError("Direct Chat request was not accepted.", {
+    code: "authentication_required",
+    status: 401,
+    retryable: false,
+  }));
+  await opening;
+
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("app-view").hidden, true);
+  assert.equal(browser.document.getElementById("messages").children.length, 0);
+  assert.equal(toast.hidden, true, "a stale owner cannot surface a post-logout history error");
+  assert.equal(toast.textContent, "signed-out sentinel");
 });
 
 test("a local multi-image-run preparation failure preserves both images and the exact prompt for retry", async () => {

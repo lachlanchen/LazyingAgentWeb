@@ -11,7 +11,9 @@ import { createRunPresentation } from "./presentation-state.js";
 import {
   applyTheme,
   offerPasswordManagerSave,
+  rememberWorkspaceMode,
   restoreTheme,
+  restoreWorkspaceMode,
 } from "./pwa-assets.js";
 import { createBrowserUpdateHandoffStore } from "./pwa-update-handoff-store.js";
 import {
@@ -946,6 +948,7 @@ export function createBrowserApp({
     agentReplayFailed: false,
     agentReplayOfferResume: true,
     agentCancelPending: false,
+    agentPendingResume: null,
     streamAbort: null,
     streamKind: null,
     viewEpoch: 0,
@@ -1166,7 +1169,8 @@ export function createBrowserApp({
     return state.busy || state.logoutPending || state.chatFinalization !== null
       || state.chatHistoryRestoration !== null
       || state.authRecoveryGeneration !== null
-      || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending;
+      || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending
+      || state.agentPendingResume !== null;
   }
 
   function updateImageControl() {
@@ -1175,6 +1179,7 @@ export function createBrowserApp({
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
     const locked = interactionLocked();
+    const pendingAgentResume = state.mode === "agent" && state.agentPendingResume !== null;
     const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
     const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
       && state.chatPendingSend?.ambiguousMutation !== undefined
@@ -1192,7 +1197,8 @@ export function createBrowserApp({
     elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
       || pendingChatDeletion
       || (state.selectedImages.length === 0 && !state.imagePreparing);
-    elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+    elements.message_input.disabled = !state.session.authenticated || (locked && !pendingAgentResume)
+      || state.imagePreparing || pendingChatSend
       || pendingChatDeletion
       || preservingAuthenticationDraft;
     elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
@@ -1225,7 +1231,7 @@ export function createBrowserApp({
     return state.mode === "agent" ? state.agentThreadId : state.chatThreadId;
   }
 
-  function setMode(mode, { restoreView = true } = {}) {
+  function setMode(mode, { restoreView = true, remember = true } = {}) {
     const agentAvailable = state.capabilities.enabled === true;
     const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
     const changed = nextMode !== state.mode;
@@ -1243,6 +1249,7 @@ export function createBrowserApp({
       state.streamAbort?.abort();
     }
     state.mode = nextMode;
+    if (remember && state.session.authenticated) rememberWorkspaceMode(state.mode);
     elements.workspace.dataset.mode = state.mode;
     elements.mode_switch.hidden = !agentAvailable;
     elements.agent_mode.setAttribute("aria-pressed", state.mode === "agent" ? "true" : "false");
@@ -2568,6 +2575,11 @@ export function createBrowserApp({
       }
       await stream;
     } catch (error) {
+      if (state.chatHistoryRestoration !== restoration
+          || state.chat !== restoration.chat
+          || !state.session.authenticated
+          || state.mode !== "chat"
+          || state.viewEpoch !== expectedEpoch) return;
       if (recoverChatReadAuthentication(error, captureChatReadRecovery({ threadId, generationId }))) return;
       throw error;
     } finally {
@@ -3250,7 +3262,7 @@ export function createBrowserApp({
     catch { return; }
     if (state.mode === "chat" && state.capabilities.enabled === true && !state.agentReplayFailed
         && state.selectedImages.length === 0 && requestsAgentExecution(text)) {
-      setMode("agent", { restoreView: false });
+      setMode("agent", { restoreView: false, remember: false });
       if (state.mode === "agent") {
         newConversation();
         showToast("Handed to Agent to run code and show the result here.");
@@ -3422,6 +3434,7 @@ export function createBrowserApp({
       state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
+      state.agentPendingResume = null;
       state.agentReplayFailed = false;
       clearConversation();
       state.agent = createAgentClient(state.session);
@@ -3481,9 +3494,14 @@ export function createBrowserApp({
         state.chatThreadId = sameAccountRecoveryWorkflow.thread.threadId;
       }
       showApp();
-      setMode(updateHandoff !== null || (recoveringAuthenticationDraft && !discardedCrossAccountDraft)
+      const forcedChatMode = updateHandoff !== null
+        || (recoveringAuthenticationDraft && !discardedCrossAccountDraft);
+      setMode(forcedChatMode
         ? "chat"
-        : selectDefaultMode(capability), { restoreView: false });
+        : restoreWorkspaceMode() ?? selectDefaultMode(capability), {
+        restoreView: false,
+        remember: false,
+      });
       const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
         && state.selectedImages.length > 0 && chatCapability.visionInput !== true
         && sameAccountRecoveryWorkflow === null;
@@ -3672,6 +3690,7 @@ export function createBrowserApp({
     updateImageControl();
     state.runId = null;
     state.agentRunStatus = null;
+    state.agentPendingResume = null;
     state.agentReplayFailed = false;
     clearConversation();
     purgeAttachmentBlobCache();
@@ -3788,6 +3807,7 @@ export function createBrowserApp({
     state.busy = true;
     elements.resume_run.disabled = true;
     updateImageControl();
+    let ownsAgentResume = null;
     try {
       if (state.mode === "chat") {
         if (state.authRecoveryGeneration) {
@@ -3817,17 +3837,81 @@ export function createBrowserApp({
       } else if (state.runId && state.capabilities.enabled && state.capabilities.actions.resume) {
         const requestedRunId = state.runId;
         const requestedThreadId = state.agentThreadId;
-        const { run } = await state.agent.resumeRun(requestedRunId);
+        const requestedSession = state.session;
+        const requestedAgent = state.agent;
+        const requestedEpoch = state.viewEpoch;
+        let resumeTicket = state.agentPendingResume;
+        if (resumeTicket === null) {
+          let draft = null;
+          let text;
+          if (state.agentRunStatus === "failed" || state.agentRunStatus === "cancelled") {
+            const candidate = elements.message_input.value;
+            if (candidate !== "") {
+              try {
+                draft = candidate;
+                text = boundedMessage(candidate);
+              } catch {
+                showToast("The corrected Agent prompt is invalid or too large. Edit it before resuming; no run was resumed.");
+                return;
+              }
+            }
+          }
+          resumeTicket = Object.freeze({
+            session: requestedSession,
+            agent: requestedAgent,
+            runId: requestedRunId,
+            threadId: requestedThreadId,
+            epoch: requestedEpoch,
+            draft,
+            text,
+            idempotency: createBrowserOpaqueId("agent_resume"),
+          });
+          state.agentPendingResume = resumeTicket;
+          updateImageControl();
+        } else if (resumeTicket.session !== requestedSession
+            || resumeTicket.agent !== requestedAgent
+            || resumeTicket.runId !== requestedRunId
+            || resumeTicket.threadId !== requestedThreadId
+            || resumeTicket.epoch !== requestedEpoch) {
+          state.agentPendingResume = null;
+          showToast("The pending Agent resume no longer owns this view. Reopen the conversation before resuming.");
+          return;
+        }
+        ownsAgentResume = () => state.session === requestedSession
+          && state.session.authenticated
+          && state.agent === requestedAgent
+          && state.mode === "agent"
+          && state.viewEpoch === requestedEpoch
+          && state.agentThreadId === requestedThreadId
+          && state.runId === requestedRunId;
+        const response = await requestedAgent.resumeRun(
+          requestedRunId,
+          resumeTicket.text,
+          { idempotency: resumeTicket.idempotency },
+        );
+        if (!ownsAgentResume() || state.agentPendingResume !== resumeTicket) return;
+        const { run } = response;
         const resumedRun = correlatedResumedAgentRun(run, {
           previousRunId: requestedRunId,
           threadId: requestedThreadId,
         });
+        if (state.agentPendingResume === resumeTicket) state.agentPendingResume = null;
+        if (resumeTicket.text !== undefined) {
+          if (elements.message_input.value === resumeTicket.draft) elements.message_input.value = "";
+          messageNode("user", resumeTicket.text, { runId: resumedRun.id });
+        }
         await streamAgentRun(resumedRun, {
           expectedRunId: resumedRun.id,
           expectedThreadId: requestedThreadId,
         });
       }
     } catch (error) {
+      if (ownsAgentResume !== null && !ownsAgentResume()) return;
+      if (state.agentPendingResume !== null && error?.retryable === false
+          && Number.isSafeInteger(error?.status) && error.status >= 400 && error.status < 499
+          && error?.code !== "AGINTI_ABORTED") {
+        state.agentPendingResume = null;
+      }
       const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;
       const ambiguousAuthenticationWorkflow = state.mode === "chat"
         && state.chatPendingSend?.ambiguousMutation !== null
@@ -3881,6 +3965,7 @@ export function createBrowserApp({
       state.agentThreadId = null;
       state.runId = null;
       state.agentRunStatus = null;
+      state.agentPendingResume = null;
     } else {
       state.chatThreadId = null;
       state.chatThread = null;
@@ -3904,6 +3989,7 @@ export function createBrowserApp({
       || state.imagePreparing || state.chatPendingSend !== null || state.chatPendingDeletion !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
+      || state.agentPendingResume !== null
       || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
       || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
   }

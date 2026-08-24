@@ -4,14 +4,17 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.19 production):** production is promoted
+> **Deployment status (v0.1.20 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
 > or disabled, the BFF fails closed and Agent is unavailable. Direct Chat stays
 > separate and does not enable or authorize Agent. Current accepted Agent
 > requests can execute one exact fenced `python` block without model planning,
-> retain public failure reasons across reload, and follow Resume successor runs.
+> retain public failure reasons across reload, and follow exact idempotent Resume
+> successor runs with an optional corrected prompt. Direct Chat remembers the
+> user's non-private workspace-mode preference across a full reload, while
+> confirmed sign-out fences stale history reads.
 > Accepted artifacts remain limited to declarative plot, table, and Markdown schemas; voice
 > messages, web/deep research, and general artifact file upload/download remain
 > unavailable.
@@ -22,7 +25,7 @@ boundary, and replaceable-node contract are specified in
 
 ## Implemented surface
 
-- A bright-by-default installable PWA with persistent theme preference,
+- A bright-by-default installable PWA with persistent theme and workspace-mode preferences,
   browser-password-manager integration, durable thread restoration, resumable
   streaming, explicit cancellation, optional one-to-four-image Direct Chat input,
   Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering.

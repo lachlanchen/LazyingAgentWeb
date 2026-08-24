@@ -133,6 +133,14 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
     threadId: THREAD_ID,
     input: { text: "Plot this" },
   }), { threadId: THREAD_ID, input: { text: "Plot this" } });
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
+    threadId: THREAD_ID,
+    input: { text: "x\ud800" },
+  }), /malformed Unicode/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
+    threadId: THREAD_ID,
+    input: { text: "界".repeat(11_000) },
+  }), /UTF-8 byte limit/u);
   for (const field of ["model", "provider", "tools", "cwd", "sandboxMode", "runtime", "context", "compaction"]) {
     assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
       threadId: THREAD_ID,

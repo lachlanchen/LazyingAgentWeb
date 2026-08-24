@@ -136,10 +136,25 @@ function boundedInteger(value, label, { minimum = 0, maximum = Number.MAX_SAFE_I
   return value;
 }
 
+function isUnicodeScalarText(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function boundedText(value, label, maximum, { minimum = 0, presentation = false } = {}) {
   if (typeof value !== "string" || value.length < minimum || value.length > maximum) {
     invalid(`${label} must contain ${minimum}-${maximum} characters`);
   }
+  if (!isUnicodeScalarText(value)) invalid(`${label} contains malformed Unicode text`);
   if (CONTROL.test(value)) invalid(`${label} contains forbidden control characters`);
   if (presentation && (UNSAFE_PRESENTATION.test(value) || PRIVATE_PATH.test(value))) {
     invalid(`${label} contains markup, a URL, or a private runtime path`, "UNSAFE_PRESENTATION");
@@ -229,6 +244,7 @@ function input(value, { optional = false } = {}) {
   const object = exact(value, ["text"], "input");
   const text = boundedText(object.text, "input.text", 32_000, { minimum: 1 }).trim();
   if (!text) invalid("input.text must contain non-whitespace text");
+  if (utf8.encode(text).byteLength > 32 * 1024) invalid("input.text exceeds the UTF-8 byte limit");
   return Object.freeze({ text });
 }
 

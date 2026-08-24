@@ -45,6 +45,7 @@ const ATTACHMENT_RENDERED_PREVIEW_LIMIT = 4;
 const ATTACHMENT_RESTORE_CONCURRENCY = 1;
 const COMPOSER_IMAGE_COUNT_LIMIT = 4;
 const COMPOSER_IMAGE_BYTES_LIMIT = 16 * 1024 * 1024;
+const COMPOSER_MESSAGE_BYTES_LIMIT = 32 * 1024;
 const updateHandoffEncoder = new TextEncoder();
 const updateHandoffDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -123,8 +124,23 @@ function requiredMethod(value, name, owner) {
   if (!value || typeof value[name] !== "function") throw new TypeError(`${owner} must provide ${name}()`);
 }
 
+function isUnicodeScalarText(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function boundedMessage(value) {
   if (typeof value !== "string" || value.length < 1 || value.length > 32_000
+      || !isUnicodeScalarText(value) || updateHandoffEncoder.encode(value).byteLength > COMPOSER_MESSAGE_BYTES_LIMIT
       || UNSAFE_MESSAGE_CONTROL.test(value)) {
     throw new TypeError("message is invalid");
   }
@@ -133,7 +149,39 @@ function boundedMessage(value) {
   return text;
 }
 
+function normalizedExecutionAction(value) {
+  let text = String(value || "").normalize("NFKC").replace(/\s+/gu, " ").trim();
+  text = text.replace(/^(?:please|kindly)[ \t]*,?[ \t]+/iu, "");
+  text = text.replace(
+    /^(?:can|could|would|will)\s+you\s+(?:(?:please|kindly)[ \t]*,?[ \t]+)?/iu,
+    ""
+  );
+  text = text.replace(
+    /^i(?:['’]d|\s+would)?\s+(?:like|want|need)\s+(?:you\s+)?to\s+/iu,
+    ""
+  );
+  text = text.replace(/^let(?:['’]s|\s+us)\s+/iu, "");
+  text = text.replace(/^(?:请你?|請你?|麻烦你?|麻煩你?|劳驾|勞駕)[ \t]*/u, "");
+  return text;
+}
+
+function requestsExplicitPythonHandoff(value) {
+  const fenceLines = value.match(/^ {0,3}(?:`{3,}|~{3,})/gmu) ?? [];
+  if (fenceLines.length === 0) return null;
+  const matches = [...value.matchAll(/(^|\n)```python[ \t]*\r?\n[\s\S]*?\r?\n```[ \t]*(?=\n|$)/giu)];
+  if (matches.length !== 1 || fenceLines.length !== 2) return false;
+  const match = matches[0];
+  const outside = `${value.slice(0, match.index)}\n${value.slice(match.index + match[0].length)}`;
+  const action = normalizedExecutionAction(outside);
+  return /^(?:run|execute)(?:(?:\s+|:)(?:this|that|my|the|following|below|above|python|code|script|program|snippet|block|it)\b|\s*:)/iu.test(action)
+    || /^(?:run|execute)\b[ \t]*(?:[,;][ \t]*)?(?:(?:and(?:[ \t]+then)?|then|to)[ \t]+)?(?:show|display|return|give|print|output|produce|create|generate|draw|render|include|plot|chart|graph|visuali[sz]e)\b/iu.test(action)
+    || /^(?:run|execute)\b[ \t]*[;,][ \t]*i[ \t]+(?:need|want|would[ \t]+like)[ \t]+(?:a[ \t]+|the[ \t]+)?(?:plot|chart|graph)\b/iu.test(action)
+    || /^(?:运行|運行|执行|執行)(?:一下)?(?:(?:以下|下面|上述|上面|这段|這段|这个|這個|该|該|python|代码|代碼|程式碼|脚本|腳本|程序|程式)|[ \t]*[:：])/iu.test(action);
+}
+
 function requestsAgentExecution(value) {
+  const explicitPythonHandoff = requestsExplicitPythonHandoff(value);
+  if (explicitPythonHandoff !== null) return explicitPythonHandoff;
   const text = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
   const lower = text.toLocaleLowerCase("en-US");
   if (/^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:do\s+not|don['’]?t|dont|can['’]?t|cannot|not|never|no\s+need\s+to)\b/iu.test(lower)
@@ -145,27 +193,16 @@ function requestsAgentExecution(value) {
       || /\b(?:using|with|in|run|execute)\s+(?:r|go|c)(?:\s+(?:code|script|runtime|language))?\b/iu.test(lower)) {
     return false;
   }
-  const requestPrefix = /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:i\s+(?:want|need)\s+you\s+to\s+)?/iu;
-  const request = lower.match(requestPrefix)?.[0] ?? "";
-  const command = lower.slice(request.length);
+  const command = normalizedExecutionAction(lower);
   return /^(?:plot|graph|chart)\b/iu.test(command)
     || /^(?:run|execute)\b.{0,160}\b(?:code|script|python|plot|graph|chart)\b/iu.test(command)
     || /^(?:make|draw|create|generate|render|display|show|calculate|compute)\b.{0,160}\b(?:plot|graph|chart)\b/iu.test(command);
 }
 
 function updateHandoffDraft(value) {
-  if (typeof value !== "string" || value.length > 32_000 || UNSAFE_MESSAGE_CONTROL.test(value)) {
+  if (typeof value !== "string" || value.length > 32_000 || !isUnicodeScalarText(value)
+      || UNSAFE_MESSAGE_CONTROL.test(value)) {
     throw new TypeError("update handoff draft is invalid");
-  }
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError("update handoff draft contains invalid Unicode");
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      throw new TypeError("update handoff draft contains invalid Unicode");
-    }
   }
   return value;
 }
@@ -658,6 +695,16 @@ function correlatedAgentRun(value, { runId, threadId }) {
   return value;
 }
 
+function correlatedResumedAgentRun(value, { previousRunId, threadId }) {
+  if (!value || typeof value !== "object" || value.threadId !== threadId
+      || value.previousRunId !== previousRunId || value.id === previousRunId) {
+    throw new AgintiProtocolError("Resumed Agent run does not extend the requested run", {
+      code: "LEDGER_OWNERSHIP_MISMATCH",
+    });
+  }
+  return value;
+}
+
 function assertTerminalAgentReplay(run, snapshot) {
   const cursor = run?.eventCursor;
   if (!TERMINAL.has(run?.status)
@@ -674,16 +721,19 @@ function assertTerminalAgentReplay(run, snapshot) {
   return snapshot;
 }
 
-function persistedAssistantRuns(thread) {
+function persistedThreadRuns(thread) {
   const result = [];
   const seen = new Set();
-  const persisted = new Set();
+  const persisted = new Set(
+    (Array.isArray(thread?.messages) ? thread.messages : [])
+      .filter((message) => message?.role === "assistant")
+      .map((message) => message.runId)
+  );
   for (const message of Array.isArray(thread?.messages) ? thread.messages : []) {
-    if (message?.role !== "assistant") continue;
-    persisted.add(message.runId);
+    if (message?.role !== "user" && message?.role !== "assistant") continue;
     if (message.runId === thread?.lastRunId || seen.has(message.runId)) continue;
     seen.add(message.runId);
-    result.push(Object.freeze({ runId: message.runId, persisted: true }));
+    result.push(Object.freeze({ runId: message.runId, persisted: persisted.has(message.runId) }));
   }
   // The thread's declared current run is always restored last even if a
   // hostile-but-schema-valid message ordering places it earlier in history.
@@ -1813,6 +1863,19 @@ export function createBrowserApp({
     if (releaseCancellationFence) updateImageControl();
   }
 
+  function renderAgentFailure(runId, value) {
+    const runMessage = state.agentRunMessages.get(runId);
+    if (!runMessage) return;
+    const candidate = typeof value === "string" && value.length <= 600
+      && isUnicodeScalarText(value) && !UNSAFE_MESSAGE_CONTROL.test(value)
+      ? value.trim()
+      : "";
+    const message = document.createElement("p");
+    message.className = "agent-run-failure";
+    message.textContent = candidate || "Agent execution failed. Resume this run to try again.";
+    runMessage.body.replaceChildren(message);
+  }
+
   async function streamAgentRun(run, {
     cursor,
     expectedRunId = run?.id,
@@ -1880,10 +1943,25 @@ export function createBrowserApp({
           assertTerminalAgentReplay(run, snapshot);
           state.agentReplayValidating = false;
           renderPresentation(snapshot);
+          if (snapshot.status === "failed") renderAgentFailure(run.id, run.error?.message);
           connection("Connected");
           return;
         }
         if (snapshot.terminalStatus !== null) {
+          if (snapshot.status === "failed") {
+            let failureMessage = "";
+            try {
+              const response = await agent.runStatus(run.id, { signal: controller.signal });
+              if (!ownsStream()) return;
+              const finalRun = correlatedAgentRun(response.run, { runId: run.id, threadId: run.threadId });
+              assertTerminalAgentReplay(finalRun, snapshot);
+              failureMessage = finalRun.error?.message || "";
+            } catch {
+              // The verified terminal event still proves failure. Error detail
+              // is optional presentation data and falls back to fixed text.
+            }
+            renderAgentFailure(run.id, failureMessage);
+          }
           connection("Connected");
           return;
         }
@@ -1975,7 +2053,7 @@ export function createBrowserApp({
         elements.context_indicator.hidden = false;
         elements.context_indicator_text.textContent = `${thread.authority.lastCompaction.compactedMessages} earlier messages were compacted by AgInTi.`;
       }
-      const runs = persistedAssistantRuns(thread);
+      const runs = persistedThreadRuns(thread);
       for (const requested of runs) {
         const requestedRunId = requested.runId;
         const { run } = await agent.runStatus(requestedRunId);
@@ -3740,9 +3818,12 @@ export function createBrowserApp({
         const requestedRunId = state.runId;
         const requestedThreadId = state.agentThreadId;
         const { run } = await state.agent.resumeRun(requestedRunId);
-        correlatedAgentRun(run, { runId: requestedRunId, threadId: requestedThreadId });
-        await streamAgentRun(run, {
-          expectedRunId: requestedRunId,
+        const resumedRun = correlatedResumedAgentRun(run, {
+          previousRunId: requestedRunId,
+          threadId: requestedThreadId,
+        });
+        await streamAgentRun(resumedRun, {
+          expectedRunId: resumedRun.id,
           expectedThreadId: requestedThreadId,
         });
       }

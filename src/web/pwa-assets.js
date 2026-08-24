@@ -643,6 +643,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message { min-width: 0; max-width: min(86%, 760px); padding: .85rem 1rem; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
 .message[data-role="user"] { justify-self: end; background: var(--accent-soft); }
 .message[data-role="assistant"] { justify-self: start; }
+.agent-run-failure { margin: 0; color: var(--danger); overflow-wrap: anywhere; }
 .message pre { overflow-x: auto; padding: .8rem; border-radius: 10px; background: var(--surface-soft); }
 .message-artifacts { min-width: 0; display: grid; gap: .75rem; margin-top: .85rem; padding-top: .85rem; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .message-artifacts[hidden] { display: none; }

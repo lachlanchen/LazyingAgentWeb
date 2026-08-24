@@ -614,7 +614,30 @@ test("explicit plot and code-run prompts in Direct Chat hand off to Agent with u
     ["output.delta", { text: "Rendered plot" }],
     ["run.completed", {}],
   ]);
-  for (const prompt of ["Plot e^x-x^e", "Plot and show here?", "Run code plot e^x-x"]) {
+  for (const prompt of [
+    "Plot e^x-x^e",
+    "Plot and show here?",
+    "Run code plot e^x-x",
+    "Run this Python code and chart the values\n```python\nprint(1)\n```",
+    "Run this Python code and display its graph\n```python\nprint(1)\n```",
+    "Run this Python code; I need a plot\n```python\nprint(1)\n```",
+    "Kindly run this Python code\n```python\nprint(1)\n```",
+    "I'd like you to run this Python code\n```python\nprint(1)\n```",
+    "Let's run this Python code\n```python\nprint(1)\n```",
+    "请执行下面代码\n```python\nprint('好')\n```",
+    "請執行下面的程式碼\n```python\nprint('好')\n```",
+    "Run this Python code and show the result\n```python\nprint('javascript is only output text')\n```",
+    "Run and show the plot.\n```python\nprint(1)\n```",
+    "Run and show the output.\n```python\nprint(1)\n```",
+    "Execute and return the result.\n```python\nprint(1)\n```",
+    "Execute and show both stdout and messages.\n```python\nprint(1)\n```",
+    "Run, show output.\n```python\nprint(1)\n```",
+    "Run; then show output.\n```python\nprint(1)\n```",
+    "Run, I need a plot.\n```python\nprint(1)\n```",
+    "Execute; I would like a graph.\n```python\nprint(1)\n```",
+    "执行：\n```python\nprint(1)\n```",
+    "執行一下:\n```python\nprint(1)\n```",
+  ]) {
     const started = [];
     const agent = {
       ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
@@ -890,6 +913,61 @@ test("Agent reload restores artifacts for every persisted assistant run from ind
   assert.equal(resumes, 0);
 });
 
+test("Agent reload restores an older failed run after its resumed successor completed", async () => {
+  const failedEvents = await verifiedEvents([["run.failed", {}]]);
+  const completedEvents = await verifiedEvents([
+    ["output.delta", { text: "Corrected run completed" }],
+    ["output.completed", {}],
+    ["run.completed", {}],
+  ], { runId: SECOND_RUN_ID });
+  const failureMessage = "Python execution failed. Check the code, then resume.";
+  const thread = agentThread({
+    lastRunId: SECOND_RUN_ID,
+    messages: [
+      { id: "msg_user_failed_history_0001", role: "user", content: "Broken code", runId: RUN_ID },
+      { id: "msg_user_resumed_history_0002", role: "user", content: "Corrected code", runId: SECOND_RUN_ID },
+      { id: "msg_assistant_resumed_history_0002", role: "assistant", content: "Stored corrected answer", runId: SECOND_RUN_ID },
+    ],
+  });
+  const histories = new Map([
+    [RUN_ID, failedEvents],
+    [SECOND_RUN_ID, completedEvents],
+  ]);
+  const statusReads = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus(runId) {
+      statusReads.push(runId);
+      return { run: terminalRun(runId === RUN_ID ? "failed" : "completed", histories.get(runId), {
+        id: runId,
+        ...(runId === RUN_ID ? {
+          error: { code: "ANALYSIS_EXECUTION_FAILED", message: failureMessage },
+        } : {}),
+      }) };
+    },
+    async *streamRunEvents(options) {
+      for (const event of histories.get(options.runId)) {
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      }
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  assert.deepEqual(statusReads, [RUN_ID, SECOND_RUN_ID]);
+  const assistants = browser.document.getElementById("messages").children
+    .filter((node) => node.dataset.role === "assistant");
+  assert.equal(assistants.length, 2);
+  assert.equal(assistants.find((node) => node.dataset.runId === RUN_ID).textContent, failureMessage);
+  assert.match(
+    assistants.find((node) => node.dataset.runId === SECOND_RUN_ID).textContent,
+    /Corrected run completed/u
+  );
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
 test("a persisted assistant run cannot bypass exact terminal replay by also being lastRunId", async () => {
   const thread = agentThread({
     lastRunId: RUN_ID,
@@ -947,8 +1025,50 @@ test("terminal mutation and status responses remain nonterminal until a verified
   assert.match(browser.document.getElementById("toast").textContent, /still owned by AgInTi/u);
 });
 
-test("Agent resume binds the response to the exact requested run before opening a stream", async () => {
+test("verified Agent failure refreshes and renders its public reason as literal text", async () => {
+  const events = await verifiedEvents([["run.failed", {}]]);
+  const publicReason = "<img src=x onerror=alert(1)> [retry](javascript:alert(1))";
+  let statuses = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async runStatus() {
+      statuses += 1;
+      return { run: terminalRun("failed", events, {
+        error: { code: "ANALYSIS_EXECUTION_FAILED", message: publicReason },
+      }) };
+    },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Run this Python code";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(statuses, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+  const assistant = browser.document.getElementById("messages").children
+    .find((node) => node.dataset.runId === RUN_ID);
+  const body = assistant.children.find((node) => node.className === "message-content");
+  assert.equal(body.children.length, 1);
+  assert.equal(body.children[0].tagName, "p");
+  assert.equal(body.children[0].className, "agent-run-failure");
+  assert.equal(body.textContent, publicReason);
+  assert.equal(body.children[0].children[0].tagName, "#text");
+});
+
+test("Agent resume binds a new run to the exact failed predecessor before opening its stream", async () => {
   const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const resumedCompleted = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
   let streams = 0;
   let resumes = 0;
   const agent = {
@@ -958,12 +1078,15 @@ test("Agent resume binds the response to the exact requested run before opening 
     async resumeRun(runId) {
       resumes += 1;
       assert.equal(runId, RUN_ID);
-      return { run: run("running", { id: SECOND_RUN_ID }) };
+      return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
     },
     async *streamRunEvents() {
       streams += 1;
       if (streams === 1) yield { event: failed, cursor: { seq: failed.seq, hash: failed.hash } };
-      else throw new Error("a mismatched resume response must not open another stream");
+      else yield {
+        event: resumedCompleted,
+        cursor: { seq: resumedCompleted.seq, hash: resumedCompleted.hash },
+      };
     },
   };
   const browser = harness({ agent });
@@ -975,9 +1098,9 @@ test("Agent resume binds the response to the exact requested run before opening 
   await browser.app.resume();
 
   assert.equal(resumes, 1);
-  assert.equal(streams, 1);
-  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
-  assert.match(browser.document.getElementById("toast").textContent, /could not resume this run/u);
+  assert.equal(streams, 2);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
 });
 
 test("terminal cancel response waits for the verified cancelled event without aborting its stream", async () => {

@@ -133,6 +133,26 @@ function boundedMessage(value) {
   return text;
 }
 
+function requestsAgentExecution(value) {
+  const text = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
+  const lower = text.toLocaleLowerCase("en-US");
+  if (/^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:do\s+not|don['’]?t|dont|can['’]?t|cannot|not|never|no\s+need\s+to)\b/iu.test(lower)
+      || /\bhow\s+(?:to|do|can|could|would|should)\b/iu.test(lower)
+      || /^(?:please\s+)?(?:how\b|what(?:['’]s|\s+is)\s+the\s+(?:best\s+)?way\b)/iu.test(lower)
+      || /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:explain|describe|interpret|analy[sz]e|review|discuss)\b/iu.test(lower)
+      || /\b(?:this|that|my|existing|attached|above|below|current|provided)\s+(?:existing\s+)?(?:plot|graph|chart)\b/iu.test(lower)
+      || /\b(?:javascript|typescript|node(?:\.js)?|deno|bun|bash|shell|powershell|ruby|java|kotlin|swift|rust|golang|c\+\+|cpp|c#|csharp|\.net|php|perl|matlab|octave|julia|sql)\b/iu.test(lower)
+      || /\b(?:using|with|in|run|execute)\s+(?:r|go|c)(?:\s+(?:code|script|runtime|language))?\b/iu.test(lower)) {
+    return false;
+  }
+  const requestPrefix = /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:i\s+(?:want|need)\s+you\s+to\s+)?/iu;
+  const request = lower.match(requestPrefix)?.[0] ?? "";
+  const command = lower.slice(request.length);
+  return /^(?:plot|graph|chart)\b/iu.test(command)
+    || /^(?:run|execute)\b.{0,160}\b(?:code|script|python|plot|graph|chart)\b/iu.test(command)
+    || /^(?:make|draw|create|generate|render|display|show|calculate|compute)\b.{0,160}\b(?:plot|graph|chart)\b/iu.test(command);
+}
+
 function updateHandoffDraft(value) {
   if (typeof value !== "string" || value.length > 32_000 || UNSAFE_MESSAGE_CONTROL.test(value)) {
     throw new TypeError("update handoff draft is invalid");
@@ -1178,6 +1198,9 @@ export function createBrowserApp({
     elements.agent_mode.setAttribute("aria-pressed", state.mode === "agent" ? "true" : "false");
     elements.chat_mode.setAttribute("aria-pressed", state.mode === "chat" ? "true" : "false");
     elements.activity_panel.hidden = state.mode !== "agent";
+    const sendLabel = state.mode === "agent" ? "Run Agent" : "Send Chat";
+    elements.send_message.textContent = sendLabel;
+    elements.send_message.setAttribute("aria-label", sendLabel);
     elements.welcome_eyebrow.textContent = state.mode === "agent" ? "AgInTi Agent" : "Direct LocalLLM chat";
     elements.welcome_copy.textContent = state.mode === "agent"
       ? "AgInTi owns planning, tools, context, compaction, runs, and artifacts."
@@ -3142,14 +3165,22 @@ export function createBrowserApp({
       updateImageControl();
       return;
     }
-    const submissionSession = state.session;
-    const submissionMode = state.mode;
-    const submissionChat = state.chat;
     clearChatFailureDiagnostic();
     const draft = elements.message_input.value;
     let text;
     try { text = boundedMessage(draft); }
     catch { return; }
+    if (state.mode === "chat" && state.capabilities.enabled === true && !state.agentReplayFailed
+        && state.selectedImages.length === 0 && requestsAgentExecution(text)) {
+      setMode("agent", { restoreView: false });
+      if (state.mode === "agent") {
+        newConversation();
+        showToast("Handed to Agent to run code and show the result here.");
+      }
+    }
+    const submissionSession = state.session;
+    const submissionMode = state.mode;
+    const submissionChat = state.chat;
     if (state.mode === "chat") fenceAttachmentRestorationsForSend();
     let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
     let selected = detachedImage?.selected ?? Object.freeze([]);

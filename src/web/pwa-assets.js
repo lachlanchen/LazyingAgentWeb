@@ -545,7 +545,7 @@ ${modulePreloads}
         <div class="composer-actions">
           <button id="resume-run" type="button" hidden>Resume</button>
           <button id="stop-run" type="button" hidden>Stop</button>
-          <button id="send-message" class="primary" type="submit">Send</button>
+          <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
         </div>
       </form>
       <p class="footer-note">AgInTi owns Agent runs, tools, context, compaction, and artifacts. This UI is a presentation surface.</p>

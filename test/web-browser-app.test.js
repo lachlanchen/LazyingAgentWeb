@@ -232,6 +232,54 @@ function terminalVisionChat({ bytes, descriptor, onAttachment = () => {} }) {
   });
 }
 
+function terminalTextChat({ onRun = () => {} } = {}) {
+  let thread = null;
+  let messages = [];
+  return baseChat({
+    prepareThread({ title }) {
+      return Object.freeze({
+        threadId: CHAT_THREAD_ID,
+        title,
+        idempotencyKey: "thread_create_agent_handoff_x",
+      });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread ? [thread] : [] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_start_agent_handoff_xxx",
+      });
+    },
+    async startRun(ticket) {
+      onRun(ticket);
+      messages = [
+        chatMessage(1, "user", ticket.content),
+        chatMessage(2, "assistant", "Direct Chat answer"),
+      ];
+      thread = chatThread({
+        title: thread.title,
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+  });
+}
+
 function harness({
   restore = { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" },
   login,
@@ -559,6 +607,126 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   await malformed.app.initialize();
   assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+});
+
+test("explicit plot and code-run prompts in Direct Chat hand off to Agent with unmistakable controls", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "Rendered plot" }],
+    ["run.completed", {}],
+  ]);
+  for (const prompt of ["Plot e^x-x^e", "Plot and show here?", "Run code plot e^x-x"]) {
+    const started = [];
+    const agent = {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun(threadId, text) {
+        started.push({ threadId, text });
+        return { run: run() };
+      },
+      async *streamRunEvents() {
+        for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    };
+    const browser = harness({ agent });
+    await browser.app.initialize();
+    const send = browser.document.getElementById("send-message");
+    assert.equal(send.textContent, "Run Agent");
+    assert.equal(send.getAttribute("aria-label"), "Run Agent");
+
+    browser.app.setMode("chat", { restoreView: false });
+    assert.equal(send.textContent, "Send Chat");
+    assert.equal(send.getAttribute("aria-label"), "Send Chat");
+    browser.document.getElementById("message-input").value = prompt;
+    await browser.app.submitMessage({ preventDefault() {} });
+
+    assert.deepEqual(started, [{ threadId: THREAD_ID, text: prompt }]);
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(send.textContent, "Run Agent");
+    assert.equal(send.getAttribute("aria-label"), "Run Agent");
+    assert.match(browser.document.getElementById("toast").textContent, /Handed to Agent/iu);
+  }
+});
+
+test("Agent handoff rejects negated, instructional, existing-plot, and non-Python runtime wording", async () => {
+  const prompts = [
+    "Don't plot e^x-x^e.",
+    "How do I plot e^x-x^e?",
+    "Show me how to plot e^x-x^e.",
+    "Explain this existing plot.",
+    "Show me what this existing plot means.",
+    "Run this JavaScript code and plot e^x-x.",
+    "Run Go code and plot e^x-x.",
+  ];
+  for (const prompt of prompts) {
+    const chatRuns = [];
+    let agentStarts = 0;
+    const browser = harness({
+      agent: {
+        ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+        async createThread() { throw new Error("excluded wording must not create an Agent thread"); },
+        async startRun() { agentStarts += 1; throw new Error("excluded wording must not start Agent"); },
+      },
+      chat: terminalTextChat({ onRun(ticket) { chatRuns.push(ticket.content); } }),
+    });
+    await browser.app.initialize();
+    browser.app.setMode("chat", { restoreView: false });
+    browser.document.getElementById("message-input").value = prompt;
+    await browser.app.submitMessage({ preventDefault() {} });
+
+    assert.deepEqual(chatRuns, [prompt]);
+    assert.equal(agentStarts, 0);
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(browser.document.getElementById("send-message").textContent, "Send Chat");
+    assert.doesNotMatch(browser.document.getElementById("toast").textContent, /Handed to Agent/iu);
+  }
+});
+
+test("a selected image keeps an explicit plot prompt in Direct Chat", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const descriptor = {
+    attachmentId: "image_agent_handoff_00000001",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 128,
+    height: 128,
+    sha256: "d".repeat(64),
+  };
+  let agentStarts = 0;
+  const browser = harness({
+    agent: {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async createThread() { throw new Error("an image prompt must not create an Agent thread"); },
+      async startRun() { agentStarts += 1; throw new Error("an image prompt must not start Agent"); },
+    },
+    chat: terminalVisionChat({ bytes, descriptor }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: descriptor.attachmentId,
+        mediaType: descriptor.mediaType,
+        byteLength: descriptor.byteLength,
+        width: descriptor.width,
+        height: descriptor.height,
+        bytes,
+        previewBlob: new Blob([bytes], { type: descriptor.mediaType }),
+      });
+    },
+    createObjectUrl() { return "blob:agent-handoff-image"; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  browser.app.setMode("chat", { restoreView: false });
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "plot.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Plot e^x-x^e";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(agentStarts, 0);
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(browser.document.getElementById("send-message").textContent, "Send Chat");
+  assert.match(browser.document.getElementById("messages").textContent, /Vision final answer/u);
+  assert.doesNotMatch(browser.document.getElementById("toast").textContent, /Handed to Agent/iu);
 });
 
 test("completed Agent reload replays the verified ledger into the existing message and inline artifact without a mutation", async () => {

@@ -705,6 +705,7 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.match(html, /Password saving is handled only by your browser or password manager/u);
   assert.match(html, /id="agent-mode"[^>]*aria-pressed="false"/u);
   assert.match(html, /id="mode-switch"[^>]*hidden/u);
+  assert.match(html, /<button id="send-message"[^>]*aria-label="Send Chat"[^>]*>Send Chat<\/button>/u);
   assert.match(html, /AgInTi owns Agent runs, tools, context, compaction, and artifacts/u);
   assert.doesNotMatch(html, /name="(?:model|provider|runtime|tools|cwd|sandbox)/iu);
   assert.doesNotMatch(html, /value="[^"\n]*(?:password|token|secret)/iu);

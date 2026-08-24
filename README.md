@@ -4,13 +4,15 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.18 production):** production is promoted
+> **Deployment status (v0.1.19 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
 > or disabled, the BFF fails closed and Agent is unavailable. Direct Chat stays
 > separate and does not enable or authorize Agent. Current accepted Agent
-> artifacts are limited to declarative plot, table, and Markdown schemas; voice
+> requests can execute one exact fenced `python` block without model planning,
+> retain public failure reasons across reload, and follow Resume successor runs.
+> Accepted artifacts remain limited to declarative plot, table, and Markdown schemas; voice
 > messages, web/deep research, and general artifact file upload/download remain
 > unavailable.
 

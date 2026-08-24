@@ -127,6 +127,12 @@ class Document {
   createTextNode(value) { return new Node("#text", String(value)); }
 }
 
+function threadOpenControls(document) {
+  return document.getElementById("thread-list").children.map((entry) => (
+    entry.className === "thread-row" ? entry.children[0] : entry
+  ));
+}
+
 function capabilities(overrides = {}) {
   return {
     schemaVersion: "1",
@@ -156,6 +162,9 @@ function baseChat(overrides = {}) {
     async retryCreateThread() { throw new Error("unexpected Direct Chat mutation"); },
     async listThreads() { return { threads: [] }; },
     async getThread() { throw new Error("unexpected Direct Chat read"); },
+    prepareThreadDeletion() { throw new Error("unexpected Direct Chat deletion"); },
+    async deleteThread() { throw new Error("unexpected Direct Chat deletion"); },
+    async retryDeleteThread() { throw new Error("unexpected Direct Chat deletion retry"); },
     async listMessages() { throw new Error("unexpected Direct Chat read"); },
     async getAttachment() { throw new Error("unexpected Direct Chat attachment read"); },
     prepareRun() { throw new Error("unexpected Direct Chat mutation"); },
@@ -915,7 +924,7 @@ test("corrupt cancellation replay fails closed but releases read-only reopen wit
   assert.equal(streams, 2);
   assert.match(browser.document.getElementById("toast").textContent, /Reopen this conversation.*no run was resumed/u);
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false, "read-only reopen remains available");
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false, "read-only reopen remains available");
   browser.document.getElementById("new-thread").dispatch("click");
   assert.match(browser.document.getElementById("toast").textContent, /Reopen an Agent conversation/u);
   browser.document.getElementById("message-input").value = "Must remain a draft";
@@ -1815,7 +1824,7 @@ test("completed generation finalization authentication expiry signs in and resto
   assert.equal(browser.document.getElementById("new-thread").disabled, true);
   assert.equal(browser.document.getElementById("send-message").disabled, true);
   assert.equal(browser.document.getElementById("agent-mode").disabled, true);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, true);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, true);
   browser.document.getElementById("new-thread").dispatch("click");
   await browser.app.openThread(CHAT_THREAD_ID, { mode: "chat" });
   browser.app.setMode("agent");
@@ -1841,7 +1850,7 @@ test("completed generation finalization authentication expiry signs in and resto
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
   assert.equal(browser.document.getElementById("new-thread").disabled, false);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
 });
 
 test("PWA image control bounds selection, sends one image once, and renders only authenticated previews", async () => {
@@ -2227,7 +2236,7 @@ test("Completed becomes usable while its restored attachment decodes in the back
   assert.equal(browser.document.getElementById("workspace").getAttribute("aria-busy"), "false");
   assert.equal(browser.document.getElementById("new-thread").disabled, false);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
   assert.equal(image.dataset.previewState, "loading");
   assert.equal(image.hidden, true);
   assert.equal(image.loading, "eager", "an admitted hidden Blob must not deadlock behind native lazy loading");
@@ -3305,28 +3314,28 @@ test("completed chat navigation ignores a stalled and then out-of-order sidebar 
   await new Promise((resolve) => setImmediate(resolve));
 
   stallSidebar = true;
-  browser.document.getElementById("thread-list").children[0].dispatch("click");
+  threadOpenControls(browser.document)[0].dispatch("click");
   await sidebarReadStarted.promise;
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
   assert.equal(browser.document.getElementById("new-thread").disabled, false);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
 
   listedThreads = [newerThread, thread];
-  browser.document.getElementById("thread-list").children[0].dispatch("click");
+  threadOpenControls(browser.document)[0].dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(
-    browser.document.getElementById("thread-list").children.map((button) => button.dataset.threadId),
+    threadOpenControls(browser.document).map((button) => button.dataset.threadId),
     [newerThread.threadId, thread.threadId],
   );
 
   sidebarRead.resolve({ threads: [thread] });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(
-    browser.document.getElementById("thread-list").children.map((button) => button.dataset.threadId),
+    threadOpenControls(browser.document).map((button) => button.dataset.threadId),
     [newerThread.threadId, thread.threadId],
     "an older list response cannot remove a chat learned by a newer refresh",
   );
@@ -3382,7 +3391,7 @@ test("a stale restored-image decode revokes its object URL even when replacement
 
   const initialization = browser.app.initialize();
   await decodeStarted.promise;
-  browser.document.getElementById("thread-list").children[1].dispatch("click");
+  threadOpenControls(browser.document)[1].dispatch("click");
   await replacementReadStarted.promise;
   decodeGate.reject(new Error("stale image decode"));
   await initialization;
@@ -4377,7 +4386,7 @@ test("an authoritative run rejection releases its ticket and restores the exact 
   assert.equal(messageInput.value, draft);
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
   assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent · Conversation changed");
   assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "authoritative_conflict");
   assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "conflict");
@@ -4741,7 +4750,7 @@ test("a completed generation stays visibly locked in Finalizing until Resume res
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   assert.equal(browser.document.getElementById("new-thread").disabled, false);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
   assert.match(browser.document.getElementById("messages").textContent, /Authoritative final answer/u);
 });
 
@@ -4784,7 +4793,7 @@ test("Resume releases an ambiguous run when its exact retry receives an authorit
   assert.equal(messageInput.disabled, false);
   assert.equal(messageInput.value, draft);
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
   assert.equal(browser.document.getElementById("connection-state").textContent, "Request not sent · Conversation changed");
   assert.match(browser.document.getElementById("toast").textContent, /rejected before it ran/iu);
 });
@@ -4957,7 +4966,7 @@ test("Resume fences an ambiguous Direct Chat ticket without consuming later comp
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(browser.document.getElementById("resume-run").hidden, false);
   assert.equal(browser.document.getElementById("send-message").disabled, true);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, true);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, true);
   browser.document.getElementById("message-input").value = "Do not consume this later draft";
   const dispatchesBeforeBlockedSubmit = dispatched.length;
   await browser.app.submitMessage({ preventDefault() {} });
@@ -4972,7 +4981,7 @@ test("Resume fences an ambiguous Direct Chat ticket without consuming later comp
   assert.equal(dispatched.every((ticket) => ticket === prepared), true);
   assert.equal(browser.document.getElementById("message-input").value, "Do not consume this later draft");
   assert.equal(browser.document.getElementById("send-message").disabled, false);
-  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false);
+  assert.equal(threadOpenControls(browser.document)[0].disabled, false);
   assert.match(browser.document.getElementById("messages").textContent, /Already completed/u);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
 });

@@ -545,6 +545,161 @@ BEGIN
 END;
 `;
 
+const SAFE_THREAD_DELETION_SCHEMA = `
+CREATE TABLE direct_chat_thread_deletions (
+  account_id TEXT NOT NULL CHECK (length(account_id) BETWEEN 1 AND 128),
+  thread_id TEXT NOT NULL CHECK (length(thread_id) BETWEEN 1 AND 128),
+  key_hash TEXT NOT NULL CHECK (
+    length(key_hash) = 64 AND key_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  request_hash TEXT NOT NULL CHECK (
+    length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  deleted_revision INTEGER NOT NULL CHECK (deleted_revision BETWEEN 0 AND 2000),
+  deleted_hash TEXT,
+  result_digest TEXT NOT NULL CHECK (
+    length(result_digest) = 64 AND result_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, key_hash),
+  UNIQUE (account_id, thread_id),
+  CHECK (
+    (deleted_revision = 0 AND deleted_hash IS NULL)
+    OR (
+      deleted_revision > 0
+      AND length(deleted_hash) = 64
+      AND deleted_hash NOT GLOB '*[^0-9a-f]*'
+    )
+  )
+) STRICT;
+
+CREATE TRIGGER direct_chat_thread_deletions_no_update
+BEFORE UPDATE ON direct_chat_thread_deletions
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat deletion receipts are immutable');
+END;
+
+CREATE TRIGGER direct_chat_thread_deletions_no_delete
+BEFORE DELETE ON direct_chat_thread_deletions
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat deletion receipts are durable');
+END;
+
+CREATE TRIGGER direct_chat_threads_authorized_delete
+BEFORE DELETE ON direct_chat_threads
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat threads require durable deletion authority');
+END;
+
+DROP TRIGGER direct_chat_messages_no_delete;
+CREATE TRIGGER direct_chat_messages_no_delete
+BEFORE DELETE ON direct_chat_messages
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat messages are append-only');
+END;
+
+DROP TRIGGER direct_chat_generations_no_delete;
+CREATE TRIGGER direct_chat_generations_no_delete
+BEFORE DELETE ON direct_chat_generations
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat generation records are durable');
+END;
+
+DROP TRIGGER direct_chat_generation_leases_no_delete;
+CREATE TRIGGER direct_chat_generation_leases_no_delete
+BEFORE DELETE ON direct_chat_generation_leases
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat generation lease fences are durable');
+END;
+
+DROP TRIGGER direct_chat_attachments_no_delete;
+CREATE TRIGGER direct_chat_attachments_no_delete
+BEFORE DELETE ON direct_chat_attachments
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'direct chat attachments are durable');
+END;
+
+DROP TRIGGER direct_chat_deltas_no_delete;
+CREATE TRIGGER direct_chat_deltas_no_delete
+BEFORE DELETE ON direct_chat_deltas
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+AND NOT EXISTS (
+  SELECT 1 FROM direct_chat_generations
+  WHERE account_id = OLD.account_id
+    AND thread_id = OLD.thread_id
+    AND generation_id = OLD.generation_id
+    AND status = 'completed'
+    AND deltas_pruned = 1
+    AND EXISTS (
+      SELECT 1 FROM direct_chat_generations AS newer
+      WHERE newer.account_id = OLD.account_id
+        AND newer.thread_id = OLD.thread_id
+        AND newer.status = 'completed'
+        AND (
+          newer.terminal_at > direct_chat_generations.terminal_at
+          OR (
+            newer.terminal_at = direct_chat_generations.terminal_at
+            AND newer.generation_id > direct_chat_generations.generation_id
+          )
+        )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'only safely retained terminal direct chat deltas may be pruned');
+END;
+
+DROP TRIGGER direct_chat_compactions_no_delete;
+CREATE TRIGGER direct_chat_compactions_no_delete
+BEFORE DELETE ON direct_chat_compactions
+WHEN NOT EXISTS (
+  SELECT 1 FROM direct_chat_thread_deletions
+  WHERE account_id = OLD.account_id AND thread_id = OLD.thread_id
+)
+AND NOT EXISTS (
+  SELECT 1 FROM direct_chat_compactions AS newer
+  WHERE newer.account_id = OLD.account_id
+    AND newer.thread_id = OLD.thread_id
+    AND (
+      newer.source_end_revision > OLD.source_end_revision
+      OR (
+        newer.source_end_revision = OLD.source_end_revision
+        AND newer.created_at > OLD.created_at
+      )
+      OR (
+        newer.source_end_revision = OLD.source_end_revision
+        AND newer.created_at = OLD.created_at
+        AND newer.snapshot_id > OLD.snapshot_id
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'the current direct chat compaction snapshot cannot be pruned');
+END;
+`;
+
 function checksum(sql) {
   return createHash('sha256').update(sql, 'utf8').digest('hex');
 }
@@ -573,11 +728,21 @@ export const CHAT_MIGRATIONS = Object.freeze([
     name: 'bounded_multi_vision_attachments',
     sql: MULTI_VISION_ATTACHMENT_SCHEMA,
     checksum: checksum(MULTI_VISION_ATTACHMENT_SCHEMA)
+  }),
+  Object.freeze({
+    version: 5,
+    name: 'safe_direct_chat_thread_deletion',
+    sql: SAFE_THREAD_DELETION_SCHEMA,
+    checksum: checksum(SAFE_THREAD_DELETION_SCHEMA)
   })
 ]);
 
 export const LATEST_CHAT_SCHEMA_VERSION = CHAT_MIGRATIONS[CHAT_MIGRATIONS.length - 1].version;
-export const DEFAULT_CHAT_SCHEMA_VERSION = 2;
+// Thread deletion needs the v5 authority/receipt schema in every deployment.
+// The attachment tables remain feature-gated at the application boundary when
+// vision is disabled, but are materialized so one ordered migration lineage is
+// retained for both deployment modes.
+export const DEFAULT_CHAT_SCHEMA_VERSION = LATEST_CHAT_SCHEMA_VERSION;
 
 const EXPECTED_SCHEMA_OBJECTS_V2 = Object.freeze([
   'index:direct_chat_compactions_owner_range:direct_chat_compactions',
@@ -626,10 +791,19 @@ const EXPECTED_SCHEMA_OBJECTS_V3 = Object.freeze([
 
 const EXPECTED_SCHEMA_OBJECTS_V4 = EXPECTED_SCHEMA_OBJECTS_V3;
 
+const EXPECTED_SCHEMA_OBJECTS_V5 = Object.freeze([
+  ...EXPECTED_SCHEMA_OBJECTS_V4,
+  'table:direct_chat_thread_deletions:direct_chat_thread_deletions',
+  'trigger:direct_chat_thread_deletions_no_delete:direct_chat_thread_deletions',
+  'trigger:direct_chat_thread_deletions_no_update:direct_chat_thread_deletions',
+  'trigger:direct_chat_threads_authorized_delete:direct_chat_threads'
+].sort());
+
 const EXPECTED_SCHEMA_FINGERPRINTS = Object.freeze({
   2: 'ad84514c28ac6762061439579862853249f6c87b613f81b79a20947d5c52d4d5',
   3: '1707c8971cd41ed0fe3743af381528ff176dc91c2ed398b2e74ffb0d17b5d0bb',
-  4: '4c8475d7a9aa7052733d27f514adfb539266a58c629f7eccf6522bbd70d9a256'
+  4: '4c8475d7a9aa7052733d27f514adfb539266a58c629f7eccf6522bbd70d9a256',
+  5: 'd2a81bde2e0a58b31b50222652a924cb82f583d93592f49b1c0c33e1ac10d424'
 });
 
 function pragmaInteger(database, pragma) {
@@ -700,7 +874,9 @@ function verifySchemaObjects(database, currentVersion) {
     ? EXPECTED_SCHEMA_OBJECTS_V2
     : (currentVersion === 3
       ? EXPECTED_SCHEMA_OBJECTS_V3
-      : (currentVersion === 4 ? EXPECTED_SCHEMA_OBJECTS_V4 : null));
+      : (currentVersion === 4
+        ? EXPECTED_SCHEMA_OBJECTS_V4
+        : (currentVersion === 5 ? EXPECTED_SCHEMA_OBJECTS_V5 : null)));
   if (expectedObjects === null || JSON.stringify(actual) !== JSON.stringify(expectedObjects)) {
     throw new StorageCorruptionError('The direct-chat schema object set is missing, altered, or extended.');
   }
@@ -733,10 +909,9 @@ export function applyChatMigrations(database, appliedAt, { enableVisionAttachmen
     if (currentVersion >= 2) verifySchemaObjects(database, currentVersion);
   }
 
-  // Disabled deployments deliberately remain on v2 until the feature is
-  // enabled. Once a database reaches v3, this v4-aware build completes the
-  // ordered-attachment expansion and continues accepting it with vision
-  // disabled; a pre-v4 binary is not a rollback target after migration.
+  // V5 is common to every deployment because safe thread deletion relies on
+  // its durable authority receipts. Vision use remains application-gated even
+  // though the empty attachment tables now exist in a vision-disabled store.
   const targetVersion = enableVisionAttachments || currentVersion >= 3
     ? LATEST_CHAT_SCHEMA_VERSION
     : DEFAULT_CHAT_SCHEMA_VERSION;

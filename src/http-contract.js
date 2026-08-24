@@ -72,6 +72,7 @@ export const CLOUD_ROUTES = Object.freeze({
   chatThreadsList: '/api/chat/threads/list',
   chatThreadsCreate: '/api/chat/threads/create',
   chatThreadsGet: '/api/chat/threads/get',
+  chatThreadsDelete: '/api/chat/threads/delete',
   chatMessagesList: '/api/chat/messages/list',
   chatAttachmentsGet: '/api/chat/attachments/get',
   chatRunsStart: '/api/chat/runs/start',
@@ -85,6 +86,7 @@ export const CHAT_POST_ROUTES = Object.freeze([
   CLOUD_ROUTES.chatThreadsList,
   CLOUD_ROUTES.chatThreadsCreate,
   CLOUD_ROUTES.chatThreadsGet,
+  CLOUD_ROUTES.chatThreadsDelete,
   CLOUD_ROUTES.chatMessagesList,
   CLOUD_ROUTES.chatAttachmentsGet,
   CLOUD_ROUTES.chatRunsStart,
@@ -95,6 +97,7 @@ export const CHAT_POST_ROUTES = Object.freeze([
 
 export const CHAT_MUTATION_ROUTES = Object.freeze([
   CLOUD_ROUTES.chatThreadsCreate,
+  CLOUD_ROUTES.chatThreadsDelete,
   CLOUD_ROUTES.chatRunsStart,
   CLOUD_ROUTES.chatRunsCancel
 ]);
@@ -445,6 +448,20 @@ export function validateChatRequest(pathname, value) {
     case CLOUD_ROUTES.chatThreadsGet: {
       const body = exactObject(value, ['threadId'], [], 'chat thread lookup');
       return Object.freeze({ threadId: identifier(body.threadId, 'threadId') });
+    }
+    case CLOUD_ROUTES.chatThreadsDelete: {
+      const body = exactObject(
+        value,
+        ['threadId', 'expectedRevision', 'expectedHash'],
+        [],
+        'chat thread deletion'
+      );
+      const expected = cursor(body.expectedRevision, body.expectedHash);
+      return Object.freeze({
+        threadId: identifier(body.threadId, 'threadId'),
+        expectedRevision: expected.revision,
+        expectedHash: expected.hash
+      });
     }
     case CLOUD_ROUTES.chatMessagesList: {
       const body = exactObject(value, ['threadId'], ['afterRevision', 'limit', 'attachmentSchema'], 'chat message list');

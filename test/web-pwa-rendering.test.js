@@ -32,6 +32,7 @@ import {
 } from "../src/web/asset-map.js";
 import { createSafeRenderer } from "../src/web/safe-rendering.js";
 import { canonicalJson, verifyAgentEvent } from "../src/web/aginti-protocol.js";
+import { DirectChatProtocolError, DirectChatTransportError } from "../src/web/direct-chat-client.js";
 
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const CURRENT_RELEASE = `release-${"a".repeat(64)}`;
@@ -123,6 +124,7 @@ class DomNode {
   dispatch(name, event = {}) {
     for (const listener of this.listeners.get(name) ?? []) listener(event);
   }
+  focus() { this.focused = true; }
   get textContent() {
     return this.tagName === "#text" ? this.nodeValue : this.children.map((child) => child.textContent).join("");
   }
@@ -480,6 +482,8 @@ function updateControllerHarness({
   createObjectUrl,
   revokeObjectUrl,
   updateHandoffStore,
+  confirmThreadDeletion,
+  wait,
 } = {}) {
   const document = appDocument({ basePath, releaseId });
   const shared = environment ?? updateEnvironment({ waiting, controlled, onUpdate, registerPromise });
@@ -524,7 +528,12 @@ function updateControllerHarness({
     },
     createChatClient() {
       if (!chat) throw new Error("signed-out initialization must not create Chat client");
-      return chat;
+      return {
+        prepareThreadDeletion() { throw new Error("unexpected Direct Chat deletion"); },
+        async deleteThread() { throw new Error("unexpected Direct Chat deletion"); },
+        async retryDeleteThread() { throw new Error("unexpected Direct Chat deletion retry"); },
+        ...chat,
+      };
     },
     renderer: {
       renderMarkdown(target, value) { target.textContent = value; },
@@ -536,6 +545,8 @@ function updateControllerHarness({
     ...(createObjectUrl === undefined ? {} : { createObjectUrl }),
     ...(revokeObjectUrl === undefined ? {} : { revokeObjectUrl }),
     ...(updateHandoffStore === undefined ? {} : { updateHandoffStore }),
+    ...(confirmThreadDeletion === undefined ? {} : { confirmThreadDeletion }),
+    ...(wait === undefined ? {} : { wait }),
   });
   return {
     app,
@@ -626,6 +637,9 @@ function idleAuthenticatedPwaClients(mutationCalls = { prepareThread: 0, createT
     async retryCreateThread() { throw new Error("must not retry during restore"); },
     async listThreads() { return { threads: [] }; },
     async getThread() { throw new Error("no thread exists"); },
+    prepareThreadDeletion() { throw new Error("must not prepare deletion during restore"); },
+    async deleteThread() { throw new Error("must not delete during restore"); },
+    async retryDeleteThread() { throw new Error("must not retry deletion during restore"); },
     async listMessages() { return { messages: [] }; },
     async getAttachment() { throw new Error("no attachment exists"); },
     prepareRun() { throw new Error("must not prepare a run during restore"); },
@@ -734,6 +748,23 @@ test("the conversation sidebar gives the thread list one bounded scroll region",
   assert.doesNotMatch(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*margin-top: auto;/u);
 });
 
+test("mobile thread rows reserve non-overlapping title and full Delete control rectangles", () => {
+  const rowRule = /\.thread-row \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const deleteRule = /\.thread-delete \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(rowRule);
+  assert.ok(deleteRule);
+  assert.match(rowRule[1], /display:\s*grid;/u);
+  assert.match(
+    rowRule[1],
+    /grid-template-columns:\s*minmax\(0, 1fr\) minmax\(4\.5rem, max-content\);/u,
+  );
+  assert.match(deleteRule[1], /width:\s*100%;/u);
+  assert.match(deleteRule[1], /min-width:\s*4\.5rem;/u);
+  assert.match(deleteRule[1], /min-height:\s*44px;/u);
+  assert.doesNotMatch(rowRule[1], /position:\s*(?:absolute|fixed)/u);
+  assert.doesNotMatch(deleteRule[1], /position:\s*(?:absolute|fixed)/u);
+});
+
 test("the install action stays in the sidebar footer without covering mobile controls", async () => {
   const map = await productionMap({ label: "sidebar-install" });
   const html = map.get("/").body;
@@ -770,6 +801,296 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     BRIGHT_APP_CSS,
     /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*flex-direction: column;[^}]*align-items: stretch;/u,
   );
+});
+
+test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and clears only after authority", async () => {
+  const now = "2026-08-24T08:00:00.000Z";
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
+  const resolved = {
+    threadId: "chat_delete_resolved_xxxxxxxxxxxx",
+    title: "Resolved history",
+    modelAlias: "local-default",
+    revision: 2,
+    ledgerHash: hashB,
+    messageCount: 2,
+    ledgerBytes: 22,
+    currentGenerationId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const active = {
+    ...resolved,
+    threadId: "chat_delete_active_xxxxxxxxxxxxxx",
+    title: "Generating now",
+    revision: 1,
+    ledgerHash: hashA,
+    messageCount: 1,
+    currentGenerationId: "generation_delete_active_xxxxxxxxx",
+  };
+  const messages = [
+    {
+      threadId: resolved.threadId,
+      messageId: "message_delete_user_xxxxxxxxxxxxx",
+      revision: 1,
+      role: "user",
+      content: "Please answer",
+      contentBytes: 13,
+      previousHash: null,
+      messageHash: hashA,
+      generationId: null,
+      createdAt: now,
+    },
+    {
+      threadId: resolved.threadId,
+      messageId: "message_delete_assistant_xxxxxxx",
+      revision: 2,
+      role: "assistant",
+      content: "Done safely",
+      contentBytes: 11,
+      previousHash: hashA,
+      messageHash: hashB,
+      generationId: "generation_delete_resolved_xxxxxxx",
+      createdAt: now,
+    },
+  ];
+  let preparedTicket = null;
+  const deleteTickets = [];
+  const retryTickets = [];
+  let resolveDeletion;
+  const authoritativeDeletion = new Promise((resolve) => { resolveDeletion = resolve; });
+  const chat = {
+    async capabilities() { return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }; },
+    prepareThread() { throw new Error("unexpected create"); },
+    async createThread() { throw new Error("unexpected create"); },
+    async retryCreateThread() { throw new Error("unexpected create retry"); },
+    async listThreads() { return { threads: [resolved, active] }; },
+    async getThread(threadId) {
+      if (threadId !== resolved.threadId) throw new Error("unexpected active restoration");
+      return { thread: resolved };
+    },
+    async listMessages({ threadId, afterRevision, limit }) {
+      assert.equal(threadId, resolved.threadId);
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment() { throw new Error("unexpected attachment read"); },
+    prepareThreadDeletion(value) {
+      preparedTicket = Object.freeze({ ...value, idempotencyKey: "thread_delete_ui_exact_0001" });
+      return preparedTicket;
+    },
+    async deleteThread(ticket) {
+      deleteTickets.push(ticket);
+      throw Object.assign(new Error("response interrupted"), { retryable: true });
+    },
+    async retryDeleteThread(ticket) {
+      retryTickets.push(ticket);
+      return await authoritativeDeletion;
+    },
+    prepareRun() { throw new Error("unexpected run"); },
+    async startRun() { throw new Error("unexpected run"); },
+    async retryRun() { throw new Error("unexpected run retry"); },
+    async getRunStatus() { throw new Error("unexpected run status"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("unexpected cancellation"); },
+    async cancelRun() { throw new Error("unexpected cancellation"); },
+  };
+  let agentDeleteCalls = 0;
+  const agent = {
+    async capabilities() {
+      return {
+        schemaVersion: "1",
+        enabled: false,
+        agent: { kind: "aginti", label: "AgInTi Agent" },
+        model: { label: "LocalLLM" },
+        actions: { cancel: false, resume: false, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+      };
+    },
+    async listThreads() { return { threads: [] }; },
+    async deleteThread() { agentDeleteCalls += 1; },
+    async *streamRunEvents() {},
+  };
+  const confirmations = [false, true];
+  const confirmationMessages = [];
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat,
+    wait: async () => {},
+    confirmThreadDeletion(message) {
+      confirmationMessages.push(message);
+      return confirmations.shift();
+    },
+  });
+  await harness.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const threadList = harness.document.getElementById("thread-list");
+  assert.equal(threadList.children.length, 2);
+  assert.equal(threadList.children[0].className, "thread-row");
+  assert.equal(threadList.children[0].children.length, 2);
+  assert.equal(threadList.children[0].children[1].textContent, "Delete");
+  assert.match(threadList.children[0].children[1].getAttribute("aria-label"), /Resolved history/u);
+  assert.equal(threadList.children[1].children[1].disabled, true, "an active generation has no enabled delete control");
+  assert.equal(harness.document.getElementById("messages").children.length, 2);
+
+  const cancelledDeleteControl = threadList.children[0].children[1];
+  assert.equal(await harness.app.deleteChatThread(resolved.threadId), false, "cancelled confirmation is read-only");
+  assert.equal(threadList.children[0].children[1], cancelledDeleteControl, "cancelling preserves keyboard and VoiceOver focus ownership");
+  assert.equal(preparedTicket, null);
+  assert.equal(await harness.app.deleteChatThread(active.threadId), false, "active history is rejected before confirmation");
+  assert.equal(confirmationMessages.length, 1);
+
+  harness.document.getElementById("message-input").value = "Keep this unsent draft";
+  const deletion = harness.app.deleteChatThread(resolved.threadId);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleteTickets.length, 1);
+  assert.equal(retryTickets.length, 1);
+  assert.equal(deleteTickets[0], preparedTicket);
+  assert.equal(retryTickets[0], preparedTicket, "the ambiguous retry must reuse the identical prepared ticket");
+  assert.equal(harness.document.getElementById("messages").children.length, 2, "history remains until authoritative success");
+  resolveDeletion({ deleted: true, threadId: resolved.threadId, request: preparedTicket });
+  assert.equal(await deletion, true);
+  assert.equal(harness.document.getElementById("messages").children.length, 0);
+  assert.equal(harness.document.getElementById("conversation-title").textContent, "New conversation");
+  assert.equal(harness.document.getElementById("message-input").value, "Keep this unsent draft");
+  assert.equal(threadList.children.length, 1);
+  assert.equal(threadList.children[0].dataset.threadId, active.threadId);
+  await Promise.resolve();
+  assert.equal(threadList.children[0].children[0].focused, true, "focus moves to the next conversation after removal");
+  assert.equal(agentDeleteCalls, 0, "Direct Chat deletion never calls the Agent client");
+});
+
+test("ambiguous deletion retains one exact ticket through malformed and lost responses", async () => {
+  const now = "2026-08-24T10:00:00.000Z";
+  const thread = {
+    threadId: "chat_delete_ambiguous_xxxxxxxxxx",
+    title: "Ambiguous deletion",
+    modelAlias: "local-default",
+    revision: 0,
+    ledgerHash: null,
+    messageCount: 0,
+    ledgerBytes: 0,
+    currentGenerationId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  let prepareCalls = 0;
+  let confirmationCalls = 0;
+  const tickets = [];
+  const ticket = Object.freeze({
+    threadId: thread.threadId,
+    expectedRevision: thread.revision,
+    expectedHash: thread.ledgerHash,
+    idempotencyKey: "thread_delete_ambiguous_exact_0001",
+  });
+  const chat = {
+    async capabilities() { return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }; },
+    prepareThread() { throw new Error("unexpected create"); },
+    async createThread() { throw new Error("unexpected create"); },
+    async retryCreateThread() { throw new Error("unexpected create retry"); },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages() { return { messages: [] }; },
+    async getAttachment() { throw new Error("unexpected attachment read"); },
+    prepareThreadDeletion(value) {
+      prepareCalls += 1;
+      assert.deepEqual(value, {
+        threadId: thread.threadId,
+        expectedRevision: thread.revision,
+        expectedHash: thread.ledgerHash,
+      });
+      return ticket;
+    },
+    async deleteThread(value) {
+      tickets.push(value);
+      throw new DirectChatProtocolError("committed response was truncated");
+    },
+    async retryDeleteThread(value) {
+      tickets.push(value);
+      if (tickets.length === 2) {
+        throw new DirectChatTransportError("retry response was lost", { status: 503, retryable: true });
+      }
+      return { deleted: true, threadId: thread.threadId, request: value };
+    },
+    prepareRun() { throw new Error("unexpected run"); },
+    async startRun() { throw new Error("unexpected run"); },
+    async retryRun() { throw new Error("unexpected run retry"); },
+    async getRunStatus() { throw new Error("unexpected run status"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("unexpected cancellation"); },
+    async cancelRun() { throw new Error("unexpected cancellation"); },
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idleAuthenticatedPwaClients().agent,
+    chat,
+    wait: async () => {},
+    confirmThreadDeletion() { confirmationCalls += 1; return true; },
+  });
+  await harness.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await harness.app.deleteChatThread(thread.threadId), false);
+  const threadList = harness.document.getElementById("thread-list");
+  assert.equal(threadList.children[0].children[1].textContent, "Retry");
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(prepareCalls, 1);
+  assert.equal(confirmationCalls, 1);
+  assert.equal(tickets.length, 2);
+  assert.equal(tickets.every((value) => value === ticket), true);
+
+  assert.equal(await harness.app.deleteChatThread(thread.threadId), true);
+  assert.equal(prepareCalls, 1, "manual confirmation retry never generates a new idempotency key");
+  assert.equal(confirmationCalls, 1, "the irreversible confirmation is not repeated for the same ticket");
+  assert.equal(tickets.length, 3);
+  assert.equal(tickets.every((value) => value === ticket), true);
+  assert.equal(threadList.children.length, 0);
+});
+
+test("authenticated deletion 404 is treated as desired multi-tab absence", async () => {
+  const thread = {
+    threadId: "chat_delete_other_tab_xxxxxxxxxx",
+    title: "Deleted elsewhere",
+    modelAlias: "local-default",
+    revision: 0,
+    ledgerHash: null,
+    messageCount: 0,
+    ledgerBytes: 0,
+    currentGenerationId: null,
+    createdAt: "2026-08-24T10:05:00.000Z",
+    updatedAt: "2026-08-24T10:05:00.000Z",
+  };
+  let retryCalls = 0;
+  const chat = {
+    ...idleAuthenticatedPwaClients().chat,
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    prepareThreadDeletion(value) { return Object.freeze({ ...value, idempotencyKey: "thread_delete_other_tab_0001" }); },
+    async deleteThread() {
+      throw new DirectChatTransportError("already absent", { status: 404, retryable: false });
+    },
+    async retryDeleteThread() { retryCalls += 1; throw new Error("must not retry an authenticated 404"); },
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idleAuthenticatedPwaClients().agent,
+    chat,
+    confirmThreadDeletion: () => true,
+  });
+  await harness.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await harness.app.deleteChatThread(thread.threadId), true);
+  assert.equal(retryCalls, 0);
+  assert.equal(harness.document.getElementById("thread-list").children.length, 0);
 });
 
 test("inline Agent artifacts contain wide tables inside the assistant message", () => {

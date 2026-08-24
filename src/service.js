@@ -205,7 +205,7 @@ export async function checkStandaloneServiceHealth(loadedConfig, {
     : null;
   const allowedDirectChatSchemas = config.localLlm.vision.enabled
     ? [LATEST_CHAT_SCHEMA_VERSION]
-    : [DEFAULT_CHAT_SCHEMA_VERSION, LATEST_CHAT_SCHEMA_VERSION];
+    : [...new Set([DEFAULT_CHAT_SCHEMA_VERSION, LATEST_CHAT_SCHEMA_VERSION])];
 
   return createOperatorHealthReport({
     releaseId: assetMap.releaseVersion,

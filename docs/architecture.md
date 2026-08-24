@@ -86,7 +86,8 @@ Cloud-authoritative storage is divided so ownership is visible in the schema:
 2. direct-chat threads, messages and chat-only context windows;
 3. non-authoritative AgInTi thread presentation pointers;
 4. non-authoritative event delivery sequence/hash cursors;
-5. closed idempotency receipts and bounded retention metadata.
+5. closed idempotency receipts, immutable Direct Chat deletion receipts, and
+   bounded retention metadata.
 
 `CloudIndexStore` and `DirectChatStore` use separate SQLite application IDs and
 migration chains. `CloudIndexStore` holds items 1, 3, 4, and their bounded
@@ -97,6 +98,19 @@ holds immutable canonical attachment bytes in an owner-private table; the
 message ledger contains only the attachment MIME, size, dimensions, opaque ID,
 and SHA-256 descriptor bound into its hash. The split makes it difficult for a future
 presentation migration to silently acquire Direct Chat or Agent authority.
+
+Schema v5 gives Direct Chat hard deletion an explicit durable authority. The
+exact `POST /api/chat/threads/delete` mutation binds the authenticated account,
+thread ID, current revision/hash cursor, CSRF proof, and idempotency key. It
+refuses a current generation, stale cursor, or trailing user message with
+unresolved send acceptance. In one immediate transaction, an immutable,
+content-free receipt retaining only identity, cursor metadata, and digests is
+written before the messages, attachments, generation state, compactions,
+mutation receipts, and owning thread are removed. Exact ambiguous retries
+replay the raw-key-free receipt, and its account/thread uniqueness permanently
+retires the thread identifier. This authority applies only to cloud-owned
+Direct Chat threads; Agent presentation-index removal and authoritative AgInTi
+thread deletion remain separate operations.
 
 ### Private data and cache placement
 
@@ -137,21 +151,22 @@ new digest-only session. Existing-token collisions are rejected before any
 eviction, and deterministic selection plus account-qualified deletion prevents
 cross-account rotation.
 
-The attachment migration is an explicit expand/enable boundary. New and
-existing v2 databases remain at v2 while vision is disabled. First enablement
-advances the private Direct Chat database through v3 to ordered schema v4; an
-existing v3 attachment table migrates each image to position zero atomically.
-A v4-aware service
-can subsequently run with vision disabled: it still serves authenticated
-previews and exact retries of committed turns, but refuses new image turns and
-follow-ups that would reuse stored images. An older binary that knows only v2
-or v3 cannot reopen the migrated database; backup or a retained v4-aware rollback
-release is required before first enablement or v3-to-v4 expansion.
-The deployment boundary blocks every `/api` route, stops the service, verifies
-sidecar-free `DELETE` journal state, and authenticates an offline v3 backup
-before starting the candidate. That backup can be restored only before the
-durable v4 write-authority marker exists. After the marker and API activation,
-all rollbacks preserve the live v4 database and require a v4-aware binary.
+Schema v5 is the common Direct Chat migration target because deletion safety
+depends on its durable authority receipts. The ordered schema-v4 attachment
+tables are therefore materialized even when vision is disabled; attachment use
+remains gated at the application boundary. Existing v3 attachment rows migrate
+to ordered position zero atomically. A v5-aware service running with vision
+disabled still serves authenticated previews and exact retries of committed
+turns, but refuses new image turns and follow-ups that would reuse stored images.
+
+A pre-v5 binary cannot reopen the migrated database. The activation boundary
+blocks every dynamic API, stops the service, verifies sidecar-free SQLite
+`DELETE` journal state, takes an offline private database backup, and preflights
+a copy with the candidate release. That snapshot is restorable only while all
+dynamic APIs remain blocked and before any v5 write authority or deletion API
+activation. After that boundary, every rollback preserves the live v5 database
+and uses a v5-aware binary; an older snapshot could discard accepted messages
+or deletion authority.
 
 The cloud database must never contain AgInTi plans, agent context or summaries,
 tool calls/results, commands, workspace paths, runtime policy, raw artifacts or
@@ -205,6 +220,12 @@ Direct Chat:
   probes the stable generation ID; it re-uploads only when an authoritative 404
   proves absence. Once accepted, raw composer bytes and the serialized retry
   ticket are released before generation finishes.
+- Direct Chat thread deletion is a separate cursor-bound, idempotent POST. The
+  browser disables it during history restoration, finalization, an active
+  generation, or ambiguous send acceptance; it clears the selected presentation
+  only after authoritative success. A transport ambiguity retries the identical
+  prepared ticket. The server's durable receipt permits exact replay while
+  permanently preventing reuse of the deleted thread ID.
 - Before calling LocalLLM, one cloud worker claims a durable lease with a
   monotonic fence and marks dispatch started. Append, finalize, failure, and
   renewal require that proof. A restarted or stale worker cannot continue after

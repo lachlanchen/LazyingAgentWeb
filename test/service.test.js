@@ -322,7 +322,7 @@ test('operator health reads both initialized stores without taking service owner
   assert.equal(report.storage.cloudIndexStore.state, 'ready');
   assert.equal(report.storage.cloudIndexStore.schemaVersion, 1);
   assert.equal(report.storage.directChatStore.state, 'ready');
-  assert.equal(report.storage.directChatStore.schemaVersion, 2);
+  assert.equal(report.storage.directChatStore.schemaVersion, 5);
   assert.equal(service.controlStore.healthCheck().ready, true);
   assert.equal(service.directChatStore.healthCheck().ready, true);
   assert.equal(report.scope.publicHttpEndpoint, false);

@@ -40,6 +40,7 @@ export const DIRECT_CHAT_ROUTES = Object.freeze({
   threadsList: "/api/chat/threads/list",
   threadsCreate: "/api/chat/threads/create",
   threadsGet: "/api/chat/threads/get",
+  threadsDelete: "/api/chat/threads/delete",
   messagesList: "/api/chat/messages/list",
   attachmentsGet: "/api/chat/attachments/get",
   runsStart: "/api/chat/runs/start",
@@ -580,6 +581,28 @@ function threadTicket(value) {
   });
 }
 
+function threadDeletionTicket(value) {
+  const request = exactObject(value, [
+    "threadId", "expectedRevision", "expectedHash", "idempotencyKey",
+  ], [
+    "threadId", "expectedRevision", "expectedHash", "idempotencyKey",
+  ], "prepared thread deletion", { input: true });
+  const expectedRevision = integer(request.expectedRevision, "expectedRevision", {
+    maximum: 2_000,
+    input: true,
+  });
+  if ((expectedRevision === 0 && request.expectedHash !== null)
+      || (expectedRevision > 0 && (typeof request.expectedHash !== "string" || !HASH.test(request.expectedHash)))) {
+    throw new TypeError("expectedHash is inconsistent with expectedRevision");
+  }
+  return Object.freeze({
+    threadId: identifier(request.threadId, "threadId", { input: true }),
+    expectedRevision,
+    expectedHash: request.expectedHash,
+    idempotencyKey: idempotencyKey(request.idempotencyKey, { input: true }),
+  });
+}
+
 function runTicket(value) {
   const request = exactObject(value, [
     "threadId", "messageId", "generationId", "assistantMessageId", "content",
@@ -1098,6 +1121,39 @@ export class DirectChatBrowserClient {
     identifier(threadId, "threadId", { input: true });
     const response = exactObject(await this.#post(DIRECT_CHAT_ROUTES.threadsGet, { threadId }, { signal }), ["thread"], ["thread"], "thread response");
     return Object.freeze({ thread: responseThread(response.thread, threadId) });
+  }
+
+  prepareThreadDeletion(value = {}) {
+    const request = exactObject(value, [
+      "threadId", "expectedRevision", "expectedHash",
+    ], [
+      "threadId", "expectedRevision", "expectedHash",
+    ], "new thread deletion", { input: true });
+    return threadDeletionTicket({
+      ...request,
+      idempotencyKey: generated(this.makeOpaqueId, "thread_delete", { idempotency: true }),
+    });
+  }
+
+  async deleteThread(prepared, options = {}) {
+    const { signal } = exactObject(options, ["signal"], [], "delete thread options", { input: true });
+    const ticket = threadDeletionTicket(prepared);
+    const response = exactObject(await this.#post(DIRECT_CHAT_ROUTES.threadsDelete, {
+      threadId: ticket.threadId,
+      expectedRevision: ticket.expectedRevision,
+      expectedHash: ticket.expectedHash,
+    }, { signal, idempotency: ticket.idempotencyKey }), ["deleted", "threadId"], [
+      "deleted", "threadId",
+    ], "thread deletion response");
+    if (response.deleted !== true
+        || identifier(response.threadId, "thread deletion response threadId") !== ticket.threadId) {
+      throw new DirectChatProtocolError("thread deletion response is invalid");
+    }
+    return Object.freeze({ request: ticket, deleted: true, threadId: ticket.threadId });
+  }
+
+  retryDeleteThread(prepared, options) {
+    return this.deleteThread(prepared, options);
   }
 
   async listMessages(value = {}) {

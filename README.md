@@ -30,7 +30,8 @@ boundary, and replaceable-node contract are specified in
 - `DirectChatStore` for cloud-owned Direct Chat threads and hash-linked message
   ledgers, atomic user-message/generation start, durable fenced dispatch leases,
   exact-once assistant finalization, replayable deltas, cancellation, bounded
-  retention, compaction snapshots, and private immutable vision attachments.
+  retention, compaction snapshots, private immutable vision attachments, and
+  receipt-authorized Direct Chat thread deletion.
 - `DirectChatContextCoordinator` for bounded LocalLLM context assembly and
   provenance-bound chat compaction. The standalone service uses a deterministic
   local summarizer that performs no model or network call, so compaction cannot
@@ -297,6 +298,19 @@ transaction. A durable owner digest plus monotonic fence prevents two cloud
 workers from dispatching the same generation concurrently; a stale worker
 cannot append or finalize after losing its lease.
 
+Direct Chat deletion is a distinct exact mutation:
+`POST /api/chat/threads/delete` requires the authenticated browser session,
+CSRF proof, a caller-generated idempotency key, and the exact current
+revision/hash cursor. The store refuses an active generation, a stale cursor,
+or a trailing user message whose send acceptance is unresolved. On success it
+atomically writes a content-free schema-v5 deletion receipt containing only
+identity, cursor metadata, and digests before removing the thread and its
+private descendants. The receipt is immutable, supports an exact retry without
+retaining the raw key or deleted content, and permanently retires that
+account/thread identifier. This route deletes only cloud-owned
+Direct Chat state; deleting an Agent presentation index or an authoritative
+AgInTi thread remains a separate contract.
+
 Canonical attachment bytes are durable only in the owner-private Direct Chat
 database. The message ledger and browser API expose a size/dimension/MIME/SHA-256
 descriptor, never the bytes or base64. Authenticated previews are `no-store`
@@ -315,17 +329,23 @@ previous PWA that omits it receives the first descriptor in the legacy singular
 shape, so a stale open tab keeps its text/history protocol valid until the
 content-versioned PWA refresh takes control.
 
-The ordered attachment table is schema v4 and is created only when vision is enabled.
-A v4-aware build can reopen the database with vision disabled. It continues to
-serve authenticated previews and exact retries of committed turns, while
-refusing new image turns and follow-ups that would reuse stored images. A
-pre-v4 binary cannot reopen a database after this migration. Existing v3
-single-image rows migrate with position zero. Take a private database backup or
-retain a v4-aware rollback build before first enablement or v3-to-v4 expansion.
-That pre-v4 backup is a rollback source only while every dynamic API remains
-blocked. Once a durable write-authority marker is committed and the v4 API is
-opened, rollback must preserve the live database and use a v4-aware release;
-restoring the older snapshot could discard accepted messages.
+Schema v5 adds the durable authority receipts required for safe Direct Chat
+thread deletion. It is now the common Direct Chat schema whether vision is
+enabled or disabled, so the ordered v4 attachment tables are materialized on
+upgrade while image use remains fail-closed at the application boundary.
+Existing v3 single-image rows still migrate to ordered position zero. A v5-aware
+build running with vision disabled can serve authenticated previews and exact
+retries of previously committed image turns, but refuses new image turns and
+follow-ups that would reuse stored images.
+
+A pre-v5 binary cannot reopen the migrated database. Before activation, block
+every dynamic API, stop the service, verify sidecar-free SQLite `DELETE`
+journal state, take an offline private database backup, and preflight a copy of
+that backup with the candidate release. The snapshot may be restored only
+while all dynamic APIs remain blocked and before any v5 write authority or the
+v5 deletion API is activated. After that boundary, preserve the live v5
+database and use only a v5-aware rollback release; restoring the older snapshot
+could discard accepted messages or deletion authority.
 
 The production server is designed to bind on loopback behind Caddy. It trusts
 the configured public authority/client-address headers only from that local

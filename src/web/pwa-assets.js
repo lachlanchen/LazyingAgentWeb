@@ -619,7 +619,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .brand { display: flex; gap: .7rem; align-items: center; min-height: 44px; }
 .brand-mark { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; background: var(--accent-soft); color: var(--accent-strong); font-size: .78rem; font-weight: 800; }
 .thread-list { min-height: 0; flex: 1 1 0; display: grid; align-content: start; gap: .35rem; overflow-y: auto; overscroll-behavior: contain; }
-.thread-list button { width: 100%; min-width: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.thread-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(4.5rem, max-content); gap: .3rem; align-items: stretch; }
+.thread-list button { min-width: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.thread-open { width: 100%; }
+.thread-delete { width: 100%; min-width: 4.5rem; min-height: 44px; padding-inline: .65rem; color: var(--danger); text-align: center !important; }
+.thread-delete:hover:not(:disabled) { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
 .sidebar footer { flex: 0 0 auto; display: grid; gap: .5rem; }
 .workspace { min-width: 0; min-height: 0; height: 100%; display: grid; overflow: hidden; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; }
 .topbar { min-height: 66px; display: flex; align-items: center; gap: .8rem; padding: .7rem 1rem; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(16px); }

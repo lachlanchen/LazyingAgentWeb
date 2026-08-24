@@ -200,6 +200,61 @@ test("prepared create/start requests carry browser IDs and remain byte-identical
   }
 });
 
+test("prepared thread deletion retries one exact cursor-bound mutation without Agent coupling", async () => {
+  const calls = [];
+  const makeOpaqueId = idFactory();
+  const client = new DirectChatBrowserClient(clientOptions({
+    makeOpaqueId,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      const body = JSON.parse(options.body);
+      return jsonResponse({ deleted: true, threadId: body.threadId });
+    },
+  }));
+  const thread = publicThread({ revision: 2, ledgerHash: HASH_A, messageCount: 2 });
+  const prepared = client.prepareThreadDeletion({
+    threadId: thread.threadId,
+    expectedRevision: thread.revision,
+    expectedHash: thread.ledgerHash,
+  });
+  const generatedBeforeDispatch = makeOpaqueId.count();
+  const first = await client.deleteThread(prepared);
+  const replay = await client.retryDeleteThread(prepared);
+  assert.deepEqual(first, replay);
+  assert.equal(first.deleted, true);
+  assert.equal(makeOpaqueId.count(), generatedBeforeDispatch);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "https://llm.lazying.art/api/chat/threads/delete");
+  assert.equal(calls[0].options.body, calls[1].options.body);
+  assert.equal(calls[0].options.headers.get("idempotency-key"), calls[1].options.headers.get("idempotency-key"));
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    threadId: thread.threadId,
+    expectedRevision: 2,
+    expectedHash: HASH_A,
+  });
+  assert.equal(calls[0].options.headers.get("x-csrf-token"), CSRF);
+  assert.equal(calls[0].options.method, "POST");
+
+  assert.throws(() => client.prepareThreadDeletion({
+    threadId: thread.threadId,
+    expectedRevision: 0,
+    expectedHash: HASH_A,
+  }), /expectedHash/u);
+
+  const hostile = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => jsonResponse({
+      deleted: true,
+      threadId: thread.threadId,
+      schemaVersion: "agent-thread-delete",
+    }),
+  }));
+  await assert.rejects(hostile.deleteThread(hostile.prepareThreadDeletion({
+    threadId: thread.threadId,
+    expectedRevision: 2,
+    expectedHash: HASH_A,
+  })), DirectChatProtocolError);
+});
+
 test("vision capabilities, canonical image retries, and authenticated previews stay exact and bounded", async () => {
   const bytes = Buffer.from(createPwaIcon(192));
   const digest = createHash("sha256").update(bytes).digest("hex");

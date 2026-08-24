@@ -347,7 +347,7 @@ test('real CLI preserves one authenticated browser session and Direct Chat threa
     assert.match(row.csrf_digest, /^[a-f0-9]{64}$/u);
     assert.equal(row.revoked_at, null);
   });
-  verifyDatabase(state.directChatDatabase, 2, (database) => {
+  verifyDatabase(state.directChatDatabase, 5, (database) => {
     const row = database.prepare(`
       SELECT thread_id, title, ledger_revision, message_count, generation_count
       FROM direct_chat_threads

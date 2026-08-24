@@ -334,6 +334,20 @@ test('refuses mismatched release identities and forged changed-body maps before 
   }
 });
 
+test('refuses a Direct Chat adapter without deletion authority before listening', (t) => {
+  const state = testState(t);
+  const incomplete = new Proxy(state.directChatStore, {
+    get(target, property, receiver) {
+      if (property === 'deleteThread') return undefined;
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  assert.throws(
+    () => createCloudServer({ ...state.options, directChatStore: incomplete }),
+    /deleteThread\(\)/u
+  );
+});
+
 test('serves stable update metadata with HEAD parity and immutable caching only in the release namespace', async (t) => {
   const state = testState(t);
   const { baseUrl } = await state.start();
@@ -412,6 +426,7 @@ test('rejects non-exact routes, encoded paths, dynamic queries, and authority by
   const matrix = [
     ['/api/chat/threads/list/', 400],
     ['/api/chat/threads/list?limit=1', 400],
+    ['/api/chat/threads/delete?threadId=owned', 400],
     ['/api/chat/%74hreads/list', 400],
     ['/api/chat%2fthreads/list', 400],
     ['/agent/v1/capabilities', 404],
@@ -546,6 +561,102 @@ test('uses secure browser cookies, session-bound CSRF, generic failures, and own
     csrf: auth.csrf
   });
   assert.equal(foreign.status, 404);
+});
+
+test('deletes Direct Chat only through the exact authenticated cursor-bound mutation', async (t) => {
+  const state = testState(t);
+  const active = state.directChatStore.createThread({
+    accountId: PRINCIPAL_ID,
+    threadId: 'delete-active-thread',
+    title: 'Active',
+    idempotencyKey: 'create-delete-active-0001'
+  });
+  state.directChatStore.startTurn({
+    accountId: PRINCIPAL_ID,
+    threadId: active.threadId,
+    messageId: 'delete-active-message',
+    content: 'This accepted send is still running.',
+    generationId: 'delete-active-generation',
+    assistantMessageId: 'delete-active-assistant',
+    expectedRevision: 0,
+    expectedHash: null,
+    idempotencyKey: 'start-delete-active-0001'
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+
+  const create = await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'delete-owned-thread',
+    title: 'Delete me'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-delete-owned-0001'
+  });
+  const thread = (await create.json()).thread;
+  const body = {
+    threadId: thread.threadId,
+    expectedRevision: thread.revision,
+    expectedHash: thread.ledgerHash
+  };
+  const missingCsrf = await post(baseUrl, '/api/chat/threads/delete', body, {
+    cookie: auth.cookie,
+    idempotency: 'delete-owned-thread-0001'
+  });
+  assert.equal(missingCsrf.status, 403);
+  const missingIdempotency = await post(baseUrl, '/api/chat/threads/delete', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.equal(missingIdempotency.status, 400);
+  const extraField = await post(baseUrl, '/api/chat/threads/delete', { ...body, accountId: PRINCIPAL_ID }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'delete-owned-extra-0001'
+  });
+  assert.equal(extraField.status, 400);
+  const stale = await post(baseUrl, '/api/chat/threads/delete', {
+    ...body,
+    expectedRevision: 1,
+    expectedHash: 'a'.repeat(64)
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'delete-owned-stale-0001'
+  });
+  assert.equal(stale.status, 409);
+
+  const activeThread = state.directChatStore.getThread(PRINCIPAL_ID, active.threadId);
+  const activeDelete = await post(baseUrl, '/api/chat/threads/delete', {
+    threadId: active.threadId,
+    expectedRevision: activeThread.revision,
+    expectedHash: activeThread.ledgerHash
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'delete-active-thread-0001'
+  });
+  assert.equal(activeDelete.status, 409);
+
+  const deletion = await post(baseUrl, '/api/chat/threads/delete', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'delete-owned-thread-0001'
+  });
+  assert.equal(deletion.status, 200);
+  assert.deepEqual(await deletion.json(), { deleted: true, threadId: thread.threadId });
+  const replay = await post(baseUrl, '/api/chat/threads/delete', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'delete-owned-thread-0001'
+  });
+  assert.equal(replay.status, 200);
+  assert.deepEqual(await replay.json(), { deleted: true, threadId: thread.threadId });
+  const list = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.deepEqual((await list.json()).threads.map((item) => item.threadId), [active.threadId]);
 });
 
 test('bounds oversized and slow login bodies before password verification', async (t) => {

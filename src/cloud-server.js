@@ -851,7 +851,7 @@ export function createCloudRequestHandler({
   ]);
   const controls = requireMethods(controlStore, 'controlStore', ['getAccount']);
   const chat = requireMethods(directChatStore, 'directChatStore', [
-    'createThread', 'getThread', 'listThreads', 'startTurn',
+    'createThread', 'getThread', 'listThreads', 'deleteThread', 'startTurn',
     'appendGenerationDelta', 'finalizeGeneration', 'cancelGeneration', 'failGeneration',
     'getGeneration', 'replayGeneration', 'listMessages',
     'getVisionAttachment', 'getLatestVisionAttachment', 'getLatestVisionAttachments',
@@ -1254,6 +1254,11 @@ export function createCloudRequestHandler({
       const thread = chat.getThread(accountId, input.threadId);
       if (!thread) throw new CloudHttpError(404, 'not_found', 'The chat thread does not exist.');
       sendJson(req, res, 200, { thread: publicThread(thread, accountId) });
+      return;
+    }
+    if (route.pathname === CLOUD_ROUTES.chatThreadsDelete) {
+      const deleted = chat.deleteThread({ accountId, ...input, idempotencyKey });
+      sendJson(req, res, 200, { deleted: deleted.deleted, threadId: deleted.threadId });
       return;
     }
     if (route.pathname === CLOUD_ROUTES.chatMessagesList) {

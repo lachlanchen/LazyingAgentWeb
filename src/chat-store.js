@@ -62,6 +62,7 @@ export const DIRECT_CHAT_LIMITS = Object.freeze({
   summaryBytes: 256 * 1024,
   listPage: 200,
   idempotencyReceiptsPerAccount: 1_024,
+  threadDeletionReceiptsPerAccount: 100_000,
   cleanupRows: 256
 });
 
@@ -346,6 +347,38 @@ function compactionView(row) {
     summaryHash: row.summary_hash,
     untrustedDirectChatData: true,
     createdAt: row.created_at
+  };
+}
+
+function threadDeletionView(row) {
+  if (!row) return null;
+  return {
+    accountId: row.account_id,
+    threadId: row.thread_id,
+    deleted: true,
+    revision: Number(row.deleted_revision),
+    ledgerHash: row.deleted_hash,
+    deletedAt: row.deleted_at
+  };
+}
+
+function threadDeletionRequest(accountId, threadId, cursor) {
+  return {
+    accountId,
+    threadId,
+    expectedRevision: cursor.revision,
+    expectedHash: cursor.hash
+  };
+}
+
+function threadDeletionDigest(result) {
+  return {
+    accountId: result.accountId,
+    threadId: result.threadId,
+    deleted: result.deleted,
+    revision: result.revision,
+    ledgerHash: result.ledgerHash,
+    deletedAt: result.deletedAt
   };
 }
 
@@ -804,6 +837,50 @@ function auditDatabase(database) {
     assertStoredTimestamp(receipt.expires_at, 'idempotency.expires_at');
     if (receipt.expires_at <= receipt.created_at) {
       throw new StorageCorruptionError('A direct-chat idempotency receipt has an invalid lifetime.');
+    }
+  }
+  const deletionReceiptOverflows = database.prepare(`
+    SELECT account_id, count(*) AS count
+    FROM direct_chat_thread_deletions
+    GROUP BY account_id
+    HAVING count(*) > ?
+  `).all(DIRECT_CHAT_LIMITS.threadDeletionReceiptsPerAccount);
+  if (deletionReceiptOverflows.length !== 0) {
+    throw new StorageCorruptionError('An account exceeds the direct-chat thread deletion receipt bound.');
+  }
+  const deletionReceipts = database.prepare(`
+    SELECT * FROM direct_chat_thread_deletions
+    ORDER BY account_id, thread_id
+  `).all();
+  const liveDeletedThread = database.prepare(`
+    SELECT deletion.account_id, deletion.thread_id
+    FROM direct_chat_thread_deletions AS deletion
+    INNER JOIN direct_chat_threads AS thread
+      ON thread.account_id = deletion.account_id AND thread.thread_id = deletion.thread_id
+    LIMIT 1
+  `).get();
+  if (liveDeletedThread) {
+    throw new StorageCorruptionError('A deleted direct-chat thread still has live storage.');
+  }
+  for (const receipt of deletionReceipts) {
+    assertStoredIdentifier(receipt.account_id, 'thread_deletion.account_id');
+    assertStoredIdentifier(receipt.thread_id, 'thread_deletion.thread_id');
+    assertStoredTimestamp(receipt.deleted_at, 'thread_deletion.deleted_at');
+    const revision = Number(receipt.deleted_revision);
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision > DIRECT_CHAT_LIMITS.messagesPerThread
+        || (revision === 0) !== (receipt.deleted_hash === null)
+        || (revision > 0 && !HASH_PATTERN.test(receipt.deleted_hash))
+        || !HASH_PATTERN.test(receipt.key_hash)
+        || !HASH_PATTERN.test(receipt.request_hash)
+        || !HASH_PATTERN.test(receipt.result_digest)) {
+      throw new StorageCorruptionError('A direct-chat thread deletion receipt is invalid.');
+    }
+    const cursor = { revision, hash: receipt.deleted_hash };
+    const request = threadDeletionRequest(receipt.account_id, receipt.thread_id, cursor);
+    const result = threadDeletionView(receipt);
+    if (sha256(canonicalJson(request)) !== receipt.request_hash
+        || sha256(canonicalJson(threadDeletionDigest(result))) !== receipt.result_digest) {
+      throw new StorageCorruptionError('A direct-chat thread deletion receipt digest is inconsistent.');
     }
   }
 }
@@ -1306,6 +1383,13 @@ export class DirectChatStore {
         })
       },
       () => {
+        const retired = this.#database.prepare(`
+          SELECT 1 AS present FROM direct_chat_thread_deletions
+          WHERE account_id = ? AND thread_id = ?
+        `).get(accountId, threadId);
+        if (retired) {
+          throw new ConflictError('The direct-chat thread identifier was permanently retired.');
+        }
         const existing = this.#database.prepare(`
           SELECT * FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
         `).get(accountId, threadId);
@@ -1371,6 +1455,135 @@ export class DirectChatStore {
       `).all(accountId, limit);
       for (const row of rows) this.#auditThread(row);
       return rows.map(threadView);
+    });
+  }
+
+  deleteThread(input) {
+    assertExactKeys(
+      input,
+      {
+        required: [
+          'accountId', 'threadId', 'expectedRevision', 'expectedHash', 'idempotencyKey'
+        ]
+      },
+      'direct chat thread deletion'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const threadId = assertIdentifier(input.threadId, 'threadId');
+    const cursor = assertCursor(input.expectedRevision, input.expectedHash);
+    assertIdempotencyKey(input.idempotencyKey);
+    const keyHash = sha256(input.idempotencyKey);
+    const request = threadDeletionRequest(accountId, threadId, cursor);
+    const requestHash = sha256(canonicalJson(request));
+
+    return this.#transaction(() => {
+      const existing = this.#database.prepare(`
+        SELECT * FROM direct_chat_thread_deletions
+        WHERE account_id = ? AND key_hash = ?
+      `).get(accountId, keyHash);
+      if (existing) {
+        if (existing.request_hash !== requestHash) throw new IdempotencyConflictError();
+        if (existing.thread_id !== threadId) {
+          throw new StorageCorruptionError('A direct-chat deletion receipt has inconsistent ownership.');
+        }
+        const replayed = threadDeletionView(existing);
+        if (sha256(canonicalJson(threadDeletionDigest(replayed))) !== existing.result_digest) {
+          throw new ConflictError('The original direct-chat deletion result cannot be replayed exactly.');
+        }
+        return replayed;
+      }
+
+      if (this.#database.prepare(`
+        SELECT 1 AS present FROM direct_chat_thread_deletions
+        WHERE account_id = ? AND thread_id = ?
+      `).get(accountId, threadId)) {
+        throw new NotFoundError();
+      }
+      const thread = requireThread(this.#database, accountId, threadId);
+      this.#auditThread(thread);
+      assertCursorMatches(thread, cursor);
+      if (thread.current_generation_id !== null) {
+        throw new ConflictError('An active or unresolved Direct Chat generation cannot be deleted.');
+      }
+      const unresolvedUser = this.#database.prepare(`
+        SELECT 1 AS present
+        FROM direct_chat_messages AS message
+        WHERE message.account_id = ? AND message.thread_id = ?
+          AND message.revision = ? AND message.role = 'user'
+          AND NOT EXISTS (
+            SELECT 1 FROM direct_chat_generations AS generation
+            WHERE generation.account_id = message.account_id
+              AND generation.thread_id = message.thread_id
+              AND generation.source_revision = message.revision
+              AND generation.source_hash = message.message_hash
+          )
+      `).get(accountId, threadId, Number(thread.ledger_revision));
+      if (unresolvedUser) {
+        throw new ConflictError('A Direct Chat send with unresolved acceptance cannot be deleted.');
+      }
+      const receiptCount = Number(this.#database.prepare(`
+        SELECT count(*) AS count FROM direct_chat_thread_deletions WHERE account_id = ?
+      `).get(accountId).count);
+      if (receiptCount >= DIRECT_CHAT_LIMITS.threadDeletionReceiptsPerAccount) {
+        throw new ConflictError('The account reached its durable thread deletion receipt limit.');
+      }
+
+      const deletedAt = nowIso(this.#clock);
+      const result = {
+        accountId,
+        threadId,
+        deleted: true,
+        revision: Number(thread.ledger_revision),
+        ledgerHash: thread.ledger_hash,
+        deletedAt
+      };
+      this.#database.prepare(`
+        INSERT INTO direct_chat_thread_deletions(
+          account_id, thread_id, key_hash, request_hash, deleted_revision,
+          deleted_hash, result_digest, deleted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        accountId,
+        threadId,
+        keyHash,
+        requestHash,
+        result.revision,
+        result.ledgerHash,
+        sha256(canonicalJson(threadDeletionDigest(result))),
+        deletedAt
+      );
+
+      // The durable receipt above is the only authority accepted by the
+      // deletion triggers. All private descendants and mutation receipts are
+      // removed in one transaction before the owning thread row disappears.
+      this.#database.prepare(`
+        DELETE FROM direct_chat_attachments WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_deltas WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_generation_leases WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_compactions WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_generations WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_messages WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      this.#database.prepare(`
+        DELETE FROM direct_chat_idempotency WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      const removed = this.#database.prepare(`
+        DELETE FROM direct_chat_threads WHERE account_id = ? AND thread_id = ?
+      `).run(accountId, threadId);
+      if (Number(removed.changes) !== 1) {
+        throw new StorageCorruptionError('The authorized direct-chat thread deletion was incomplete.');
+      }
+      return result;
     });
   }
 

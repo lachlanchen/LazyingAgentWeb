@@ -722,6 +722,7 @@ export function createBrowserApp({
   renderer,
   cursorStore,
   credentialSaver = offerPasswordManagerSave,
+  confirmThreadDeletion = (message) => window?.confirm?.(message) === true,
   canonicalizeImage = canonicalizeVisionImage,
   createObjectUrl = (blob) => globalThis.URL.createObjectURL(blob),
   revokeObjectUrl = (url) => globalThis.URL.revokeObjectURL(url),
@@ -764,6 +765,9 @@ export function createBrowserApp({
   requiredMethod(renderer, "renderArtifact", "renderer");
   if (cursorStore !== undefined) requiredMethod(cursorStore, "save", "cursorStore");
   if (typeof credentialSaver !== "function") throw new TypeError("credentialSaver must be a function");
+  if (typeof confirmThreadDeletion !== "function") {
+    throw new TypeError("confirmThreadDeletion must be a function");
+  }
   if (typeof canonicalizeImage !== "function" || typeof createObjectUrl !== "function"
       || typeof revokeObjectUrl !== "function") {
     throw new TypeError("browser image handlers must be functions");
@@ -836,7 +840,9 @@ export function createBrowserApp({
     chatAfterSequence: 0,
     chatOutput: "",
     chatPendingSend: null,
+    chatPendingDeletion: null,
     chatFinalization: null,
+    chatHistoryRestoration: null,
     chatFailureDiagnostic: null,
     authRecoveryPending: false,
     authRecoveryUsername: null,
@@ -1000,6 +1006,7 @@ export function createBrowserApp({
     state.chatThread = null;
     state.chatGeneration = null;
     state.chatPendingSend = workflow;
+    state.chatPendingDeletion = null;
     state.chatFinalization = null;
     state.runId = null;
     state.agentRunStatus = null;
@@ -1076,6 +1083,7 @@ export function createBrowserApp({
 
   function interactionLocked() {
     return state.busy || state.logoutPending || state.chatFinalization !== null
+      || state.chatHistoryRestoration !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending;
   }
@@ -1084,6 +1092,7 @@ export function createBrowserApp({
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
+    const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
     const locked = interactionLocked();
     const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
     const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
@@ -1092,22 +1101,32 @@ export function createBrowserApp({
     const fencedImage = preservingAuthenticationDraft || preservingAmbiguousImage;
     if (!available && !fencedImage && (state.imagePreparing || state.selectedImages.length > 0)) clearSelectedImage();
     elements.add_image.hidden = !available;
-    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend
+    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
       || state.selectedImages.length >= COMPOSER_IMAGE_COUNT_LIMIT;
     elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
+      || pendingChatDeletion
       || (state.selectedImages.length === 0 && !state.imagePreparing);
     elements.message_input.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+      || pendingChatDeletion
       || preservingAuthenticationDraft;
     elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+      || pendingChatDeletion
       || preservingAuthenticationDraft;
-    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend || preservingAuthenticationDraft;
+    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend || pendingChatDeletion
+      || preservingAuthenticationDraft;
     elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
+      || pendingChatDeletion || preservingAuthenticationDraft;
+    elements.chat_mode.disabled = !state.session.authenticated || locked || pendingChatDeletion
       || preservingAuthenticationDraft;
-    elements.chat_mode.disabled = !state.session.authenticated || locked || preservingAuthenticationDraft;
-    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend ? "true" : "false");
+    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
+      ? "true" : "false");
     elements.workspace.setAttribute("aria-busy", state.chatFinalization === null ? "false" : "true");
-    for (const button of elements.thread_list.children ?? []) {
-      button.disabled = locked || pendingChatSend;
+    for (const row of elements.thread_list.children ?? []) {
+      const buttons = row.className === "thread-row" ? row.children : [row];
+      for (const button of buttons) {
+        button.disabled = locked || pendingChatSend || button.dataset.threadBlocked === "true"
+          || (pendingChatDeletion && button.dataset.threadDeleteRetry !== "true");
+      }
     }
     scheduleSafeUpdateReload();
   }
@@ -1125,6 +1144,10 @@ export function createBrowserApp({
     const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
     const changed = nextMode !== state.mode;
     if (changed && interactionLocked()) return;
+    if (changed && state.mode === "chat" && state.chatPendingDeletion) {
+      showToast("Confirm the pending conversation deletion before changing modes.");
+      return;
+    }
     if (changed && state.mode === "chat" && state.chatPendingSend) {
       showToast("Confirm the pending durable send with Resume before changing modes.");
       return;
@@ -1161,6 +1184,12 @@ export function createBrowserApp({
 
   function purgeAttachmentBlobCache() {
     for (const key of [...state.attachmentBlobCache.keys()]) forgetAttachmentBlob(key);
+  }
+
+  function purgeAttachmentBlobCacheForThread(threadId) {
+    for (const [key, entry] of [...state.attachmentBlobCache.entries()]) {
+      if (entry.threadId === threadId) forgetAttachmentBlob(key);
+    }
   }
 
   function deferAttachmentRestorationJob(job) {
@@ -1228,10 +1257,10 @@ export function createBrowserApp({
     return JSON.stringify([threadId, attachment.attachmentId, attachment.sha256]);
   }
 
-  function cachedAttachmentBlob(key, attachment) {
+  function cachedAttachmentBlob(key, threadId, attachment) {
     const entry = state.attachmentBlobCache.get(key);
     if (entry === undefined) return null;
-    if (entry.mediaType !== attachment.mediaType || entry.byteLength !== attachment.byteLength
+    if (entry.threadId !== threadId || entry.mediaType !== attachment.mediaType || entry.byteLength !== attachment.byteLength
         || entry.width !== attachment.width || entry.height !== attachment.height) {
       forgetAttachmentBlob(key);
       return null;
@@ -1249,7 +1278,7 @@ export function createBrowserApp({
     forgetRenderedAttachmentPreview(key);
   }
 
-  function rememberAttachmentBlob(key, blob, attachment) {
+  function rememberAttachmentBlob(key, threadId, blob, attachment) {
     if (!(blob instanceof Blob) || blob.size < 1 || blob.size > attachmentMemoryLimitBytes) return false;
     forgetAttachmentBlob(key);
     while (state.attachmentBlobCacheBytes + blob.size > attachmentMemoryLimitBytes) {
@@ -1258,6 +1287,7 @@ export function createBrowserApp({
       forgetAttachmentBlob(oldestKey);
     }
     state.attachmentBlobCache.set(key, Object.freeze({
+      threadId,
       blob,
       byteLength: blob.size,
       mediaType: attachment.mediaType,
@@ -1427,7 +1457,7 @@ export function createBrowserApp({
     let url = null;
     try {
       if (!current()) return "stale";
-      let blob = cachedAttachmentBlob(cacheKey, attachment);
+      let blob = cachedAttachmentBlob(cacheKey, threadId, attachment);
       if (blob === null) {
         const { bytes, descriptor } = await chat.getAttachment({ threadId, attachment, signal });
         if (!current()) return "stale";
@@ -1440,7 +1470,7 @@ export function createBrowserApp({
           throw new DirectChatProtocolError("Direct Chat attachment verification result is inconsistent");
         }
         blob = new Blob([bytes], { type: descriptor.mediaType });
-        if (!rememberAttachmentBlob(cacheKey, blob, attachment)) {
+        if (!rememberAttachmentBlob(cacheKey, threadId, blob, attachment)) {
           throw new TypeError("attached image exceeds the compressed preview memory limit");
         }
       }
@@ -1581,16 +1611,63 @@ export function createBrowserApp({
     elements.thread_list.replaceChildren();
     const mode = state.mode;
     const selected = currentThreadId();
+    const pendingDeletion = mode === "chat" ? state.chatPendingDeletion : null;
     currentThreads().forEach((thread) => {
       const threadId = mode === "agent" ? thread.id : thread.threadId;
       const title = thread.title || "New conversation";
-      const button = makeButton(document, title, () => { void openThread(threadId, { mode }); });
-      button.disabled = interactionLocked() || (mode === "chat" && state.chatPendingSend !== null);
-      button.dataset.threadId = threadId;
-      button.dataset.mode = mode;
-      button.setAttribute("aria-current", threadId === selected ? "true" : "false");
-      elements.thread_list.appendChild(button);
+      const open = makeButton(document, title, () => { void openThread(threadId, { mode }); });
+      open.className = "thread-open";
+      open.disabled = interactionLocked() || (mode === "chat"
+        && (state.chatPendingSend !== null || pendingDeletion !== null));
+      open.dataset.threadId = threadId;
+      open.dataset.mode = mode;
+      open.setAttribute("aria-current", threadId === selected ? "true" : "false");
+      if (mode === "agent") {
+        elements.thread_list.appendChild(open);
+        return;
+      }
+      const row = document.createElement("div");
+      row.className = "thread-row";
+      row.dataset.threadId = threadId;
+      row.dataset.mode = "chat";
+      const retryingDeletion = pendingDeletion?.threadId === threadId
+        && pendingDeletion.session === state.session && pendingDeletion.chat === state.chat;
+      const remove = makeButton(document, retryingDeletion ? "Retry" : "Delete", () => {
+        void deleteChatThread(threadId);
+      });
+      remove.className = "thread-delete";
+      remove.setAttribute("aria-label", `${retryingDeletion ? "Retry deleting" : "Delete"} ${title}`);
+      remove.setAttribute("title", `${retryingDeletion ? "Retry deleting" : "Delete"} ${title}`);
+      remove.dataset.threadDeleteRetry = retryingDeletion ? "true" : "false";
+      remove.dataset.threadBlocked = thread.currentGenerationId !== null
+        || (pendingDeletion !== null && !retryingDeletion) ? "true" : "false";
+      remove.disabled = interactionLocked() || state.chatPendingSend !== null
+        || thread.currentGenerationId !== null || (pendingDeletion !== null && !retryingDeletion);
+      row.appendChild(open);
+      row.appendChild(remove);
+      elements.thread_list.appendChild(row);
     });
+  }
+
+  function focusThreadDeleteControl(threadId) {
+    const row = [...(elements.thread_list.children ?? [])]
+      .find((entry) => entry.dataset?.threadId === threadId);
+    row?.children?.[1]?.focus?.();
+  }
+
+  function focusAfterThreadDeletion(previousIndex) {
+    const rows = [...(elements.thread_list.children ?? [])];
+    if (rows.length === 0) {
+      elements.new_thread.focus?.();
+      return;
+    }
+    const row = rows[Math.min(Math.max(previousIndex, 0), rows.length - 1)];
+    const open = row.className === "thread-row" ? row.children?.[0] : row;
+    open?.focus?.();
+  }
+
+  function focusSoon(operation) {
+    Promise.resolve().then(operation);
   }
 
   async function loadAgentThreads() {
@@ -2338,6 +2415,10 @@ export function createBrowserApp({
     refreshThreadList = true,
   } = {}) {
     const expectedEpoch = state.viewEpoch;
+    const restoration = Object.freeze({ threadId, expectedEpoch, chat: state.chat });
+    state.chatHistoryRestoration = restoration;
+    updateImageControl();
+    renderThreads();
     let generationId = null;
     try {
       const snapshot = await refreshChatThread(threadId, undefined, {
@@ -2372,6 +2453,12 @@ export function createBrowserApp({
     } catch (error) {
       if (recoverChatReadAuthentication(error, captureChatReadRecovery({ threadId, generationId }))) return;
       throw error;
+    } finally {
+      if (state.chatHistoryRestoration === restoration) {
+        state.chatHistoryRestoration = null;
+        updateImageControl();
+        renderThreads();
+      }
     }
   }
 
@@ -2409,8 +2496,219 @@ export function createBrowserApp({
     });
   }
 
+  function currentThreadDeletion(pending) {
+    return pending !== null && pending !== undefined
+      && pending.session === state.session && pending.chat === state.chat
+      && state.session.authenticated && state.mode === "chat";
+  }
+
+  function deletionAlreadyAbsent(error) {
+    return error instanceof DirectChatTransportError && error.status === 404;
+  }
+
+  function definitiveDeletionRejection(error) {
+    return error instanceof DirectChatTransportError && error.retryable === false
+      && Number.isSafeInteger(error.status) && error.status >= 400 && error.status < 500
+      && error.status !== 404;
+  }
+
+  function finishLocalThreadDeletion(pending, authoritativeThreads = null) {
+    if (!currentThreadDeletion(pending)) return false;
+    const threadId = pending.threadId;
+    const previousIndex = state.chatThreads.findIndex((item) => item.threadId === threadId);
+    state.chatThreadListEpoch += 1;
+    state.chatThreads = authoritativeThreads === null
+      ? state.chatThreads.filter((item) => item.threadId !== threadId)
+      : [...authoritativeThreads];
+    if (state.chatPendingDeletion === pending) state.chatPendingDeletion = null;
+    purgeAttachmentBlobCacheForThread(threadId);
+    if (state.chatThreadId === threadId) {
+      state.viewEpoch += 1;
+      state.streamAbort?.abort();
+      state.streamAbort = null;
+      state.streamKind = null;
+      state.chatThreadId = null;
+      state.chatThread = null;
+      state.chatGeneration = null;
+      state.chatAfterSequence = 0;
+      state.chatOutput = "";
+      clearChatFailureDiagnostic();
+      clearConversation();
+      elements.conversation_title.textContent = "New conversation";
+    }
+    connection("Connected");
+    renderThreads();
+    focusSoon(() => focusAfterThreadDeletion(previousIndex));
+    showToast("Conversation deleted.");
+    return true;
+  }
+
+  async function reconcileThreadDeletion(pending) {
+    let response;
+    try {
+      response = await pending.chat.listThreads({ limit: 100 });
+    } catch (error) {
+      if (!currentThreadDeletion(pending)) return false;
+      if (isChatAuthenticationAfterAmbiguousDispatch(error)) {
+        if (state.chatPendingDeletion === pending) state.chatPendingDeletion = null;
+        requireFreshAuthentication();
+        return false;
+      }
+      renderThreads();
+      focusSoon(() => focusThreadDeleteControl(pending.threadId));
+      connection("Deletion confirmation paused", false);
+      showToast("The deletion response is still uncertain. Retry reuses the exact same request.");
+      return false;
+    }
+    if (!currentThreadDeletion(pending)) return false;
+    const threads = [...response.threads];
+    const authoritative = threads.find((item) => item.threadId === pending.threadId);
+    if (authoritative === undefined) return finishLocalThreadDeletion(pending, threads);
+    state.chatThreadListEpoch += 1;
+    state.chatThreads = threads;
+    if (authoritative.revision !== pending.revision || authoritative.ledgerHash !== pending.ledgerHash
+        || authoritative.currentGenerationId !== null) {
+      if (state.chatPendingDeletion === pending) state.chatPendingDeletion = null;
+      renderThreads();
+      focusSoon(() => focusThreadDeleteControl(pending.threadId));
+      connection("Connected");
+      showToast("Deletion stopped because this conversation changed or started new work.");
+      return false;
+    }
+    // The read may have overtaken an earlier disconnected delete request. Keep
+    // the exact ticket until either absence or a changed cursor is authoritative.
+    renderThreads();
+    focusSoon(() => focusThreadDeleteControl(pending.threadId));
+    connection("Deletion confirmation paused", false);
+    showToast("The deletion response is still uncertain. Retry reuses the exact same request.");
+    return false;
+  }
+
+  async function deleteChatThread(threadId) {
+    if (interactionLocked() || !state.session.authenticated || state.mode !== "chat"
+        || state.chatPendingSend !== null) return false;
+    let retained = state.chatPendingDeletion;
+    if (retained !== null && (!currentThreadDeletion(retained) || retained.threadId !== threadId)) {
+      if (!currentThreadDeletion(retained)) {
+        state.chatPendingDeletion = null;
+        retained = null;
+      }
+      else {
+        showToast("Confirm the pending conversation deletion before deleting another conversation.");
+        focusSoon(() => focusThreadDeleteControl(retained.threadId));
+        return false;
+      }
+    }
+    const thread = state.chatThreads.find((item) => item.threadId === threadId);
+    if (!thread) {
+      return retained !== null && retained.threadId === threadId
+        ? finishLocalThreadDeletion(retained, state.chatThreads)
+        : false;
+    }
+    if (thread.currentGenerationId !== null
+        || (state.chatThreadId === threadId && state.chatGeneration
+          && !TERMINAL.has(state.chatGeneration.status))) {
+      showToast("Stop or resolve this LocalLLM response before deleting its conversation.");
+      return false;
+    }
+
+    const session = state.session;
+    const chat = state.chat;
+    state.busy = true;
+    updateImageControl();
+    try {
+      let pending = retained;
+      if (pending === null) {
+        let confirmed = false;
+        try {
+          confirmed = await confirmThreadDeletion(
+            `Delete “${thread.title || "New conversation"}” and all of its saved messages and images? This cannot be undone.`,
+          ) === true;
+        } catch {
+          confirmed = false;
+        }
+        if (!confirmed || state.session !== session || state.chat !== chat
+            || !state.session.authenticated || state.mode !== "chat"
+            || state.chatPendingSend !== null) return false;
+        const current = state.chatThreads.find((item) => item.threadId === threadId);
+        if (!current || current.revision !== thread.revision || current.ledgerHash !== thread.ledgerHash
+            || current.currentGenerationId !== null) {
+          showToast("This conversation changed before deletion. Reopen it and try again.");
+          return false;
+        }
+        const ticket = chat.prepareThreadDeletion({
+          threadId,
+          expectedRevision: thread.revision,
+          expectedHash: thread.ledgerHash,
+        });
+        pending = Object.freeze({
+          session,
+          chat,
+          threadId,
+          revision: thread.revision,
+          ledgerHash: thread.ledgerHash,
+          ticket,
+        });
+        state.chatPendingDeletion = pending;
+      }
+
+      let result = null;
+      let ambiguous = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          result = await (attempt === 0 && retained === null
+            ? pending.chat.deleteThread(pending.ticket)
+            : pending.chat.retryDeleteThread(pending.ticket));
+          ambiguous = null;
+          break;
+        } catch (error) {
+          if (!currentThreadDeletion(pending)) return false;
+          if (deletionAlreadyAbsent(error)) return finishLocalThreadDeletion(pending);
+          if (definitiveDeletionRejection(error)) throw error;
+          ambiguous = error;
+          if (attempt === 0) {
+            connection("Retrying the same durable deletion", false);
+            await wait(250);
+          }
+        }
+      }
+      if (result !== null) {
+        if (!currentThreadDeletion(pending) || result.deleted !== true || result.threadId !== threadId) return false;
+        return finishLocalThreadDeletion(pending);
+      }
+      if (ambiguous !== null) return await reconcileThreadDeletion(pending);
+      return false;
+    } catch (error) {
+      const pending = state.chatPendingDeletion;
+      if (pending !== null && currentThreadDeletion(pending)) state.chatPendingDeletion = null;
+      if (isChatAuthenticationAfterAmbiguousDispatch(error)) {
+        requireFreshAuthentication();
+      } else if (error instanceof DirectChatTransportError && error.status === 409) {
+        if (retained !== null) {
+          renderThreads();
+          focusSoon(() => focusThreadDeleteControl(threadId));
+        }
+        showToast("Deletion stopped because this conversation changed or still has unresolved work.");
+      } else {
+        if (retained !== null) {
+          renderThreads();
+          focusSoon(() => focusThreadDeleteControl(threadId));
+        }
+        showToast("Conversation deletion was rejected before it could be confirmed.");
+      }
+      return false;
+    } finally {
+      state.busy = false;
+      updateImageControl();
+    }
+  }
+
   async function openThread(threadId, { mode = state.mode } = {}) {
     if (interactionLocked() || mode !== state.mode) return;
+    if (mode === "chat" && state.chatPendingDeletion) {
+      showToast("Retry the pending conversation deletion before opening another conversation.");
+      return;
+    }
     if (mode === "chat" && state.chatPendingSend) {
       showToast("Confirm the pending durable send with Resume before opening another conversation.");
       return;
@@ -2737,7 +3035,7 @@ export function createBrowserApp({
   async function selectImage() {
     if (interactionLocked() || !state.session.authenticated || state.mode !== "chat"
         || state.chatCapabilities.visionInput !== true || state.chatPendingSend !== null
-        || state.logoutPending) return;
+        || state.chatPendingDeletion !== null || state.logoutPending) return;
     const files = elements.image_input.files;
     if (!files || files.length < 1) {
       elements.image_input.value = "";
@@ -2793,6 +3091,10 @@ export function createBrowserApp({
   async function submitMessage(event) {
     event?.preventDefault?.();
     if (interactionLocked() || !state.session.authenticated) return;
+    if (state.mode === "chat" && state.chatPendingDeletion) {
+      showToast("Retry the pending conversation deletion before sending another message.");
+      return;
+    }
     if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed)) {
       showToast(state.agentHistoryRestoring
         ? "Wait for verified Agent history to finish restoring before creating more work."
@@ -2933,6 +3235,7 @@ export function createBrowserApp({
     const recoveryUsername = state.authRecoveryUsername;
     const recoveryWorkflow = state.authRecoveryWorkflow;
     const recoveryGeneration = state.authRecoveryGeneration;
+    state.chatPendingDeletion = null;
     purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
     if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
@@ -2974,6 +3277,7 @@ export function createBrowserApp({
       state.chatAfterSequence = sameAccountRecoveryGeneration?.afterSequence ?? 0;
       state.chatOutput = sameAccountRecoveryGeneration?.output ?? "";
       state.chatPendingSend = sameAccountRecoveryWorkflow;
+      state.chatPendingDeletion = null;
       state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
@@ -2985,7 +3289,8 @@ export function createBrowserApp({
       requiredMethod(state.agent, "listThreads", "agent client");
       requiredMethod(state.agent, "streamRunEvents", "agent client");
       for (const method of [
-        "capabilities", "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread", "listMessages", "getAttachment",
+        "capabilities", "prepareThread", "createThread", "retryCreateThread", "listThreads", "getThread",
+        "prepareThreadDeletion", "deleteThread", "retryDeleteThread", "listMessages", "getAttachment",
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
       const authenticatedChat = state.chat;
@@ -3218,6 +3523,7 @@ export function createBrowserApp({
     state.chatThread = null;
     state.chatGeneration = null;
     state.chatPendingSend = null;
+    state.chatPendingDeletion = null;
     state.chatFinalization = null;
     state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
     clearSelectedImage();
@@ -3420,6 +3726,10 @@ export function createBrowserApp({
       showToast("This durable request has an uncertain response. Use Resume before starting another conversation.");
       return;
     }
+    if (state.mode === "chat" && state.chatPendingDeletion) {
+      showToast("Retry the pending conversation deletion before starting another conversation.");
+      return;
+    }
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     if (state.mode === "agent") {
@@ -3445,7 +3755,9 @@ export function createBrowserApp({
 
   function updateHasUnsafeActivity() {
     return state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null
-      || state.imagePreparing || state.chatPendingSend !== null || state.authRecoveryGeneration !== null
+      || state.chatHistoryRestoration !== null
+      || state.imagePreparing || state.chatPendingSend !== null || state.chatPendingDeletion !== null
+      || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
       || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
       || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
@@ -4097,5 +4409,15 @@ export function createBrowserApp({
     schedulePwaRegistration();
   }
 
-  return Object.freeze({ initialize, submitMessage, login, logout, stop, resume, openThread, setMode });
+  return Object.freeze({
+    initialize,
+    submitMessage,
+    login,
+    logout,
+    stop,
+    resume,
+    openThread,
+    deleteChatThread,
+    setMode,
+  });
 }

@@ -300,6 +300,163 @@ test('appends an immutable monotonic user/assistant hash ledger and rejects stal
   }
 });
 
+test('atomically deletes one resolved thread and replays only its hash-bound deletion receipt', (t) => {
+  const state = testState(t, { enableVisionAttachments: true });
+  const thread = createThread(state.store, 'delete-resolved');
+  const turn = startTurn(state.store, thread, 'delete-resolved', {
+    attachment: visionAttachment('delete-resolved')
+  });
+  appendDelta(state.store, turn.generation, 0, 'Resolved private output.');
+  state.store.finalizeGeneration({
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    generationId: turn.generation.generationId,
+    idempotencyKey: 'finalize-delete-resolved-0001'
+  });
+  const messages = state.store.listMessages({
+    accountId: thread.accountId,
+    threadId: thread.threadId
+  });
+  state.store.createCompactionSnapshot({
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    snapshotId: 'snapshot-delete-resolved',
+    sourceStartRevision: 1,
+    sourceStartHash: messages[0].messageHash,
+    sourceEndRevision: 2,
+    sourceEndHash: messages[1].messageHash,
+    summaryText: 'Private summary removed with the deleted thread.',
+    idempotencyKey: 'compaction-delete-resolved-0001'
+  });
+  const resolved = state.store.getThread(thread.accountId, thread.threadId);
+  const request = {
+    accountId: thread.accountId,
+    threadId: thread.threadId,
+    expectedRevision: resolved.revision,
+    expectedHash: resolved.ledgerHash,
+    idempotencyKey: 'thread-delete-resolved-0001'
+  };
+  const deleted = state.store.deleteThread(request);
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.threadId, thread.threadId);
+  assert.equal(deleted.revision, 2);
+  assert.equal(deleted.ledgerHash, resolved.ledgerHash);
+  assert.deepEqual(state.store.deleteThread(request), deleted);
+  assert.equal(state.store.getThread(thread.accountId, thread.threadId), null);
+  assert.deepEqual(state.store.listThreads({ accountId: thread.accountId }), []);
+
+  const database = new DatabaseSync(state.databasePath);
+  try {
+    for (const table of [
+      'direct_chat_threads', 'direct_chat_messages', 'direct_chat_generations',
+      'direct_chat_deltas', 'direct_chat_generation_leases', 'direct_chat_compactions',
+      'direct_chat_attachments', 'direct_chat_idempotency'
+    ]) {
+      assert.equal(Number(database.prepare(`
+        SELECT count(*) AS count FROM ${table} WHERE account_id = ? AND thread_id = ?
+      `).get(thread.accountId, thread.threadId).count), 0, `${table} must be removed`);
+    }
+    const receipt = database.prepare(`
+      SELECT * FROM direct_chat_thread_deletions WHERE account_id = ? AND thread_id = ?
+    `).get(thread.accountId, thread.threadId);
+    assert.match(receipt.key_hash, /^[a-f0-9]{64}$/u);
+    assert.equal(Object.values(receipt).includes(request.idempotencyKey), false);
+    assert.throws(() => database.prepare(`
+      DELETE FROM direct_chat_thread_deletions WHERE account_id = ? AND thread_id = ?
+    `).run(thread.accountId, thread.threadId), /durable/u);
+  } finally {
+    database.close();
+  }
+
+  state.store.close();
+  const reopened = new DirectChatStore({
+    databasePath: state.databasePath,
+    enableVisionAttachments: true
+  });
+  state.replaceStore(reopened);
+  assert.deepEqual(reopened.deleteThread(request), deleted);
+  assert.throws(() => createThread(reopened, 'delete-resolved'), /permanently retired/u);
+});
+
+test('thread deletion fails closed for active, orphaned, stale, foreign, and key-conflicting state', (t) => {
+  const { store } = testState(t);
+  const active = createThread(store, 'delete-active');
+  const activeTurn = startTurn(store, active, 'delete-active');
+  const activeThread = store.getThread(active.accountId, active.threadId);
+  assert.throws(() => store.deleteThread({
+    accountId: active.accountId,
+    threadId: active.threadId,
+    expectedRevision: activeThread.revision,
+    expectedHash: activeThread.ledgerHash,
+    idempotencyKey: 'thread-delete-active-0001'
+  }), /active or unresolved/u);
+
+  const orphaned = createThread(store, 'delete-orphaned');
+  sendUser(store, orphaned, 'delete-orphaned');
+  const orphanedThread = store.getThread(orphaned.accountId, orphaned.threadId);
+  assert.throws(() => store.deleteThread({
+    accountId: orphaned.accountId,
+    threadId: orphaned.threadId,
+    expectedRevision: orphanedThread.revision,
+    expectedHash: orphanedThread.ledgerHash,
+    idempotencyKey: 'thread-delete-orphaned-0001'
+  }), /unresolved acceptance/u);
+
+  const resolved = createThread(store, 'delete-conflict');
+  assert.throws(() => store.deleteThread({
+    accountId: resolved.accountId,
+    threadId: resolved.threadId,
+    expectedRevision: 1,
+    expectedHash: 'a'.repeat(64),
+    idempotencyKey: 'thread-delete-conflict-0001'
+  }), ConflictError);
+  assert.throws(() => store.deleteThread({
+    accountId: 'account-foreign-delete',
+    threadId: resolved.threadId,
+    expectedRevision: resolved.revision,
+    expectedHash: resolved.ledgerHash,
+    idempotencyKey: 'thread-delete-foreign-0001'
+  }), NotFoundError);
+
+  const exact = {
+    accountId: resolved.accountId,
+    threadId: resolved.threadId,
+    expectedRevision: resolved.revision,
+    expectedHash: resolved.ledgerHash,
+    idempotencyKey: 'thread-delete-conflict-0001'
+  };
+  store.deleteThread(exact);
+  const another = createThread(store, 'delete-another', {
+    accountId: resolved.accountId,
+    threadId: 'thread-delete-another'
+  });
+  assert.throws(() => store.deleteThread({
+    accountId: another.accountId,
+    threadId: another.threadId,
+    expectedRevision: another.revision,
+    expectedHash: another.ledgerHash,
+    idempotencyKey: exact.idempotencyKey
+  }), IdempotencyConflictError);
+
+  // The explicit terminal decision resolves a send; its trailing user message
+  // is no longer ambiguous and may be deleted.
+  const cancelled = store.cancelGeneration({
+    accountId: active.accountId,
+    threadId: active.threadId,
+    generationId: activeTurn.generation.generationId,
+    idempotencyKey: 'cancel-delete-active-0001'
+  });
+  assert.equal(cancelled.status, 'cancelled');
+  const cancelledThread = store.getThread(active.accountId, active.threadId);
+  assert.equal(store.deleteThread({
+    accountId: active.accountId,
+    threadId: active.threadId,
+    expectedRevision: cancelledThread.revision,
+    expectedHash: cancelledThread.ledgerHash,
+    idempotencyKey: 'thread-delete-cancelled-0001'
+  }).deleted, true);
+});
+
 test('persists and resumes in-progress deltas across restart without duplicate assistant turns', (t) => {
   const state = testState(t, { modelAlias: 'local-code' });
   const thread = createThread(state.store, 'restart');
@@ -603,7 +760,7 @@ test('atomically stores and replays an ordered bounded image set on one user mes
   }), /bounded/u);
 });
 
-test('gates v3 expansion but exactly replays committed image turns while vision is disabled for rollback', (t) => {
+test('keeps the common v5 schema while exactly gating and replaying vision across feature rollback', (t) => {
   const state = testState(t, { modelAlias: 'localllm-fast' });
   const thread = createThread(state.store, 'vision-migration');
   assert.equal(
@@ -615,7 +772,7 @@ test('gates v3 expansion but exactly replays committed image turns while vision 
       SELECT count(*) AS value FROM sqlite_schema
       WHERE type = 'table' AND name = 'direct_chat_attachments'
     `)),
-    0
+    1
   );
   assert.throws(
     () => startTurn(state.store, thread, 'vision-disabled', { attachment: visionAttachment('disabled') }),
@@ -759,7 +916,10 @@ test('migrates a populated v3 single-image ledger to ordered v4 position zero', 
     modelAlias: 'localllm-fast',
     enableVisionAttachments: true
   });
-  assert.equal(Number(scalar(databasePath, 'SELECT user_version AS value FROM pragma_user_version')), 4);
+  assert.equal(
+    Number(scalar(databasePath, 'SELECT user_version AS value FROM pragma_user_version')),
+    LATEST_CHAT_SCHEMA_VERSION
+  );
   assert.equal(Number(scalar(databasePath, `
     SELECT position AS value FROM direct_chat_attachments WHERE attachment_id = ?
   `, attachment.attachmentId)), 0);
@@ -1578,13 +1738,18 @@ test('never reclaims inference after dispatch may have started, even with zero p
 test('migrates an exact version-one chat database to fenced dispatch leases', (t) => {
   const state = testState(t);
   state.store.close();
+  rmSync(state.databasePath);
   let database = new DatabaseSync(state.databasePath);
-  database.exec(`
-    DROP TABLE direct_chat_generation_leases;
-    DELETE FROM chat_schema_migrations WHERE version = 2;
-    PRAGMA user_version = 1;
-  `);
+  const migration = CHAT_MIGRATIONS[0];
+  database.exec(migration.sql);
+  database.prepare(`
+    INSERT INTO chat_schema_migrations(version, name, checksum, applied_at)
+    VALUES (?, ?, ?, ?)
+  `).run(migration.version, migration.name, migration.checksum, '2026-08-20T00:00:00.000Z');
+  database.exec(`PRAGMA application_id = ${CHAT_SQLITE_APPLICATION_ID}`);
+  database.exec('PRAGMA user_version = 1');
   database.close();
+  chmodSync(state.databasePath, 0o600);
 
   const migrated = new DirectChatStore({ databasePath: state.databasePath });
   state.replaceStore(migrated);
@@ -1602,7 +1767,7 @@ test('migrates an exact version-one chat database to fenced dispatch leases', (t
   );
   assert.equal(
     Number(scalar(state.databasePath, 'SELECT count(*) AS value FROM chat_schema_migrations')),
-    2
+    LATEST_CHAT_SCHEMA_VERSION
   );
 });
 

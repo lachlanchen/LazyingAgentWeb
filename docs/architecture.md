@@ -2,9 +2,13 @@
 
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
-acceptance receipts and a verified rollback release. AgInTi Agent remains
-disabled until every native, sandbox, tunnel, resource, and live rollback
-acceptance gate in the promotion rule passes.
+acceptance receipts and a verified rollback release. The historical Agent gate
+is fail-closed. Current v0.1.18 production enables Agent only through the
+accepted native AgInTi capability proof; without that proof, Agent remains
+unavailable while Direct Chat continues as a separate LocalLLM data plane.
+Voice messages, web/deep research, and general artifact file upload/download
+remain unavailable. The accepted Agent artifact surface is limited to the
+declarative plot, table, and Markdown schemas described below.
 
 ## Product boundary
 
@@ -378,12 +382,16 @@ threads are migrated or intentionally left offline.
 
 ## Promotion rule
 
-Agent mode remains disabled until automated adversarial tests prove ownership,
-CSRF/schema enforcement, exact routes, event replay, idempotency, cancellation,
-context durability, artifact isolation, resource admission, tunnel outage and
-rollback. A live Docker/model acceptance run is additionally blocked whenever
-the shared-workstation resource policy fails. Releases are immutable and retain
-the current and immediately previous reproducible package with an executable
-rollback. Passing offline package tests alone does not authorize deployment.
-The current live PWA/Direct Chat deployment does not authorize or imply Agent
-enablement.
+Agent mode is fail-closed: promotion requires automated adversarial tests to
+prove ownership, CSRF/schema enforcement, exact routes, event replay,
+idempotency, cancellation, context durability, artifact isolation, resource
+admission, tunnel outage and rollback. A live Docker/model acceptance run is
+additionally blocked whenever the shared-workstation resource policy fails.
+Releases are immutable and retain the current and immediately previous
+reproducible package with an executable rollback. Passing offline package tests
+alone does not authorize deployment. Current v0.1.18 production exposes Agent
+only while AgInTi returns the accepted native capability proof; removing or
+invalidating that proof disables Agent. A live PWA or Direct Chat deployment
+alone neither authorizes nor implies Agent enablement, and Direct Chat remains a
+separate LocalLLM path. Voice messages, web/deep research, and general artifact
+file upload/download remain outside the accepted capability.

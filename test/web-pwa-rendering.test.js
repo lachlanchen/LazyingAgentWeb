@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -30,6 +31,7 @@ import {
   verifyStandaloneAssetMap,
 } from "../src/web/asset-map.js";
 import { createSafeRenderer } from "../src/web/safe-rendering.js";
+import { canonicalJson, verifyAgentEvent } from "../src/web/aginti-protocol.js";
 
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const CURRENT_RELEASE = `release-${"a".repeat(64)}`;
@@ -768,6 +770,13 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     BRIGHT_APP_CSS,
     /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*flex-direction: column;[^}]*align-items: stretch;/u,
   );
+});
+
+test("inline Agent artifacts contain wide tables inside the assistant message", () => {
+  assert.match(BRIGHT_APP_CSS, /\.message \{[^}]*min-width: 0;/u);
+  assert.match(BRIGHT_APP_CSS, /\.message-artifacts \{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere;/u);
+  assert.match(BRIGHT_APP_CSS, /\.artifact, \.artifact > div \{[^}]*min-width: 0;/u);
+  assert.match(BRIGHT_APP_CSS, /\.table-scroll, \.artifact-table-scroll \{[^}]*overflow-x: auto;/u);
 });
 
 test("content digest deterministically owns release, cache, routes, and final-map verification", async () => {
@@ -1600,13 +1609,33 @@ test("authoritative terminal Agent states remain update-safe while retaining the
   };
 
   for (const status of ["completed", "failed", "cancelled"]) {
+    const type = `run.${status}`;
+    const envelope = {
+      schemaVersion: "1",
+      id: `${runId}.1`,
+      seq: 1,
+      type,
+      threadId,
+      runId,
+      createdAt: "2026-08-20T08:00:00.000Z",
+      payload: {},
+      previousHash: "0".repeat(64),
+    };
+    const value = { ...envelope, hash: createHash("sha256").update(canonicalJson(envelope), "utf8").digest("hex") };
+    const terminalEvent = await verifyAgentEvent(value, {
+      expectedRunId: runId,
+      expectedThreadId: threadId,
+      afterSeq: 0,
+      previousHash: "0".repeat(64),
+      digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+    });
     const agent = {
       async capabilities() { return capability; },
       async listThreads() { return { threads: [] }; },
       async createThread() { return { thread: { id: threadId, title: "Terminal update safety" } }; },
       async startRun() { return { run: { id: runId, threadId, status: "starting" } }; },
-      async *streamRunEvents() {},
-      async runStatus() { return { run: { id: runId, threadId, status, output: "server-owned result" } }; },
+      async *streamRunEvents() { yield { event: terminalEvent, cursor: { seq: 1, hash: terminalEvent.hash } }; },
+      async runStatus() { throw new Error("terminal event must complete without a status shortcut"); },
     };
     const harness = updateControllerHarness({
       restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
@@ -2178,6 +2207,32 @@ test("plot, table, and Markdown artifacts render declaratively while active cont
   }), false);
   assert.equal(target.dataset.status, "rejected");
   assert.equal(target.walk().some((node) => ["script", "iframe", "img"].includes(node.tagName)), false);
+
+  assert.equal(renderer.renderArtifact(target, artifact("plot", {
+    schemaVersion: "1",
+    type: "line",
+    labels: ["unsafe"],
+    series: [{ name: "Overflow", data: [Number.MAX_VALUE] }],
+  })), false);
+  assert.equal(target.dataset.status, "rejected");
+  assert.equal(target.walk().some((node) => node.tagName === "svg"), false);
+
+  const defensiveDocument = new DomDocument();
+  const createElementNS = defensiveDocument.createElementNS.bind(defensiveDocument);
+  defensiveDocument.createElementNS = (namespace, name) => {
+    if (name === "path") throw new TypeError("simulated SVG construction failure");
+    return createElementNS(namespace, name);
+  };
+  const defensiveRenderer = createSafeRenderer({ document: defensiveDocument });
+  const defensiveTarget = defensiveDocument.createElement("section");
+  assert.equal(defensiveRenderer.renderArtifact(defensiveTarget, artifact("plot", {
+    schemaVersion: "1",
+    type: "line",
+    labels: ["A", "B"],
+    series: [{ name: "Value", data: [1, 2] }],
+  })), false);
+  assert.equal(defensiveTarget.dataset.status, "rejected");
+  assert.equal(defensiveTarget.walk().some((node) => node.tagName === "svg"), false);
 });
 
 test("rendering implementation contains no HTML injection, dynamic code execution, or external fetch", async () => {

@@ -529,7 +529,7 @@ ${modulePreloads}
         <header><strong>Agent activity</strong><span id="run-state">Idle</span></header>
         <ol id="agent-plan" class="agent-plan" data-testid="agent-plan"></ol>
         <ol id="agent-timeline" class="agent-timeline" data-testid="tool-timeline"></ol>
-        <section id="agent-artifacts" class="agent-artifacts" data-testid="artifact-panel"></section>
+        <section id="agent-artifacts" class="agent-artifacts" data-testid="artifact-panel" hidden></section>
       </aside>
 
       <form id="composer" class="composer" autocomplete="off">
@@ -636,10 +636,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .welcome { margin: 11vh auto 2rem; max-width: 680px; text-align: center; }
 .welcome p:last-child { color: var(--muted); }
 .messages { display: grid; gap: 1.2rem; }
-.message { max-width: min(86%, 760px); padding: .85rem 1rem; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
+.message { min-width: 0; max-width: min(86%, 760px); padding: .85rem 1rem; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
 .message[data-role="user"] { justify-self: end; background: var(--accent-soft); }
 .message[data-role="assistant"] { justify-self: start; }
 .message pre { overflow-x: auto; padding: .8rem; border-radius: 10px; background: var(--surface-soft); }
+.message-artifacts { min-width: 0; display: grid; gap: .75rem; margin-top: .85rem; padding-top: .85rem; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.message-artifacts[hidden] { display: none; }
+.artifact, .artifact > div { min-width: 0; }
 .message table, .artifact-table { width: 100%; border-collapse: collapse; }
 .message th, .message td, .artifact-table th, .artifact-table td { padding: .55rem; border: 1px solid var(--line); text-align: left; }
 .table-scroll, .artifact-table-scroll { overflow-x: auto; }

@@ -81,6 +81,7 @@ const PRIVATE_PATH = /(?:^|[\s("'`])\/(?:workspace|home|users|root|etc|usr|var|o
 const UNSAFE_PRESENTATION = /[<>]|(?:javascript\s*:|(?:https?|data|file)\s*:\/\/)/iu;
 const CONTROL = /\u0000|[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ZERO_HASH = "0".repeat(64);
+const MAX_PLOT_MAGNITUDE = Number.MAX_SAFE_INTEGER;
 const utf8 = new TextEncoder();
 const verifiedEvents = new WeakSet();
 
@@ -155,6 +156,31 @@ function label(value, name, maximum = 120) {
 function finite(value, name) {
   if (typeof value !== "number" || !Number.isFinite(value)) invalid(`${name} must be a finite number`);
   return value;
+}
+
+function plotNumber(value, name) {
+  const result = finite(value, name);
+  if (Math.abs(result) > MAX_PLOT_MAGNITUDE) {
+    invalid(`${name} exceeds the supported plot magnitude`);
+  }
+  return result;
+}
+
+function validatePlotRange(values, name, { includeZero = false } = {}) {
+  let minimum = includeZero ? 0 : Math.min(...values);
+  let maximum = includeZero ? 0 : Math.max(...values);
+  if (includeZero) {
+    minimum = Math.min(minimum, ...values);
+    maximum = Math.max(maximum, ...values);
+  }
+  if (minimum === maximum) {
+    minimum -= 1;
+    maximum += 1;
+  }
+  const span = maximum - minimum;
+  if (![minimum, maximum, span].every(Number.isFinite) || span <= 0) {
+    invalid(`${name} produces an unsupported numeric range`);
+  }
 }
 
 function timestamp(value, name, { nullable = false } = {}) {
@@ -325,7 +351,7 @@ export function validatePlotSpec(value) {
       points += item.data.length;
       return Object.freeze({
         name,
-        data: Object.freeze(item.data.map((point, pointIndex) => finite(point, `plot series[${index}].data[${pointIndex}]`))),
+        data: Object.freeze(item.data.map((point, pointIndex) => plotNumber(point, `plot series[${index}].data[${pointIndex}]`))),
       });
     }
     if (!Array.isArray(item.points) || item.points.length < 1) invalid("scatter points must not be empty");
@@ -335,13 +361,18 @@ export function validatePlotSpec(value) {
       points: Object.freeze(item.points.map((point, pointIndex) => {
         const pair = exact(point, ["x", "y"], `plot series[${index}].points[${pointIndex}]`);
         return Object.freeze({
-          x: finite(pair.x, `plot series[${index}].points[${pointIndex}].x`),
-          y: finite(pair.y, `plot series[${index}].points[${pointIndex}].y`),
+          x: plotNumber(pair.x, `plot series[${index}].points[${pointIndex}].x`),
+          y: plotNumber(pair.y, `plot series[${index}].points[${pointIndex}].y`),
         });
       })),
     });
   });
   if (points > 500) invalid("plot contains more than 500 total points");
+  const normalizedPoints = series.flatMap((entry) => categorical
+    ? entry.data.map((y, x) => ({ x, y }))
+    : entry.points);
+  validatePlotRange(normalizedPoints.map(({ y }) => y), "plot y values", { includeZero: true });
+  validatePlotRange(normalizedPoints.map(({ x }) => x), "plot x values");
   return Object.freeze({
     schemaVersion: AGINTI_SCHEMA_VERSION,
     type: spec.type,

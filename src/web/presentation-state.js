@@ -10,6 +10,7 @@ const TERMINAL_STATUS = Object.freeze({
   "run.failed": "failed",
   "run.cancelled": "cancelled",
 });
+const TERMINAL_RUN_STATUS = new Set(Object.values(TERMINAL_STATUS));
 
 function copyCursor(value) {
   const initial = initialEventCursor();
@@ -38,6 +39,7 @@ export function createRunPresentation({ runId, threadId, cursor } = {}) {
   validateThreadId(threadId);
   let delivery = copyCursor(cursor);
   let status = "starting";
+  let terminalStatus = null;
   let output = "";
   let outputComplete = false;
   let plan = [];
@@ -53,6 +55,7 @@ export function createRunPresentation({ runId, threadId, cursor } = {}) {
       threadId,
       cursor: delivery,
       status,
+      terminalStatus,
       output,
       outputComplete,
       plan: freezeArray(plan),
@@ -66,8 +69,13 @@ export function createRunPresentation({ runId, threadId, cursor } = {}) {
     const event = assertVerifiedAgentEvent(value);
     if (event.runId !== runId || event.threadId !== threadId) throw new TypeError("event does not belong to this presentation");
     if (event.seq !== delivery.seq + 1 || event.previousHash !== delivery.hash) throw new TypeError("event is not contiguous with this presentation");
+    if (terminalStatus !== null) throw new TypeError("event arrived after the terminal run event");
     delivery = Object.freeze({ seq: event.seq, hash: event.hash });
-    if (event.type === "run.status") status = event.payload.status;
+    if (event.type === "run.status") {
+      // A status payload is presentation progress only. Completion authority is
+      // carried exclusively by the hash-chained terminal event below.
+      if (!TERMINAL_RUN_STATUS.has(event.payload.status)) status = event.payload.status;
+    }
     else if (event.type === "plan.updated") plan = event.payload.steps.map((step) => ({ ...step }));
     else if (event.type === "context.compacted") compaction = { ...event.payload };
     else if (event.type.startsWith("tool.")) {
@@ -88,7 +96,10 @@ export function createRunPresentation({ runId, threadId, cursor } = {}) {
         throw new TypeError("artifact.updated arrived before artifact.created");
       }
       artifacts.set(event.payload.artifact.id, event.payload.artifact);
-    } else if (Object.hasOwn(TERMINAL_STATUS, event.type)) status = TERMINAL_STATUS[event.type];
+    } else if (Object.hasOwn(TERMINAL_STATUS, event.type)) {
+      status = TERMINAL_STATUS[event.type];
+      terminalStatus = status;
+    }
     return snapshot();
   }
 

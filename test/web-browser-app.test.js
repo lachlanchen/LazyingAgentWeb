@@ -9,6 +9,9 @@ import { DirectChatTransportError } from "../src/web/direct-chat-client.js";
 
 const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
 const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
+const SECOND_RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ARTIFACT_ID = `art_${"a".repeat(64)}`;
+const SECOND_ARTIFACT_ID = `art_${"b".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
 const ZERO_HASH = "0".repeat(64);
 const CHAT_THREAD_ID = "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx";
@@ -235,6 +238,7 @@ function harness({
   attachmentMemoryLimitBytes,
   attachmentDecodedMemoryLimitBytes,
   IntersectionObserver,
+  cursorStore,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
 } = {}) {
@@ -277,6 +281,7 @@ function harness({
     ...(attachmentDecodeTimeoutMs === undefined ? {} : { attachmentDecodeTimeoutMs }),
     ...(attachmentMemoryLimitBytes === undefined ? {} : { attachmentMemoryLimitBytes }),
     ...(attachmentDecodedMemoryLimitBytes === undefined ? {} : { attachmentDecodedMemoryLimitBytes }),
+    ...(cursorStore === undefined ? {} : { cursorStore }),
     wait,
     maxStreamBackoffSteps,
   });
@@ -464,21 +469,21 @@ test("failed login clears the password and releases the single-flight guard", as
   assert.equal(browser.document.getElementById("password").value, "");
 });
 
-async function verifiedEvent({ seq, type, payload, previousHash }) {
+async function verifiedEvent({ seq, type, payload, previousHash, runId = RUN_ID }) {
   const envelope = {
     schemaVersion: "1",
-    id: `${RUN_ID}.${seq}`,
+    id: `${runId}.${seq}`,
     seq,
     type,
     threadId: THREAD_ID,
-    runId: RUN_ID,
+    runId,
     createdAt: NOW,
     payload,
     previousHash,
   };
   const value = { ...envelope, hash: digest(canonicalJson(envelope)) };
   return await verifyAgentEvent(value, {
-    expectedRunId: RUN_ID,
+    expectedRunId: runId,
     expectedThreadId: THREAD_ID,
     afterSeq: seq - 1,
     previousHash,
@@ -486,8 +491,50 @@ async function verifiedEvent({ seq, type, payload, previousHash }) {
   });
 }
 
-function run(status = "running") {
-  return { id: RUN_ID, threadId: THREAD_ID, status, output: status === "completed" ? "Done" : "" };
+async function verifiedEvents(entries, { runId = RUN_ID } = {}) {
+  const events = [];
+  let previousHash = ZERO_HASH;
+  for (const [type, payload] of entries) {
+    const event = await verifiedEvent({ seq: events.length + 1, type, payload, previousHash, runId });
+    events.push(event);
+    previousHash = event.hash;
+  }
+  return events;
+}
+
+function run(status = "running", overrides = {}) {
+  return {
+    id: RUN_ID,
+    threadId: THREAD_ID,
+    status,
+    output: status === "completed" ? "Done" : "",
+    eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: ZERO_HASH, prunedThroughSeq: 0 },
+    ...overrides,
+  };
+}
+
+function terminalRun(status, events, overrides = {}) {
+  const last = events.at(-1);
+  return run(status, {
+    eventCursor: {
+      firstSeq: 1,
+      lastSeq: last?.seq ?? 0,
+      lastHash: last?.hash ?? ZERO_HASH,
+      prunedThroughSeq: 0,
+    },
+    ...overrides,
+  });
+}
+
+function agentThread(overrides = {}) {
+  return {
+    id: THREAD_ID,
+    title: "Agent calculation",
+    lastRunId: null,
+    authority: { lastCompaction: null },
+    messages: [],
+    ...overrides,
+  };
 }
 
 test("browser UI defaults to Agent only after an exact enabled AgInTi capability", async () => {
@@ -503,6 +550,671 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   await malformed.app.initialize();
   assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+});
+
+test("completed Agent reload replays the verified ledger into the existing message and inline artifact without a mutation", async () => {
+  const events = await verifiedEvents([
+    ["plan.updated", { steps: [{ id: "compute", label: "Compute values", status: "completed" }] }],
+    ["tool.completed", {
+      callId: "code-call-1",
+      publicLabel: "Run calculation",
+      publicSummary: "Prepared bounded plot data",
+      at: NOW,
+    }],
+    ["output.delta", { text: "Restored verified answer" }],
+    ["artifact.created", { artifact: {
+      id: ARTIFACT_ID,
+      title: "Restored plot",
+      kind: "plot",
+      spec: {
+        schemaVersion: "1",
+        type: "line",
+        labels: ["A", "B"],
+        series: [{ name: "Value", data: [1, 2] }],
+      },
+    } }],
+    ["output.completed", {}],
+    ["run.completed", {}],
+  ]);
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_user_reload_0001", role: "user", content: "Calculate", runId: RUN_ID },
+      { id: "msg_assistant_reload_0001", role: "assistant", content: "Stored answer", runId: RUN_ID },
+    ],
+  });
+  let statuses = 0;
+  let streams = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(threadId) { assert.equal(threadId, THREAD_ID); return { thread }; },
+    async runStatus(runId) {
+      statuses += 1;
+      assert.equal(runId, RUN_ID);
+      return { run: terminalRun("completed", events) };
+    },
+    async startRun() { starts += 1; throw new Error("terminal restoration must not start a run"); },
+    async resumeRun() { resumes += 1; throw new Error("terminal restoration must not resume a run"); },
+    async *streamRunEvents(options) {
+      streams += 1;
+      assert.equal(options.runId, RUN_ID);
+      assert.equal(options.threadId, THREAD_ID);
+      assert.deepEqual(options.cursor, { seq: 0, hash: ZERO_HASH });
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  const messages = browser.document.getElementById("messages");
+  assert.equal(messages.children.length, 2, "ledger replay reuses the persisted assistant message");
+  const assistant = messages.children.find((node) => node.dataset.role === "assistant");
+  assert(assistant);
+  assert.equal(assistant.dataset.runId, RUN_ID);
+  assert.match(assistant.textContent, /Restored verified answer/u);
+  assert.match(assistant.textContent, /Restored plot/u);
+  const inlineArtifacts = assistant.children.find((node) => node.className === "message-artifacts");
+  assert(inlineArtifacts);
+  assert.equal(inlineArtifacts.hidden, false);
+  assert.equal(inlineArtifacts.children.length, 1, "ledger replay projects each artifact exactly once");
+  assert.match(browser.document.getElementById("agent-plan").textContent, /Compute values/u);
+  assert.match(browser.document.getElementById("agent-timeline").textContent, /Prepared bounded plot data/u);
+  assert.equal(browser.document.getElementById("agent-artifacts").children.length, 0);
+  assert.equal(browser.document.getElementById("agent-artifacts").hidden, true);
+  assert.equal(statuses, 1);
+  assert.equal(streams, 1);
+  assert.equal(starts, 0);
+  assert.equal(resumes, 0);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Agent reload restores artifacts for every persisted assistant run from independent zero cursors", async () => {
+  const firstEvents = await verifiedEvents([
+    ["output.delta", { text: "First restored answer" }],
+    ["artifact.created", { artifact: {
+      id: ARTIFACT_ID,
+      title: "First artifact",
+      kind: "table",
+      spec: {
+        schemaVersion: "1",
+        columns: [{ key: "value", label: "Value" }],
+        rows: [{ value: 1 }],
+      },
+    } }],
+    ["run.completed", {}],
+  ]);
+  const secondEvents = await verifiedEvents([
+    ["output.delta", { text: "Second restored answer" }],
+    ["artifact.created", { artifact: {
+      id: SECOND_ARTIFACT_ID,
+      title: "Second artifact",
+      kind: "table",
+      spec: {
+        schemaVersion: "1",
+        columns: [{ key: "value", label: "Value" }],
+        rows: [{ value: 2 }],
+      },
+    } }],
+    ["run.completed", {}],
+  ], { runId: SECOND_RUN_ID });
+  const thread = agentThread({
+    lastRunId: SECOND_RUN_ID,
+    messages: [
+      // Deliberately place the declared current run before an older run. The
+      // current run must still restore last; message ordering is not authority.
+      { id: "msg_user_history_0002", role: "user", content: "Second", runId: SECOND_RUN_ID },
+      { id: "msg_assistant_history_0002", role: "assistant", content: "Stored second", runId: SECOND_RUN_ID },
+      { id: "msg_user_history_0001", role: "user", content: "First", runId: RUN_ID },
+      { id: "msg_assistant_history_0001", role: "assistant", content: "Stored first", runId: RUN_ID },
+    ],
+  });
+  const histories = new Map([
+    [RUN_ID, firstEvents],
+    [SECOND_RUN_ID, secondEvents],
+  ]);
+  const statusReads = [];
+  const streamReads = [];
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus(runId) {
+      statusReads.push(runId);
+      return { run: terminalRun("completed", histories.get(runId), { id: runId }) };
+    },
+    async startRun() { starts += 1; throw new Error("history replay must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("history replay must not resume"); },
+    async *streamRunEvents(options) {
+      streamReads.push({ runId: options.runId, cursor: options.cursor });
+      for (const event of histories.get(options.runId)) {
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      }
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  assert.deepEqual(statusReads, [RUN_ID, SECOND_RUN_ID]);
+  assert.deepEqual(streamReads, [
+    { runId: RUN_ID, cursor: { seq: 0, hash: ZERO_HASH } },
+    { runId: SECOND_RUN_ID, cursor: { seq: 0, hash: ZERO_HASH } },
+  ]);
+  const assistants = browser.document.getElementById("messages").children
+    .filter((node) => node.dataset.role === "assistant");
+  assert.equal(assistants.length, 2);
+  assert.match(assistants.find((node) => node.dataset.runId === RUN_ID).textContent, /First restored answerFirst artifact/u);
+  assert.match(assistants.find((node) => node.dataset.runId === SECOND_RUN_ID).textContent, /Second restored answerSecond artifact/u);
+  assert.equal(starts, 0);
+  assert.equal(resumes, 0);
+});
+
+test("a persisted assistant run cannot bypass exact terminal replay by also being lastRunId", async () => {
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_assistant_nonterminal_0001", role: "assistant", content: "Stored fallback", runId: RUN_ID }],
+  });
+  let streams = 0;
+  let starts = 0;
+  let resumes = 0;
+  let cancellations = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() { return { run: run("running") }; },
+    async startRun() { starts += 1; throw new Error("invalid history must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("invalid history must not resume"); },
+    async cancelRun() { cancellations += 1; throw new Error("invalid history must not cancel"); },
+    async *streamRunEvents() { streams += 1; },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  assert.equal(streams, 0, "persisted assistant content requires a terminal cursor-bound replay");
+  assert.match(browser.document.getElementById("messages").textContent, /Stored fallback/u);
+  assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/u);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  await browser.app.resume();
+  await browser.app.stop();
+  assert.deepEqual({ starts, resumes, cancellations }, { starts: 0, resumes: 0, cancellations: 0 });
+});
+
+test("terminal mutation and status responses remain nonterminal until a verified terminal event", async () => {
+  let streams = 0;
+  let statuses = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("completed") }; },
+    async runStatus() { statuses += 1; return { run: run("completed") }; },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams > 1) throw Object.assign(new Error("terminal event unavailable"), { retryable: false });
+      // A clean EOF, even after two terminal RPC payloads, is not completion.
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Finish immediately";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(streams, 2);
+  assert.equal(statuses, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "running");
+  assert.notEqual(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.match(browser.document.getElementById("toast").textContent, /still owned by AgInTi/u);
+});
+
+test("Agent resume binds the response to the exact requested run before opening a stream", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  let streams = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(runId) {
+      resumes += 1;
+      assert.equal(runId, RUN_ID);
+      return { run: run("running", { id: SECOND_RUN_ID }) };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 1) yield { event: failed, cursor: { seq: failed.seq, hash: failed.hash } };
+      else throw new Error("a mismatched resume response must not open another stream");
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Fail, then resume safely";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+
+  await browser.app.resume();
+
+  assert.equal(resumes, 1);
+  assert.equal(streams, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+  assert.match(browser.document.getElementById("toast").textContent, /could not resume this run/u);
+});
+
+test("terminal cancel response waits for the verified cancelled event without aborting its stream", async () => {
+  const [partial, cancelled] = await verifiedEvents([
+    ["output.delta", { text: "Partial answer" }],
+    ["run.cancelled", {}],
+  ]);
+  const entered = Promise.withResolvers();
+  const failOldStream = Promise.withResolvers();
+  const cancelEntered = Promise.withResolvers();
+  const cancelResponse = Promise.withResolvers();
+  const reconnectEntered = Promise.withResolvers();
+  const releaseTerminal = Promise.withResolvers();
+  let cancellations = 0;
+  let streams = 0;
+  let starts = 0;
+  const savedCursors = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { starts += 1; return { run: run("running") }; },
+    async cancelRun(runId) {
+      cancellations += 1;
+      assert.equal(runId, RUN_ID);
+      cancelEntered.resolve();
+      return await cancelResponse.promise;
+    },
+    async *streamRunEvents({ signal, onCursor }) {
+      streams += 1;
+      if (streams === 1) {
+        await onCursor({ seq: partial.seq, hash: partial.hash });
+        yield { event: partial, cursor: { seq: partial.seq, hash: partial.hash } };
+        entered.resolve();
+        await failOldStream.promise;
+        throw Object.assign(new Error("old reader ended during cancellation"), { retryable: false });
+      }
+      assert.equal(onCursor, undefined, "forced zero-cursor cancellation replay must not roll back the durable live cursor");
+      reconnectEntered.resolve();
+      await releaseTerminal.promise;
+      assert.equal(signal.aborted, false, "the replacement read-only stream remains owned");
+      yield { event: partial, cursor: { seq: partial.seq, hash: partial.hash } };
+      yield { event: cancelled, cursor: { seq: cancelled.seq, hash: cancelled.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    cursorStore: { async save(value) { savedCursors.push(value.cursor); } },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Cancel safely";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await entered.promise;
+  const stopping = browser.app.stop();
+  await cancelEntered.promise;
+  await browser.app.stop();
+  assert.equal(cancellations, 1, "Stop is single-flight before its RPC response");
+  failOldStream.resolve();
+  await submission;
+  browser.app.setMode("chat");
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent", "navigation stays fenced while cancellation is unresolved");
+  browser.document.getElementById("message-input").value = "Must remain a draft";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts, 1, "the pending cancellation cannot dispatch new Agent work");
+  assert.equal(browser.document.getElementById("message-input").value, "Must remain a draft");
+
+  cancelResponse.resolve({ run: run("cancelled") });
+  await stopping;
+  await reconnectEntered.promise;
+
+  assert.equal(cancellations, 1);
+  assert.equal(streams, 2, "a fresh read-only ledger stream replaces the failed reader");
+  assert.deepEqual(savedCursors, [{ seq: partial.seq, hash: partial.hash }]);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "running");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Cancelling");
+  releaseTerminal.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "cancelled");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Cancelled");
+});
+
+test("corrupt cancellation replay fails closed but releases read-only reopen without exposing mutations", async () => {
+  const entered = Promise.withResolvers();
+  let streams = 0;
+  let starts = 0;
+  let cancellations = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { starts += 1; return { run: run("running") }; },
+    async cancelRun() { cancellations += 1; return { run: run("cancelled") }; },
+    async resumeRun() { resumes += 1; throw new Error("corrupt cancellation history must not resume"); },
+    async *streamRunEvents({ signal }) {
+      streams += 1;
+      if (streams === 1) {
+        entered.resolve();
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        return;
+      }
+      yield { event: Object.freeze({}), cursor: { seq: 1, hash: "f".repeat(64) } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Cancel then corrupt";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await entered.promise;
+  await browser.app.stop();
+  await submission;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(streams, 2);
+  assert.match(browser.document.getElementById("toast").textContent, /Reopen this conversation.*no run was resumed/u);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.equal(browser.document.getElementById("thread-list").children[0].disabled, false, "read-only reopen remains available");
+  browser.document.getElementById("new-thread").dispatch("click");
+  assert.match(browser.document.getElementById("toast").textContent, /Reopen an Agent conversation/u);
+  browser.document.getElementById("message-input").value = "Must remain a draft";
+  await browser.app.submitMessage({ preventDefault() {} });
+  await browser.app.resume();
+  await browser.app.stop();
+  assert.equal(browser.document.getElementById("message-input").value, "Must remain a draft");
+  assert.deepEqual({ starts, cancellations, resumes }, { starts: 1, cancellations: 1, resumes: 0 });
+});
+
+test("a verified terminal event wins over a later cancellation RPC rejection", async () => {
+  const cancelled = await verifiedEvent({ seq: 1, type: "run.cancelled", payload: {}, previousHash: ZERO_HASH });
+  const streamEntered = Promise.withResolvers();
+  const releaseTerminal = Promise.withResolvers();
+  const cancelEntered = Promise.withResolvers();
+  const cancelResponse = Promise.withResolvers();
+  let cancellations = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async cancelRun() {
+      cancellations += 1;
+      cancelEntered.resolve();
+      return await cancelResponse.promise;
+    },
+    async *streamRunEvents() {
+      streamEntered.resolve();
+      await releaseTerminal.promise;
+      yield { event: cancelled, cursor: { seq: cancelled.seq, hash: cancelled.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Race cancellation";
+  const submission = browser.app.submitMessage({ preventDefault() {} });
+  await streamEntered.promise;
+  const stopping = browser.app.stop();
+  await cancelEntered.promise;
+  releaseTerminal.resolve();
+  await submission;
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "cancelled");
+
+  cancelResponse.reject(new Error("late cancellation response lost"));
+  await stopping;
+  assert.equal(cancellations, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "cancelled");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Cancelled");
+  assert.equal(browser.document.getElementById("stop-run").hidden, true);
+  assert.doesNotMatch(browser.document.getElementById("toast").textContent, /cancellation could not be confirmed/iu);
+});
+
+test("terminal status payload plus truncated EOF is not completion and cannot expose any Agent mutation", async () => {
+  const events = await verifiedEvents([
+    ["run.status", { status: "completed" }],
+  ]);
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_assistant_truncated_0001", role: "assistant", content: "Stored safe answer", runId: RUN_ID }],
+  });
+  let starts = 0;
+  let resumes = 0;
+  let cancellations = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() { return { run: terminalRun("completed", events) }; },
+    async startRun() { starts += 1; throw new Error("failed replay must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("failed replay must not resume"); },
+    async cancelRun() { cancellations += 1; throw new Error("failed replay must not cancel"); },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      // A clean but truncated EOF is not a terminal ledger event.
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  assert.match(browser.document.getElementById("toast").textContent, /Reopen this conversation.*no run was resumed/u);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.match(browser.document.getElementById("messages").textContent, /Stored safe answer/u);
+  await browser.app.resume();
+  await browser.app.stop();
+  browser.document.getElementById("message-input").value = "Must remain a draft";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("message-input").value, "Must remain a draft");
+  assert.deepEqual({ starts, resumes, cancellations }, { starts: 0, resumes: 0, cancellations: 0 });
+});
+
+test("an in-progress read-only terminal restoration blocks start, resume, and cancellation races", async () => {
+  const events = await verifiedEvents([["run.completed", {}]]);
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_assistant_restore_race_0001", role: "assistant", content: "Stored answer", runId: RUN_ID }],
+  });
+  let starts = 0;
+  let resumes = 0;
+  let cancellations = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() { return { run: terminalRun("completed", events) }; },
+    async startRun() { starts += 1; throw new Error("restoration must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("restoration must not resume"); },
+    async cancelRun() { cancellations += 1; throw new Error("restoration must not cancel"); },
+    async *streamRunEvents() {
+      entered.resolve();
+      await release.promise;
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  const initializing = browser.app.initialize();
+  await entered.promise;
+
+  await browser.app.resume();
+  await browser.app.stop();
+  browser.document.getElementById("message-input").value = "Preserved while restoring";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("message-input").value, "Preserved while restoring");
+  assert.deepEqual({ starts, resumes, cancellations }, { starts: 0, resumes: 0, cancellations: 0 });
+
+  release.resolve();
+  await initializing;
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Agent hydration is mutation-locked before its thread list resolves", async () => {
+  const listEntered = Promise.withResolvers();
+  const releaseList = Promise.withResolvers();
+  let creates = 0;
+  let starts = 0;
+  let resumes = 0;
+  let cancellations = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { listEntered.resolve(); return await releaseList.promise; },
+    async createThread() { creates += 1; throw new Error("hydration must not create"); },
+    async startRun() { starts += 1; throw new Error("hydration must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("hydration must not resume"); },
+    async cancelRun() { cancellations += 1; throw new Error("hydration must not cancel"); },
+  };
+  const browser = harness({ agent });
+  const initializing = browser.app.initialize();
+  await listEntered.promise;
+  browser.document.getElementById("message-input").value = "Keep this draft";
+  await browser.app.submitMessage({ preventDefault() {} });
+  await browser.app.resume();
+  await browser.app.stop();
+  assert.equal(browser.document.getElementById("message-input").value, "Keep this draft");
+  assert.deepEqual({ creates, starts, resumes, cancellations }, { creates: 0, starts: 0, resumes: 0, cancellations: 0 });
+
+  releaseList.resolve({ schemaVersion: "1", threads: [], nextBefore: null });
+  await initializing;
+});
+
+test("a buffered event from an abandoned Agent view cannot mutate the successor Chat view", async () => {
+  const stale = await verifiedEvent({ seq: 1, type: "output.delta", payload: { text: "STALE PRIVATE OUTPUT" }, previousHash: ZERO_HASH });
+  const streamEntered = Promise.withResolvers();
+  const releaseStale = Promise.withResolvers();
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_user_stale_0001", role: "user", content: "Old work", runId: RUN_ID }],
+  });
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() { return { run: run("running") }; },
+    async *streamRunEvents() {
+      streamEntered.resolve();
+      await releaseStale.promise;
+      yield { event: stale, cursor: { seq: stale.seq, hash: stale.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  const initializing = browser.app.initialize();
+  await streamEntered.promise;
+  browser.app.setMode("chat");
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  releaseStale.resolve();
+  await initializing;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  assert.doesNotMatch(browser.document.getElementById("messages").textContent, /STALE PRIVATE OUTPUT/u);
+  assert.equal(browser.document.getElementById("stop-run").hidden, true);
+});
+
+test("terminal Agent replay rejects status, sequence, and hash mismatches against runStatus", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "Unbound output" }],
+    ["run.completed", {}],
+  ]);
+  const exact = terminalRun("completed", events);
+  const cases = [
+    { label: "status", run: terminalRun("failed", events) },
+    { label: "sequence", run: { ...exact, eventCursor: { ...exact.eventCursor, lastSeq: exact.eventCursor.lastSeq + 1 } } },
+    { label: "hash", run: { ...exact, eventCursor: { ...exact.eventCursor, lastHash: "f".repeat(64) } } },
+  ];
+  for (const candidate of cases) {
+    const thread = agentThread({
+      lastRunId: RUN_ID,
+      messages: [{ id: `msg_assistant_${candidate.label}_0001`, role: "assistant", content: "Stored fallback", runId: RUN_ID }],
+    });
+    let resumes = 0;
+    const agent = {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { thread }; },
+      async runStatus() { return { run: candidate.run }; },
+      async resumeRun() { resumes += 1; throw new Error("mismatched replay must not resume"); },
+      async *streamRunEvents() {
+        for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    };
+    const browser = harness({ agent });
+    await browser.app.initialize();
+    assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/u, candidate.label);
+    assert.equal(browser.document.getElementById("resume-run").hidden, true, candidate.label);
+    assert.match(browser.document.getElementById("messages").textContent, /Stored fallback/u, candidate.label);
+    assert.doesNotMatch(browser.document.getElementById("messages").textContent, /Unbound output/u, candidate.label);
+    await browser.app.resume();
+    assert.equal(resumes, 0, candidate.label);
+  }
+});
+
+test("live Agent artifacts render inline beneath their exact assistant run", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "Live answer" }],
+    ["artifact.created", { artifact: {
+      id: ARTIFACT_ID,
+      title: "Live table",
+      kind: "table",
+      spec: {
+        schemaVersion: "1",
+        columns: [{ key: "value", label: "Value" }],
+        rows: [{ value: 2 }],
+      },
+    } }],
+    ["run.completed", {}],
+  ]);
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun(threadId) { starts += 1; assert.equal(threadId, THREAD_ID); return { run: run() }; },
+    async resumeRun() { resumes += 1; throw new Error("live completion must not resume"); },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Calculate live";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  const messages = browser.document.getElementById("messages");
+  assert.equal(messages.children.length, 2);
+  const assistant = messages.children.find((node) => node.dataset.runId === RUN_ID);
+  assert(assistant);
+  assert.match(assistant.textContent, /Live answer/u);
+  assert.match(assistant.textContent, /Live table/u);
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0);
+});
+
+test("completed Agent reload rejects a run from a different thread before event replay", async () => {
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_user_mismatch_0001", role: "user", content: "Calculate", runId: RUN_ID }],
+  });
+  let streams = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() {
+      return { run: { ...run("completed"), threadId: "thr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } };
+    },
+    async startRun() { starts += 1; throw new Error("mismatched restoration must not start"); },
+    async resumeRun() { resumes += 1; throw new Error("mismatched restoration must not resume"); },
+    async *streamRunEvents() { streams += 1; },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+
+  assert.equal(streams, 0);
+  assert.equal(starts, 0);
+  assert.equal(resumes, 0);
+  assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/u);
+  assert.equal(browser.document.getElementById("agent-artifacts").children.length, 0);
 });
 
 test("chat startup overlaps capabilities with one thread list and overlaps the first verified ledger page", async () => {

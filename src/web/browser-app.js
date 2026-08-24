@@ -623,6 +623,55 @@ function safeRunStatus(value) {
   return ["starting", "running", "completed", "failed", "cancelled"].includes(value) ? value : "running";
 }
 
+function eventAwaitingRunStatus(value) {
+  const status = safeRunStatus(value);
+  return TERMINAL.has(status) ? "running" : status;
+}
+
+function correlatedAgentRun(value, { runId, threadId }) {
+  if (!value || typeof value !== "object" || value.id !== runId || value.threadId !== threadId) {
+    throw new AgintiProtocolError("Agent run ownership does not match the requested thread", {
+      code: "LEDGER_OWNERSHIP_MISMATCH",
+    });
+  }
+  return value;
+}
+
+function assertTerminalAgentReplay(run, snapshot) {
+  const cursor = run?.eventCursor;
+  if (!TERMINAL.has(run?.status)
+      || snapshot?.terminalStatus !== run.status
+      || snapshot.status !== run.status
+      || !cursor || typeof cursor !== "object"
+      || cursor.firstSeq !== 1 || cursor.prunedThroughSeq !== 0
+      || snapshot.cursor.seq !== cursor.lastSeq
+      || snapshot.cursor.hash !== cursor.lastHash) {
+    throw new AgintiProtocolError("Agent terminal history does not match its authoritative cursor", {
+      code: "LEDGER_TERMINAL_MISMATCH",
+    });
+  }
+  return snapshot;
+}
+
+function persistedAssistantRuns(thread) {
+  const result = [];
+  const seen = new Set();
+  const persisted = new Set();
+  for (const message of Array.isArray(thread?.messages) ? thread.messages : []) {
+    if (message?.role !== "assistant") continue;
+    persisted.add(message.runId);
+    if (message.runId === thread?.lastRunId || seen.has(message.runId)) continue;
+    seen.add(message.runId);
+    result.push(Object.freeze({ runId: message.runId, persisted: true }));
+  }
+  // The thread's declared current run is always restored last even if a
+  // hostile-but-schema-valid message ordering places it earlier in history.
+  if (thread?.lastRunId) {
+    result.push(Object.freeze({ runId: thread.lastRunId, persisted: persisted.has(thread.lastRunId) }));
+  }
+  return Object.freeze(result);
+}
+
 function loginFailureMessage(error) {
   const status = Number(error?.status ?? error?.statusCode ?? 0);
   if (status === 401 || status === 403) return "Sign-in failed. Check the account and try again.";
@@ -813,6 +862,12 @@ export function createBrowserApp({
     agentRunStatus: null,
     presentation: null,
     assistantNode: null,
+    agentRunMessages: new Map(),
+    agentHistoryRestoring: false,
+    agentReplayValidating: false,
+    agentReplayFailed: false,
+    agentReplayOfferResume: true,
+    agentCancelPending: false,
     streamAbort: null,
     streamKind: null,
     viewEpoch: 0,
@@ -1021,7 +1076,8 @@ export function createBrowserApp({
 
   function interactionLocked() {
     return state.busy || state.logoutPending || state.chatFinalization !== null
-      || state.authRecoveryGeneration !== null;
+      || state.authRecoveryGeneration !== null
+      || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending;
   }
 
   function updateImageControl() {
@@ -1286,6 +1342,7 @@ export function createBrowserApp({
     elements.agent_plan.replaceChildren();
     elements.agent_timeline.replaceChildren();
     elements.agent_artifacts.replaceChildren();
+    elements.agent_artifacts.hidden = true;
     elements.context_indicator.hidden = true;
     elements.welcome.hidden = false;
     elements.run_state.textContent = "Idle";
@@ -1294,6 +1351,11 @@ export function createBrowserApp({
     elements.resume_run.hidden = true;
     state.presentation = null;
     state.assistantNode = null;
+    state.agentRunMessages.clear();
+    state.agentHistoryRestoring = false;
+    state.agentReplayValidating = false;
+    state.agentReplayOfferResume = true;
+    state.agentCancelPending = false;
   }
 
   function fenceAttachmentRestorationsForSend() {
@@ -1503,6 +1565,13 @@ export function createBrowserApp({
     body.className = "message-content";
     renderer.renderMarkdown(body, content);
     article.appendChild(body);
+    if (role === "assistant" && runId && state.mode === "agent") {
+      const artifacts = document.createElement("div");
+      artifacts.className = "message-artifacts";
+      artifacts.hidden = true;
+      article.appendChild(artifacts);
+      state.agentRunMessages.set(runId, Object.freeze({ body, artifacts, persistedContent: content }));
+    }
     elements.messages.appendChild(article);
     elements.welcome.hidden = true;
     return body;
@@ -1555,12 +1624,49 @@ export function createBrowserApp({
     if (state.mode === "chat") renderThreads();
   }
 
+  function renderAgentArtifacts(target, artifacts) {
+    target.replaceChildren();
+    target.hidden = artifacts.length === 0;
+    artifacts.forEach((artifact) => {
+      const section = document.createElement("section");
+      section.className = "artifact";
+      const heading = document.createElement("h3");
+      heading.textContent = artifact.title;
+      section.appendChild(heading);
+      const body = document.createElement("div");
+      renderer.renderArtifact(body, artifact);
+      section.appendChild(body);
+      target.appendChild(section);
+    });
+  }
+
+  function resetAgentRunPresentation(runId) {
+    const runMessage = state.agentRunMessages.get(runId);
+    if (!runMessage) return;
+    renderer.renderMarkdown(runMessage.body, runMessage.persistedContent);
+    runMessage.artifacts.replaceChildren();
+    runMessage.artifacts.hidden = true;
+  }
+
   function renderPresentation(snapshot) {
-    state.agentRunStatus = safeRunStatus(snapshot.status);
-    elements.workspace.dataset.status = snapshot.status;
-    elements.run_state.textContent = statusLabel(snapshot.status);
-    if (!state.assistantNode) state.assistantNode = messageNode("assistant", "", { runId: snapshot.runId });
-    renderer.renderMarkdown(state.assistantNode, snapshot.output);
+    const releaseCancellationFence = snapshot.terminalStatus !== null && state.agentCancelPending;
+    if (releaseCancellationFence) state.agentCancelPending = false;
+    const projectedStatus = safeRunStatus(snapshot.status);
+    const visibleStatus = state.agentReplayValidating && TERMINAL.has(projectedStatus)
+      ? "running"
+      : projectedStatus;
+    state.agentRunStatus = visibleStatus;
+    elements.workspace.dataset.status = visibleStatus;
+    elements.run_state.textContent = statusLabel(visibleStatus);
+    let runMessage = state.agentRunMessages.get(snapshot.runId);
+    if (!runMessage) {
+      messageNode("assistant", "", { runId: snapshot.runId });
+      runMessage = state.agentRunMessages.get(snapshot.runId);
+    }
+    if (!runMessage) throw new TypeError("Agent assistant message presentation is unavailable");
+    state.assistantNode = runMessage.body;
+    renderer.renderMarkdown(runMessage.body, snapshot.output);
+    renderAgentArtifacts(runMessage.artifacts, snapshot.artifacts);
     elements.agent_plan.replaceChildren();
     snapshot.plan.forEach((step) => {
       const item = document.createElement("li");
@@ -1580,105 +1686,169 @@ export function createBrowserApp({
       elements.context_indicator_text.textContent = `${snapshot.compaction.compactedMessages} earlier messages were compacted by AgInTi (${snapshot.compaction.tokensBefore} → ${snapshot.compaction.tokensAfter} tokens).`;
     }
     elements.agent_artifacts.replaceChildren();
-    snapshot.artifacts.forEach((artifact) => {
-      const section = document.createElement("section");
-      section.className = "artifact";
-      const heading = document.createElement("h3");
-      heading.textContent = artifact.title;
-      section.appendChild(heading);
-      const body = document.createElement("div");
-      renderer.renderArtifact(body, artifact);
-      section.appendChild(body);
-      elements.agent_artifacts.appendChild(section);
-    });
-    const isTerminal = TERMINAL.has(snapshot.status);
-    elements.stop_run.hidden = isTerminal || !state.capabilities.actions.cancel;
-    elements.resume_run.hidden = snapshot.status !== "failed" && snapshot.status !== "cancelled";
+    elements.agent_artifacts.hidden = true;
+    const isTerminal = TERMINAL.has(visibleStatus);
+    elements.stop_run.hidden = isTerminal || state.agentCancelPending || !state.capabilities.actions.cancel;
+    elements.resume_run.hidden = state.agentReplayValidating
+      || state.agentReplayFailed
+      || !state.agentReplayOfferResume
+      || !state.capabilities.actions.resume
+      || (visibleStatus !== "failed" && visibleStatus !== "cancelled");
+    if (releaseCancellationFence) updateImageControl();
   }
 
-  async function streamAgentRun(run, { cursor } = {}) {
+  async function streamAgentRun(run, {
+    cursor,
+    expectedRunId = run?.id,
+    expectedThreadId = run?.threadId,
+    replayTerminal = false,
+    offerResume = true,
+    cancelPending = false,
+  } = {}) {
+    correlatedAgentRun(run, { runId: expectedRunId, threadId: expectedThreadId });
+    if (replayTerminal && cursor !== undefined) throw new TypeError("terminal Agent replay must start from cursor zero");
+    state.agentReplayValidating = replayTerminal;
+    state.agentReplayFailed = false;
+    state.agentReplayOfferResume = offerResume;
+    state.agentCancelPending = cancelPending;
     state.runId = run.id;
-    state.agentRunStatus = safeRunStatus(run.status);
-    state.presentation = createRunPresentation({ runId: run.id, threadId: run.threadId, cursor });
-    state.assistantNode = null;
+    // RPC response statuses can help project progress, but terminal authority
+    // belongs only to a verified hash-chained terminal event.
+    const initialStatus = replayTerminal ? "running" : eventAwaitingRunStatus(run.status);
+    state.agentRunStatus = initialStatus;
+    const agent = state.agent;
+    const streamEpoch = state.viewEpoch;
+    const presentation = createRunPresentation({ runId: run.id, threadId: run.threadId, cursor });
+    state.presentation = presentation;
+    state.assistantNode = state.agentRunMessages.get(run.id)?.body ?? null;
     state.streamAbort?.abort();
     const controller = new AbortController();
     state.streamAbort = controller;
     state.streamKind = "agent";
-    elements.workspace.dataset.status = safeRunStatus(run.status);
-    elements.run_state.textContent = statusLabel(safeRunStatus(run.status));
-    elements.stop_run.hidden = !state.capabilities.actions.cancel;
+    const ownsStream = () => !controller.signal.aborted
+      && state.streamAbort === controller
+      && state.presentation === presentation
+      && state.agent === agent
+      && state.viewEpoch === streamEpoch;
+    elements.workspace.dataset.status = initialStatus;
+    elements.run_state.textContent = replayTerminal ? "Restoring" : cancelPending ? "Cancelling" : statusLabel(initialStatus);
+    elements.stop_run.hidden = replayTerminal || cancelPending || !state.capabilities.actions.cancel;
     elements.resume_run.hidden = true;
+    if (replayTerminal) connection("Restoring verified Agent history", false);
     let recoveries = 0;
     try {
-      while (!controller.signal.aborted) {
+      while (ownsStream()) {
         let failure = null;
         try {
-          for await (const { event } of state.agent.streamRunEvents({
+          for await (const { event } of agent.streamRunEvents({
             runId: run.id,
             threadId: run.threadId,
-            cursor: state.presentation.snapshot().cursor,
+            cursor: presentation.snapshot().cursor,
             maxReconnects: 0,
             signal: controller.signal,
-            onCursor: cursorStore ? async (next) => cursorStore.save({ runId: run.id, threadId: run.threadId, cursor: next }) : undefined,
+            onCursor: cursorStore && !replayTerminal && !cancelPending
+              ? async (next) => cursorStore.save({ runId: run.id, threadId: run.threadId, cursor: next })
+              : undefined,
           })) {
-            renderPresentation(state.presentation.apply(event));
+            if (!ownsStream()) return;
+            renderPresentation(presentation.apply(event));
           }
         } catch (error) {
-          if (controller.signal.aborted) return;
+          if (!ownsStream()) return;
           failure = error;
         }
-        const snapshot = state.presentation.snapshot();
-        if (TERMINAL.has(snapshot.status)) {
+        if (!ownsStream()) return;
+        const snapshot = presentation.snapshot();
+        if (replayTerminal) {
+          if (failure) throw failure;
+          assertTerminalAgentReplay(run, snapshot);
+          state.agentReplayValidating = false;
+          renderPresentation(snapshot);
+          connection("Connected");
+          return;
+        }
+        if (snapshot.terminalStatus !== null) {
           connection("Connected");
           return;
         }
         if (failure instanceof AgintiProtocolError || (failure && failure.retryable !== true)) throw failure;
         let authoritativeRun = null;
         try {
-          const response = await state.agent.runStatus(run.id, { signal: controller.signal });
-          authoritativeRun = response.run;
+          const response = await agent.runStatus(run.id, { signal: controller.signal });
+          if (!ownsStream()) return;
+          authoritativeRun = correlatedAgentRun(response.run, { runId: run.id, threadId: run.threadId });
         } catch (error) {
-          if (controller.signal.aborted) return;
+          if (!ownsStream()) return;
           if (error instanceof AgintiProtocolError || error?.retryable === false) throw error;
         }
-        if (authoritativeRun && TERMINAL.has(authoritativeRun.status)) {
-          state.agentRunStatus = authoritativeRun.status;
-          elements.workspace.dataset.status = authoritativeRun.status;
-          elements.run_state.textContent = statusLabel(authoritativeRun.status);
-          if (!state.assistantNode) state.assistantNode = messageNode("assistant", "", { runId: authoritativeRun.id });
-          renderer.renderMarkdown(state.assistantNode, authoritativeRun.output);
-          elements.resume_run.hidden = authoritativeRun.status === "completed" || !state.capabilities.actions.resume;
-          connection("Connected");
-          return;
-        }
         recoveries += 1;
-        connection("Reconnecting to AgInTi", false);
+        connection(authoritativeRun && TERMINAL.has(authoritativeRun.status)
+          ? "Waiting for verified Agent completion"
+          : "Reconnecting to AgInTi", false);
         const backoffStep = Math.min(recoveries - 1, maxStreamBackoffSteps);
         await wait(Math.min(4_000, 250 * (2 ** backoffStep)), controller.signal);
       }
     } catch (error) {
-      if (controller.signal.aborted) return;
-      elements.resume_run.hidden = !state.capabilities.actions.resume;
-      connection("Agent stream interrupted", false);
-      showToast("The Agent run is still owned by AgInTi. Resume reconnects without restarting it.");
+      if (!ownsStream()) return;
+      if (replayTerminal) {
+        state.agentReplayValidating = false;
+        state.agentReplayFailed = true;
+        state.agentReplayOfferResume = false;
+        resetAgentRunPresentation(run.id);
+        elements.agent_plan.replaceChildren();
+        elements.agent_timeline.replaceChildren();
+        elements.resume_run.hidden = true;
+        connection("Agent history unavailable", false);
+        throw error;
+      }
+      if (cancelPending) {
+        state.agentCancelPending = false;
+        state.agentReplayFailed = true;
+        state.agentReplayOfferResume = false;
+        resetAgentRunPresentation(run.id);
+        elements.agent_plan.replaceChildren();
+        elements.agent_timeline.replaceChildren();
+        elements.stop_run.hidden = true;
+        elements.resume_run.hidden = true;
+        updateImageControl();
+        connection("Agent cancellation history unavailable", false);
+        showToast("Verified cancellation history could not be restored safely. Reopen this conversation to retry; no run was resumed.");
+        return;
+      }
+      elements.resume_run.hidden = state.agentCancelPending || !state.capabilities.actions.resume;
+      connection(state.agentCancelPending ? "Confirming Agent cancellation" : "Agent stream interrupted", false);
+      showToast(state.agentCancelPending
+        ? "Cancellation is being confirmed. Its verified history will reconnect automatically."
+        : "The Agent run is still owned by AgInTi. Resume reconnects without restarting it.");
     } finally {
       if (state.streamAbort === controller) {
         state.streamAbort = null;
         state.streamKind = null;
+        elements.stop_run.hidden = true;
       }
-      elements.stop_run.hidden = true;
     }
   }
 
   async function openAgentThread(threadId, { expectedEpoch = state.viewEpoch } = {}) {
-    if (!state.capabilities.enabled) return;
+    if (!state.capabilities.enabled || state.mode !== "agent" || state.viewEpoch !== expectedEpoch) return;
+    const session = state.session;
+    const agent = state.agent;
+    const current = () => state.session === session
+      && state.agent === agent
+      && state.mode === "agent"
+      && state.viewEpoch === expectedEpoch;
+    state.agentHistoryRestoring = true;
+    updateImageControl();
     try {
-      const session = state.session;
-      const agent = state.agent;
       const { thread } = await agent.getThread(threadId);
-      if (state.session !== session || state.agent !== agent || state.mode !== "agent" || state.viewEpoch !== expectedEpoch) return;
+      if (!current()) return;
+      if (thread.id !== threadId) {
+        throw new AgintiProtocolError("Agent thread ownership does not match the requested thread", {
+          code: "LEDGER_OWNERSHIP_MISMATCH",
+        });
+      }
       clearConversation();
+      state.agentHistoryRestoring = true;
       state.agentThreadId = thread.id;
       state.runId = null;
       state.agentRunStatus = null;
@@ -1689,13 +1859,43 @@ export function createBrowserApp({
         elements.context_indicator.hidden = false;
         elements.context_indicator_text.textContent = `${thread.authority.lastCompaction.compactedMessages} earlier messages were compacted by AgInTi.`;
       }
-      if (thread.lastRunId) {
-        const { run } = await agent.runStatus(thread.lastRunId);
-        if (state.session !== session || state.agent !== agent || state.mode !== "agent" || state.viewEpoch !== expectedEpoch) return;
-        if (!TERMINAL.has(run.status)) await streamAgentRun(run);
+      const runs = persistedAssistantRuns(thread);
+      for (const requested of runs) {
+        const requestedRunId = requested.runId;
+        const { run } = await agent.runStatus(requestedRunId);
+        if (!current()) return;
+        correlatedAgentRun(run, { runId: requestedRunId, threadId: thread.id });
+        const terminal = TERMINAL.has(run.status);
+        if (!terminal && (requested.persisted || requestedRunId !== thread.lastRunId)) {
+          throw new AgintiProtocolError("A persisted Agent assistant run is not terminal", {
+            code: "LEDGER_TERMINAL_MISMATCH",
+          });
+        }
+        // Once every historical run is restored, the current live run resumes
+        // its normal cancel/reconnect controls rather than staying read-only.
+        if (!terminal) state.agentHistoryRestoring = false;
+        await streamAgentRun(run, {
+          expectedRunId: requestedRunId,
+          expectedThreadId: thread.id,
+          replayTerminal: terminal,
+          offerResume: requestedRunId === thread.lastRunId,
+        });
+        if (!current()) return;
       }
+      if (thread.lastRunId === null) state.runId = null;
+      state.agentReplayFailed = false;
     } catch {
-      showToast("This AgInTi thread could not be opened safely.");
+      if (!current()) return;
+      state.agentReplayValidating = false;
+      state.agentReplayFailed = true;
+      state.agentReplayOfferResume = false;
+      elements.resume_run.hidden = true;
+      showToast("Verified Agent history could not be restored safely. Reopen this conversation to retry; no run was resumed.");
+    } finally {
+      if (current()) {
+        state.agentHistoryRestoring = false;
+        updateImageControl();
+      }
     }
   }
 
@@ -2240,23 +2440,37 @@ export function createBrowserApp({
   async function restoreModeView({ autoOpen = false, prefetchedChatThreads = null } = {}) {
     const mode = state.mode;
     const epoch = ++state.viewEpoch;
+    const preferred = mode === "agent" ? state.agentThreadId : state.chatThreadId;
     state.streamAbort?.abort();
     clearConversation();
     elements.conversation_title.textContent = "New conversation";
-    if (mode === "agent") await loadAgentThreads();
-    else await loadChatThreads({ prefetched: prefetchedChatThreads });
-    if (epoch !== state.viewEpoch || mode !== state.mode) return;
-    const preferred = mode === "agent" ? state.agentThreadId : state.chatThreadId;
-    const available = currentThreads();
-    const selected = available.find((thread) => (mode === "agent" ? thread.id : thread.threadId) === preferred) ?? available[0];
-    if (!autoOpen || !selected) return;
-    const threadId = mode === "agent" ? selected.id : selected.threadId;
-    if (mode === "agent") await openAgentThread(threadId);
-    else await openChatThread(threadId, {
-      backgroundStream: true,
-      threadHint: selected,
-      refreshThreadList: false,
-    });
+    if (mode === "agent") {
+      state.agentHistoryRestoring = true;
+      state.agentThreadId = null;
+      state.runId = null;
+      state.agentRunStatus = null;
+      updateImageControl();
+    }
+    try {
+      if (mode === "agent") await loadAgentThreads();
+      else await loadChatThreads({ prefetched: prefetchedChatThreads });
+      if (epoch !== state.viewEpoch || mode !== state.mode) return;
+      const available = currentThreads();
+      const selected = available.find((thread) => (mode === "agent" ? thread.id : thread.threadId) === preferred) ?? available[0];
+      if (!autoOpen || !selected) return;
+      const threadId = mode === "agent" ? selected.id : selected.threadId;
+      if (mode === "agent") await openAgentThread(threadId);
+      else await openChatThread(threadId, {
+        backgroundStream: true,
+        threadHint: selected,
+        refreshThreadList: false,
+      });
+    } finally {
+      if (mode === "agent" && epoch === state.viewEpoch && mode === state.mode) {
+        state.agentHistoryRestoring = false;
+        updateImageControl();
+      }
+    }
   }
 
   async function sendAgent(text) {
@@ -2276,7 +2490,8 @@ export function createBrowserApp({
     messageNode("user", text);
     const { run } = await agent.startRun(threadId, text);
     if (!current()) return;
-    await streamAgentRun(run);
+    correlatedAgentRun(run, { runId: run?.id, threadId });
+    await streamAgentRun(run, { expectedThreadId: threadId });
   }
 
   function workflowAttachmentFields(attachments) {
@@ -2578,6 +2793,12 @@ export function createBrowserApp({
   async function submitMessage(event) {
     event?.preventDefault?.();
     if (interactionLocked() || !state.session.authenticated) return;
+    if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed)) {
+      showToast(state.agentHistoryRestoring
+        ? "Wait for verified Agent history to finish restoring before creating more work."
+        : "Reopen this conversation before creating more Agent work; its verified history is not available yet.");
+      return;
+    }
     if (state.mode === "chat" && state.chatPendingSend) {
       showToast("The previous durable send is awaiting confirmation. Use Resume; this draft and its images were not changed.");
       return;
@@ -2756,6 +2977,7 @@ export function createBrowserApp({
       state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
+      state.agentReplayFailed = false;
       clearConversation();
       state.agent = createAgentClient(state.session);
       state.chat = createChatClient(state.session);
@@ -3002,6 +3224,7 @@ export function createBrowserApp({
     updateImageControl();
     state.runId = null;
     state.agentRunStatus = null;
+    state.agentReplayFailed = false;
     clearConversation();
     purgeAttachmentBlobCache();
     showLogin();
@@ -3012,12 +3235,64 @@ export function createBrowserApp({
   }
 
   async function stop() {
-    if (state.mode === "agent" && state.runId && state.capabilities.actions.cancel) {
+    if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed || state.agentCancelPending)) {
+      showToast(state.agentHistoryRestoring
+        ? "Wait for the read-only Agent history restoration to finish."
+        : state.agentCancelPending
+          ? "AgInTi cancellation is already awaiting its verified terminal event."
+          : "Reopen this conversation to retry its read-only Agent history restoration.");
+      return;
+    }
+    if (state.mode === "agent" && state.runId
+        && !TERMINAL.has(state.agentRunStatus)
+        && state.capabilities.actions.cancel) {
+      const runId = state.runId;
+      const threadId = state.agentThreadId;
+      const agent = state.agent;
+      const presentation = state.presentation;
+      const epoch = state.viewEpoch;
+      const current = () => state.mode === "agent"
+        && state.agent === agent
+        && state.viewEpoch === epoch
+        && state.runId === runId
+        && state.agentThreadId === threadId
+        && state.presentation === presentation;
+      // Fence a second Stop and every Agent mutation/navigation before the
+      // cancellation RPC is dispatched, not after its response arrives.
+      state.agentCancelPending = true;
+      elements.stop_run.hidden = true;
+      elements.resume_run.hidden = true;
+      elements.run_state.textContent = "Cancelling";
+      connection("Confirming Agent cancellation", false);
+      updateImageControl();
+      let cancellationRun;
       try {
-        const { run } = await state.agent.cancelRun(state.runId);
-        state.agentRunStatus = safeRunStatus(run.status);
-      } catch { showToast("AgInTi cancellation could not be confirmed."); return; }
-      state.streamAbort?.abort();
+        const { run } = await agent.cancelRun(runId);
+        cancellationRun = correlatedAgentRun(run, { runId, threadId });
+      } catch {
+        if (current() && !TERMINAL.has(state.agentRunStatus)) {
+          state.agentCancelPending = false;
+          elements.stop_run.hidden = !state.capabilities.actions.cancel;
+          updateImageControl();
+          showToast("AgInTi cancellation could not be confirmed.");
+        }
+        return;
+      }
+      if (!current()) return;
+      // A cancellation acknowledgement is not a terminal ledger event. Keep
+      // consuming from cursor zero until run.cancelled is verified. Restarting
+      // the read-only ledger stream closes the race where the former iterator
+      // ended while the cancellation RPC was in flight.
+      if (!TERMINAL.has(state.agentRunStatus)) {
+        connection("Waiting for verified Agent cancellation", false);
+        state.streamAbort?.abort();
+        void streamAgentRun(cancellationRun, {
+          expectedRunId: runId,
+          expectedThreadId: threadId,
+          cancelPending: true,
+          offerResume: false,
+        }).catch(() => {});
+      }
       return;
     }
     if (state.mode === "chat" && state.chatGeneration?.status === "in_progress") {
@@ -3047,6 +3322,21 @@ export function createBrowserApp({
 
   async function resume() {
     if (state.busy || state.logoutPending) return;
+    if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed || state.agentCancelPending)) {
+      elements.resume_run.hidden = true;
+      showToast(state.agentHistoryRestoring
+        ? "Wait for the read-only Agent history restoration to finish; no run was resumed."
+        : state.agentCancelPending
+          ? "Wait for AgInTi's verified cancellation event; no run was resumed."
+          : "Reopen this conversation to retry its read-only Agent history restoration; no run was resumed.");
+      return;
+    }
+    if (state.mode === "agent" && state.runId
+        && (!state.agentReplayOfferResume || state.agentRunStatus === "completed")) {
+      elements.resume_run.hidden = true;
+      showToast("This verified Agent run is not resumable.");
+      return;
+    }
     state.busy = true;
     elements.resume_run.disabled = true;
     updateImageControl();
@@ -3077,8 +3367,14 @@ export function createBrowserApp({
           output: state.chatOutput,
         });
       } else if (state.runId && state.capabilities.enabled && state.capabilities.actions.resume) {
-        const { run } = await state.agent.resumeRun(state.runId);
-        await streamAgentRun(run);
+        const requestedRunId = state.runId;
+        const requestedThreadId = state.agentThreadId;
+        const { run } = await state.agent.resumeRun(requestedRunId);
+        correlatedAgentRun(run, { runId: requestedRunId, threadId: requestedThreadId });
+        await streamAgentRun(run, {
+          expectedRunId: requestedRunId,
+          expectedThreadId: requestedThreadId,
+        });
       }
     } catch (error) {
       const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;
@@ -3116,6 +3412,10 @@ export function createBrowserApp({
 
   function newConversation() {
     if (interactionLocked()) return;
+    if (state.mode === "agent" && state.agentReplayFailed) {
+      showToast("Reopen an Agent conversation and restore its verified history before creating new work.");
+      return;
+    }
     if (state.mode === "chat" && state.chatPendingSend) {
       showToast("This durable request has an uncertain response. Use Resume before starting another conversation.");
       return;
@@ -3146,6 +3446,7 @@ export function createBrowserApp({
   function updateHasUnsafeActivity() {
     return state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null
       || state.imagePreparing || state.chatPendingSend !== null || state.authRecoveryGeneration !== null
+      || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
       || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
       || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
   }

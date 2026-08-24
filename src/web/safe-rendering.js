@@ -409,6 +409,12 @@ function plotBounds(plot) {
   let maxY = Math.max(0, ...points.map((point) => point.y));
   if (minX === maxX) { minX -= 1; maxX += 1; }
   if (minY === maxY) { minY -= 1; maxY += 1; }
+  const spanX = maxX - minX;
+  const spanY = maxY - minY;
+  if (![minX, maxX, minY, maxY, spanX, spanY].every(Number.isFinite)
+      || spanX <= 0 || spanY <= 0) {
+    throw new TypeError("plot bounds are not safely renderable");
+  }
   return { minX, maxX, minY, maxY };
 }
 
@@ -597,12 +603,22 @@ export function createSafeRenderer({
       }
       target.dataset.status = "ready";
       target.dataset.artifactKind = artifact.kind;
-      if (artifact.kind === "plot") renderPlot(document, target, artifact);
-      else if (artifact.kind === "table") renderTable(document, target, artifact);
-      else {
-        const markdown = createNode(document, "div", "artifact-markdown");
-        renderMarkdown(markdown, artifact.spec.markdown);
-        target.appendChild(markdown);
+      try {
+        if (artifact.kind === "plot") renderPlot(document, target, artifact);
+        else if (artifact.kind === "table") renderTable(document, target, artifact);
+        else {
+          const markdown = createNode(document, "div", "artifact-markdown");
+          renderMarkdown(markdown, artifact.spec.markdown);
+          target.appendChild(markdown);
+        }
+      } catch {
+        target.replaceChildren();
+        target.dataset.status = "rejected";
+        delete target.dataset.artifactKind;
+        const rejected = createNode(document, "p", "artifact-rejected");
+        rejected.textContent = "This artifact could not be displayed safely.";
+        target.appendChild(rejected);
+        return false;
       }
       return true;
     },

@@ -214,6 +214,41 @@ test("public responses and artifacts reject private state, active content, URLs,
     }),
   }), /does not support pruned ledgers/u);
   assert.equal(validateArtifact(artifact()).kind, "plot");
+  assert.equal(validateArtifact({
+    ...artifact(),
+    spec: {
+      schemaVersion: "1",
+      type: "line",
+      labels: ["minimum", "maximum"],
+      series: [{ name: "Safe boundary", data: [-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER] }],
+    },
+  }).kind, "plot");
+  for (const data of [
+    [Number.MAX_SAFE_INTEGER + 1],
+    [Number.MAX_VALUE],
+    [-Number.MAX_VALUE, Number.MAX_VALUE],
+  ]) {
+    assert.throws(() => validateArtifact({
+      ...artifact(),
+      spec: {
+        schemaVersion: "1",
+        type: "line",
+        labels: data.map((unused, index) => String(index)),
+        series: [{ name: "Unsafe magnitude", data }],
+      },
+    }), /plot magnitude/u);
+  }
+  assert.throws(() => validateArtifact({
+    ...artifact(),
+    spec: {
+      schemaVersion: "1",
+      type: "scatter",
+      series: [{ name: "Unsafe range", points: [
+        { x: -Number.MAX_VALUE, y: 0 },
+        { x: Number.MAX_VALUE, y: 1 },
+      ] }],
+    },
+  }), /plot magnitude/u);
   for (const candidate of [
     { id: ARTIFACT_ID, title: "Unsafe", kind: "html", spec: { html: "<script>" } },
     { id: ARTIFACT_ID, title: "Unsafe", kind: "markdown", spec: { schemaVersion: "1", markdown: "[open](https://example.test)" } },
@@ -244,6 +279,24 @@ test("event ledger verifies exact hashes, ownership, sequence, and previous hash
     previousHash: first.hash,
     digest: async (value) => digest(value),
   }), /not contiguous/u);
+  const malicious = event({
+    seq: 1,
+    type: "artifact.created",
+    payload: { artifact: {
+      id: ARTIFACT_ID,
+      title: "Unsafe artifact",
+      kind: "markdown",
+      spec: { schemaVersion: "1", markdown: "<img src=x onerror=alert(1)>" },
+    } },
+    previousHash: ZERO_HASH,
+  });
+  await assert.rejects(() => verifyAgentEvent(malicious, {
+    expectedRunId: RUN_ID,
+    expectedThreadId: THREAD_ID,
+    afterSeq: 0,
+    previousHash: ZERO_HASH,
+    digest: async (value) => digest(value),
+  }), /may not contain HTML/u);
   assert.throws(() => validateEventEnvelope({ ...first, stdout: "secret" }), /unsupported field/u);
 });
 

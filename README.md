@@ -235,12 +235,18 @@ static shell.
 
 Direct Chat vision remains fail-closed when `localLlm.vision` is absent or
 disabled. Enabling it requires the fixed `localllm-vision` alias while keeping a
-different default text alias. The PWA accepts one to four JPEG or PNG images plus
-a non-empty prompt, accepts each source file up to 24 MiB, redraws and downscales
-them sequentially through a browser canvas to remove source metadata, and
-enforces 4 MiB per canonical image and 16 MiB per message. A separate preview is
-bounded to 512 pixels and 512 KiB so a visible mobile gallery never retains the
-full upload surfaces.
+different default text alias. The PWA accepts one to four JPEG, PNG, HEIC, or
+HEIF still images plus a non-empty prompt and accepts each source file up to
+24 MiB. HEIC/HEIF support uses only a feature-detected native browser decoder;
+AVIF, sequences, conflicting brands, and malformed ISO-BMFF framing fail closed.
+The browser redraws and downscales every accepted source sequentially through a
+canvas to remove source metadata, and only canonical JPEG/PNG bytes can cross
+the wire or enter storage. Slow native decoding exposes a visible and accessible
+`Preparing images…` state; timeout, cancellation, session changes, and PWA
+controller changes fence late decoder completions. It enforces 4 MiB per
+canonical image and 16 MiB per message. A separate preview is bounded to 512
+pixels and 512 KiB so a visible
+mobile gallery never retains the full upload surfaces.
 The server independently validates MIME, framing, dimensions, metadata absence,
 digest, ordering, unique attachment IDs, count, and aggregate bytes before
 committing the user message, every private image, and the generation atomically.

@@ -197,12 +197,18 @@ admission, lease, and recovery contract as normal Direct Chat generation.
 
 Direct Chat:
 
-- The PWA accepts one to four JPEG or PNG images and requires a text prompt. It
-  accepts source files up to 24 MiB, checks source dimensions before decode,
-  redraws and downscales each image sequentially through canvas to discard source
-  metadata, and rejects canonical output above 4 MiB per image or 16 MiB per
-  message. Its visible composer/message preview is independently bounded to
-  512 pixels and 512 KiB per image. No image is placed in
+- The PWA accepts one to four JPEG, PNG, HEIC, or HEIF still images and requires
+  a text prompt. It accepts source files up to 24 MiB. JPEG/PNG source geometry
+  is checked before decode; HEIC/HEIF files pass a bounded, byte-authoritative
+  ISO-BMFF `ftyp` classifier before a feature-detected native decode, then face
+  the same decoded-pixel bound. AVIF, sequences, conflicting brands, and
+  malformed boxes fail closed. Canvas redraw/downscaling discards source
+  metadata, and only canonical JPEG/PNG output may cross the wire or enter
+  storage. Native preparation has an abort signal, one bounded deadline, a
+  visible `Preparing images…` state, and epoch fences for mode, session, logout,
+  and service-worker controller changes. Canonical output is limited to 4 MiB
+  per image and 16 MiB per message. Its visible composer/message preview is
+  independently bounded to 512 pixels and 512 KiB per image. No image is placed in
   Cache Storage, localStorage, or sessionStorage. A user-confirmed PWA update
   may place one encrypted, expiring, one-shot single-image unsent-composer handoff in a
   dedicated IndexedDB store; it is never history, a send queue, or auto-sent.

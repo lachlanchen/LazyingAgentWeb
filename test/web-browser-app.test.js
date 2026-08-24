@@ -4586,12 +4586,17 @@ test("PWA submit blocks and invalidates an image preparation race without consum
   input.dispatch("change");
   message.value = "Keep this text-only prompt";
   assert.equal(send.disabled, true, "Send is disabled before canonicalization yields");
-  assert.equal(browser.document.getElementById("add-image").disabled, true);
+  const imageAction = browser.document.getElementById("add-image");
+  assert.equal(imageAction.disabled, true);
+  assert.equal(imageAction.textContent, "Preparing images…");
+  assert.equal(imageAction.getAttribute("aria-label"), "Preparing images…");
 
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(preparedRun, null, "a programmatic form submission cannot bypass the pending guard");
   assert.equal(message.value, "Keep this text-only prompt", "the blocked submission preserves typed text");
   assert.equal(send.disabled, false, "cancelling the pending selection releases the composer");
+  assert.equal(imageAction.textContent, "Images");
+  assert.equal(imageAction.getAttribute("aria-label"), "Add images");
 
   pending.resolve(Object.freeze({
     attachmentId: "image_0000000000000002",
@@ -4612,6 +4617,82 @@ test("PWA submit blocks and invalidates an image preparation race without consum
   assert.match(browser.document.getElementById("messages").textContent, /Keep this text-only promptText-only answer/u);
 });
 
+test("slow image preparation is visible and cancellation or failure preserves the prior image draft", async () => {
+  const pending = Promise.withResolvers();
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const prepared = (serial) => Object.freeze({
+    attachmentId: `image_prior_${serial}_xxxxxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 96,
+    height: 96,
+    bytes,
+    previewBlob: new Blob([bytes], { type: "image/png" }),
+  });
+  let call = 0;
+  let secondSignal;
+  let objectUrls = 0;
+  const browser = harness({
+    chat: baseChat({
+      async capabilities() {
+        return {
+          visionInput: true,
+          visionMediaTypes: ["image/jpeg", "image/png"],
+          maximumImageBytes: 4 * 1024 * 1024,
+        };
+      },
+    }),
+    canonicalizeImage(file, options) {
+      call += 1;
+      if (call === 1) return Promise.resolve(prepared("first"));
+      if (call === 2) {
+        secondSignal = options.signal;
+        return pending.promise;
+      }
+      return Promise.reject(new TypeError("synthetic decoder failure"));
+    },
+    createObjectUrl() { objectUrls += 1; return `blob:prior-${objectUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("image-input");
+  const message = browser.document.getElementById("message-input");
+  const imageAction = browser.document.getElementById("add-image");
+  const preview = browser.document.getElementById("image-preview");
+
+  input.files = [{ name: "first.png" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  message.value = "Keep this exact draft and first image";
+  assert.equal(preview.hidden, false);
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:prior-1");
+
+  input.files = [{ name: "slow-second.heic" }];
+  input.dispatch("change");
+  assert.equal(imageAction.textContent, "Preparing images…");
+  assert.equal(imageAction.getAttribute("aria-label"), "Preparing images…");
+  assert.equal(preview.hidden, false, "the already-prepared image stays visible during another decode");
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(secondSignal.aborted, true);
+  assert.equal(message.value, "Keep this exact draft and first image");
+  assert.equal(preview.hidden, false);
+  assert.equal(imageAction.textContent, "Images");
+
+  pending.resolve(prepared("stale-second"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(objectUrls, 1, "the cancelled late decode cannot attach a second preview");
+  assert.match(browser.document.getElementById("image-preview-label").textContent, /96×96/u);
+
+  input.files = [{ name: "broken-third.heic" }];
+  input.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(message.value, "Keep this exact draft and first image");
+  assert.equal(preview.hidden, false, "a later preparation failure does not discard the prior image");
+  assert.equal(objectUrls, 1);
+  assert.equal(imageAction.textContent, "Images");
+  assert.match(browser.document.getElementById("toast").textContent, /could not be prepared safely/u);
+});
+
 test("PWA mode, explicit clear, and logout each invalidate unresolved image preparation", async () => {
   const pending = [Promise.withResolvers(), Promise.withResolvers(), Promise.withResolvers()];
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -4626,6 +4707,7 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
   });
   let canonicalizations = 0;
   let objectUrls = 0;
+  const preparationSignals = [];
   const browser = harness({
     agent: baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
     chat: baseChat({
@@ -4637,8 +4719,10 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
         };
       },
     }),
-    canonicalizeImage() {
+    canonicalizeImage(file, options) {
       const deferred = pending[canonicalizations];
+      assert.equal(options.timeoutMs, 15_000);
+      preparationSignals.push(options.signal);
       canonicalizations += 1;
       return deferred.promise;
     },
@@ -4653,6 +4737,7 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
   input.dispatch("change");
   assert.equal(send.disabled, true);
   browser.app.setMode("agent", { restoreView: false });
+  assert.equal(preparationSignals[0].aborted, true);
   pending[0].resolve(selected);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(browser.document.getElementById("image-preview").hidden, true);
@@ -4662,6 +4747,7 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
   input.dispatch("change");
   assert.equal(send.disabled, true);
   browser.document.getElementById("remove-image").dispatch("click");
+  assert.equal(preparationSignals[1].aborted, true);
   assert.equal(send.disabled, false);
   pending[1].resolve(selected);
   await new Promise((resolve) => setImmediate(resolve));
@@ -4672,6 +4758,7 @@ test("PWA mode, explicit clear, and logout each invalidate unresolved image prep
   assert.equal(send.disabled, true);
   browser.document.getElementById("message-input").value = "private draft for this account only";
   await browser.app.logout();
+  assert.equal(preparationSignals[2].aborted, true);
   assert.equal(browser.document.getElementById("message-input").value, "");
   pending[2].resolve(selected);
   await new Promise((resolve) => setImmediate(resolve));

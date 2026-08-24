@@ -533,8 +533,8 @@ ${modulePreloads}
       </aside>
 
       <form id="composer" class="composer" autocomplete="off">
-        <input id="image-input" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple hidden>
-        <button id="add-image" class="image-button" type="button" aria-label="Add images" hidden>Images</button>
+        <input id="image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" multiple hidden>
+        <button id="add-image" class="image-button" type="button" aria-label="Add images" aria-live="polite" hidden>Images</button>
         <div id="image-preview" class="image-preview" hidden>
           <img id="image-preview-thumbnail" alt="First selected image preview">
           <span id="image-preview-label"></span>

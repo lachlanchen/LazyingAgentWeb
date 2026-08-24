@@ -1985,6 +1985,53 @@ test("Update refuses to activate while a password or draft is only browser-held"
   assert.match(harness.document.getElementById("toast").textContent, /Finish the current draft or response/u);
 });
 
+test("a successor controller aborts slow image preparation and fences its stale completion", async () => {
+  const environment = updateEnvironment({ waiting: false, activeReleaseId: CURRENT_RELEASE });
+  const clients = idleAuthenticatedPwaClients();
+  const pending = Promise.withResolvers();
+  const bytes = canonicalPngHeader();
+  let preparationSignal;
+  let objectUrls = 0;
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: clients.agent,
+    chat: clients.chat,
+    canonicalizeImage(file, options) {
+      preparationSignal = options.signal;
+      return pending.promise;
+    },
+    createObjectUrl() { objectUrls += 1; return `blob:stale-release-${objectUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await harness.app.initialize();
+  await Promise.resolve();
+  harness.document.getElementById("message-input").value = "keep this browser-only draft";
+  const input = harness.document.getElementById("image-input");
+  input.files = [{ name: "slow-release-photo.heic" }];
+  input.dispatch("change");
+  assert.equal(harness.document.getElementById("add-image").textContent, "Preparing images…");
+
+  environment.transitionController(NEXT_RELEASE);
+  assert.equal(preparationSignal.aborted, true);
+  assert.equal(harness.document.getElementById("add-image").textContent, "Images");
+  pending.resolve(Object.freeze({
+    attachmentId: "image_stale_release_xxxxxxxxx",
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 64,
+    height: 64,
+    bytes,
+    previewBlob: new Blob([bytes], { type: "image/png" }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(objectUrls, 0);
+  assert.equal(harness.document.getElementById("image-preview").hidden, true);
+  assert.equal(harness.document.getElementById("message-input").value, "keep this browser-only draft");
+  assert.deepEqual(harness.replacements, [], "the new controller cannot discard browser-only work");
+});
+
 test("a staged image remains in place when protected update handoff storage is unavailable", async () => {
   const environment = updateEnvironment();
   const capability = {

@@ -18,6 +18,7 @@ import {
   BROWSER_VISION_IMAGE_LIMITS,
   canonicalizeVisionImage,
   inspectVisionImageBytes,
+  VisionImageInputError,
 } from "./vision-image-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
@@ -851,6 +852,7 @@ export function createBrowserApp({
     selectedImages: Object.freeze([]),
     selectedImageUrls: Object.freeze([]),
     imagePreparing: false,
+    imagePreparationAbort: null,
     imageSelectionEpoch: 0,
     imageRenderEpoch: 0,
     messageImageUrls: new Set(),
@@ -987,6 +989,7 @@ export function createBrowserApp({
   function requireFreshAuthentication({ workflow = null, generationRecovery = null } = {}) {
     if (!state.session.authenticated) return false;
     const recoveryUsername = normalizedSessionUsername(state.session.username);
+    if (state.imagePreparing) cancelImagePreparation();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     clearConversation();
@@ -1044,10 +1047,18 @@ export function createBrowserApp({
     elements.image_preview.hidden = false;
   }
 
+  function cancelImagePreparation() {
+    state.imageSelectionEpoch += 1;
+    state.imagePreparationAbort?.abort();
+    state.imagePreparationAbort = null;
+    state.imagePreparing = false;
+    elements.image_input.value = "";
+    renderSelectedImages();
+  }
+
   function detachSelectedImage() {
     invalidatePreparedUpdateHandoff();
-    state.imageSelectionEpoch += 1;
-    state.imagePreparing = false;
+    cancelImagePreparation();
     const detached = state.selectedImages.length === 0 ? null : Object.freeze({
       selected: state.selectedImages,
       previewUrls: state.selectedImageUrls,
@@ -1101,6 +1112,11 @@ export function createBrowserApp({
     const fencedImage = preservingAuthenticationDraft || preservingAmbiguousImage;
     if (!available && !fencedImage && (state.imagePreparing || state.selectedImages.length > 0)) clearSelectedImage();
     elements.add_image.hidden = !available;
+    elements.add_image.textContent = state.imagePreparing ? "Preparing images…" : "Images";
+    elements.add_image.setAttribute(
+      "aria-label",
+      state.imagePreparing ? "Preparing images…" : "Add images",
+    );
     elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
       || state.selectedImages.length >= COMPOSER_IMAGE_COUNT_LIMIT;
     elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
@@ -3045,11 +3061,16 @@ export function createBrowserApp({
     const selectedFiles = Array.from(files);
     if (state.selectedImages.length + selectedFiles.length > COMPOSER_IMAGE_COUNT_LIMIT) {
       elements.image_input.value = "";
-      showToast(`Choose up to ${COMPOSER_IMAGE_COUNT_LIMIT} JPEG or PNG images per message.`);
+      showToast(`Choose up to ${COMPOSER_IMAGE_COUNT_LIMIT} JPEG, PNG, HEIC, or HEIF still images per message.`);
       updateImageControl();
       return;
     }
     const selectionEpoch = state.imageSelectionEpoch;
+    const PreparationAbortController = window?.AbortController ?? globalThis.AbortController;
+    const preparationController = typeof PreparationAbortController === "function"
+      ? new PreparationAbortController()
+      : null;
+    state.imagePreparationAbort = preparationController;
     state.imagePreparing = true;
     updateImageControl();
     const prepared = [];
@@ -3059,6 +3080,8 @@ export function createBrowserApp({
         prepared.push(await canonicalizeImage(file, {
           document,
           makeAttachmentId: createBrowserOpaqueId,
+          signal: preparationController?.signal,
+          timeoutMs: attachmentDecodeTimeoutMs,
         }));
       }
       if (selectionEpoch !== state.imageSelectionEpoch || !state.imagePreparing
@@ -3076,14 +3099,23 @@ export function createBrowserApp({
       state.selectedImageUrls = Object.freeze([...state.selectedImageUrls, ...previewUrls]);
       previewUrls.length = 0;
       renderSelectedImages();
-    } catch {
+    } catch (error) {
       if (selectionEpoch === state.imageSelectionEpoch && state.imagePreparing) {
-        showToast("Those images could not be prepared safely. Use up to four JPEG or PNG photos, each up to 24 MiB; the app will downscale them for sending.");
+        const actionableHeifFailure = error instanceof VisionImageInputError
+          && error.code === "heif_decode_unavailable";
+        const timedOut = error instanceof VisionImageInputError
+          && error.code === "image_preparation_timeout";
+        showToast(actionableHeifFailure || timedOut
+          ? error.message
+          : "Those images could not be prepared safely. Use up to four JPEG, PNG, HEIC, or HEIF still photos, each up to 24 MiB; the app will downscale them for sending.");
       }
     } finally {
       for (const previewUrl of previewUrls) revokeObjectUrl(previewUrl);
       elements.image_input.value = "";
-      if (selectionEpoch === state.imageSelectionEpoch) state.imagePreparing = false;
+      if (selectionEpoch === state.imageSelectionEpoch) {
+        state.imagePreparing = false;
+        if (state.imagePreparationAbort === preparationController) state.imagePreparationAbort = null;
+      }
       updateImageControl();
     }
   }
@@ -3106,7 +3138,7 @@ export function createBrowserApp({
       return;
     }
     if (state.imagePreparing) {
-      clearSelectedImage();
+      cancelImagePreparation();
       updateImageControl();
       return;
     }
@@ -3488,6 +3520,7 @@ export function createBrowserApp({
   async function logout() {
     if (state.loginPending || state.logoutPending || elements.logout.disabled) return;
     state.logoutPending = true;
+    if (state.imagePreparing) cancelImagePreparation();
     elements.logout.disabled = true;
     elements.resume_run.disabled = true;
     updateImageControl();
@@ -4235,6 +4268,10 @@ export function createBrowserApp({
         }
         if (nextController === null || state.updateReloaded) return;
         state.updateControllerChanged = true;
+        if (state.imagePreparing) {
+          cancelImagePreparation();
+          updateImageControl();
+        }
         if (state.updateActivationTimer !== null) window?.clearTimeout?.(state.updateActivationTimer);
         state.updateActivationTimer = null;
         state.updateConfirmed = false;

@@ -6,8 +6,10 @@ import { validateVisionAttachmentRequest } from '../src/vision-attachment.js';
 import {
   BROWSER_VISION_IMAGE_LIMITS,
   canonicalizeVisionImage,
+  classifyVisionImageSource,
   inspectVisionImageBytes,
-  sanitizeVisionImageBytes
+  sanitizeVisionImageBytes,
+  VisionImageInputError,
 } from '../src/web/vision-image-client.js';
 
 const JPEG_BYTES = Buffer.from('/9j/4AAQSkZJRgABAQAAAAAAAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVN//2Q==', 'base64');
@@ -75,14 +77,33 @@ function rewriteJpegDimensions(bytes, width, height) {
   throw new TypeError('test JPEG has no baseline frame');
 }
 
-function file(bytes, type) {
+function file(bytes, type, name = 'selected-image') {
   return Object.freeze({
+    name,
     size: bytes.byteLength,
     type,
     async arrayBuffer() {
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     }
   });
+}
+
+function isoFileType({
+  major = 'heic',
+  compatible = ['mif1', 'heic'],
+  tail = Buffer.from('synthetic-native-decoder-payload', 'ascii'),
+  sizeOverride,
+} = {}) {
+  const payload = Buffer.concat([
+    Buffer.from(major, 'ascii'),
+    Buffer.alloc(4),
+    ...compatible.map((brand) => Buffer.from(brand, 'ascii')),
+  ]);
+  const box = Buffer.alloc(8 + payload.byteLength);
+  box.writeUInt32BE(sizeOverride ?? box.byteLength, 0);
+  box.write('ftyp', 4, 'ascii');
+  payload.copy(box, 8);
+  return Buffer.concat([box, tail]);
 }
 
 function browserHarness(outputBytes, outputType, dimensions, calls) {
@@ -231,7 +252,7 @@ test('downscales a high-resolution PNG while preserving a bounded PNG thumbnail'
   ]);
 });
 
-test('sniffs an iOS JPEG export with an empty MIME type and exposes extension hints in the picker', async () => {
+test('sniffs an iOS JPEG export with an empty MIME type and exposes all safe source hints in the picker', async () => {
   const calls = [];
   const result = await canonicalizeVisionImage(
     file(JPEG_BYTES, ''),
@@ -240,8 +261,175 @@ test('sniffs an iOS JPEG export with an empty MIME type and exposes extension hi
   assert.equal(result.mediaType, 'image/jpeg');
   assert.match(
     createAppShellHtml({ version: 'release-1234567890abcdef' }),
-    /accept="image\/jpeg,image\/png,\.jpg,\.jpeg,\.png"/u
+    /accept="image\/jpeg,image\/png,image\/heic,image\/heif,\.jpg,\.jpeg,\.png,\.heic,\.heif"/u
   );
+});
+
+test('classifies bounded HEIC/HEIF ftyp bytes and rejects AVIF, sequences, conflicts, and malformed boxes', () => {
+  for (const brand of ['heic', 'heix', 'heim', 'heis']) {
+    assert.deepEqual(classifyVisionImageSource(isoFileType({ major: brand, compatible: [] })), {
+      sourceKind: 'heif',
+      decodeMediaType: 'image/heic',
+      canonicalMediaType: 'image/jpeg'
+    });
+  }
+  for (const brand of ['mif1', 'mif2']) {
+    assert.deepEqual(classifyVisionImageSource(isoFileType({ major: brand, compatible: [] })), {
+      sourceKind: 'heif',
+      decodeMediaType: 'image/heif',
+      canonicalMediaType: 'image/jpeg'
+    });
+  }
+  for (const brand of ['avif', 'avis', 'MA1A', 'MA1B']) {
+    assert.throws(
+      () => classifyVisionImageSource(isoFileType({ major: brand, compatible: ['mif1'] })),
+      (error) => error instanceof VisionImageInputError && error.code === 'unsupported_avif'
+    );
+  }
+  for (const brand of ['hevc', 'hevx', 'hevm', 'hevs', 'msf1']) {
+    assert.throws(
+      () => classifyVisionImageSource(isoFileType({ major: brand, compatible: [] })),
+      (error) => error instanceof VisionImageInputError && error.code === 'unsupported_heif_sequence'
+    );
+  }
+  for (const compatible of [['mif1', 'avif'], ['mif1', 'hevc']]) {
+    assert.throws(
+      () => classifyVisionImageSource(isoFileType({ compatible })),
+      (error) => error instanceof VisionImageInputError && error.code === 'conflicting_image_brands'
+    );
+  }
+
+  const malformed = [];
+  const truncated = Buffer.alloc(12);
+  truncated.writeUInt32BE(12, 0);
+  truncated.write('ftyp', 4, 'ascii');
+  malformed.push(truncated);
+  const nonAligned = Buffer.alloc(18);
+  nonAligned.writeUInt32BE(18, 0);
+  nonAligned.write('ftyp', 4, 'ascii');
+  nonAligned.write('heic', 8, 'ascii');
+  malformed.push(nonAligned);
+  malformed.push(isoFileType({ sizeOverride: 4_097, tail: Buffer.alloc(4_100) }));
+  malformed.push(isoFileType({ sizeOverride: 2_048, tail: Buffer.alloc(8) }));
+  malformed.push(isoFileType({ sizeOverride: 0 }));
+  for (const bytes of malformed) {
+    assert.throws(
+      () => classifyVisionImageSource(bytes),
+      (error) => error instanceof VisionImageInputError && error.code === 'malformed_heif'
+    );
+  }
+});
+
+test('treats source bytes as authoritative over empty, uppercase, and dishonest file hints', async () => {
+  const heic = isoFileType({
+    tail: Buffer.from('private-source-heic-irot-metadata-must-not-cross-the-wire', 'ascii')
+  });
+  const canonicalJpeg = rewriteJpegDimensions(JPEG_BYTES, 240, 320);
+  const heicCalls = [];
+  const heicHarness = browserHarness(
+    canonicalJpeg,
+    'image/jpeg',
+    { width: 240, height: 320 },
+    heicCalls
+  );
+  const decoderInputs = [];
+  heicHarness.createImageBitmapImpl = async (blob, options) => {
+    decoderInputs.push({ type: blob.type, options, bytes: Buffer.from(await blob.arrayBuffer()) });
+    return {
+      width: 240,
+      height: 320,
+      close() { heicCalls.push(['close']); }
+    };
+  };
+  const converted = await canonicalizeVisionImage(file(heic, '', 'IPHONE-PHOTO.HEIC'), heicHarness);
+  assert.equal(decoderInputs.length, 1);
+  assert.equal(decoderInputs[0].type, 'image/heic');
+  assert.deepEqual(decoderInputs[0].options, { imageOrientation: 'from-image' });
+  assert.deepEqual(decoderInputs[0].bytes, heic);
+  assert.deepEqual([converted.mediaType, converted.width, converted.height], ['image/jpeg', 240, 320]);
+  assert.deepEqual(Buffer.from(converted.bytes), canonicalJpeg);
+  assert.equal(Buffer.from(converted.bytes).includes(Buffer.from('private-source-heic', 'ascii')), false);
+  assert.deepEqual(validateVisionAttachmentRequest({
+    attachmentId: converted.attachmentId,
+    mediaType: converted.mediaType,
+    data: Buffer.from(converted.bytes).toString('base64')
+  }).content, canonicalJpeg);
+  assert.deepEqual(heicCalls.filter(([name]) => name === 'drawImage'), [
+    ['drawImage', 0, 0, 240, 320]
+  ], 'the canvas uses the native decoder\'s already-oriented surface');
+
+  const png = Buffer.from(createPwaIcon(192));
+  const pngCalls = [];
+  const disguisedPng = await canonicalizeVisionImage(
+    file(png, 'IMAGE/HEIC', 'MISLEADING.HEIC'),
+    browserHarness(png, 'image/png', { width: 192, height: 192 }, pngCalls)
+  );
+  assert.equal(disguisedPng.mediaType, 'image/png');
+  assert.deepEqual(Buffer.from(disguisedPng.bytes), png);
+});
+
+test('fails corrupted or natively unsupported HEIC with an actionable conversion path', async () => {
+  const source = isoFileType({ tail: Buffer.from('corrupt-hevc-payload', 'ascii') });
+  const harness = browserHarness(JPEG_BYTES, 'image/jpeg', { width: 1, height: 1 }, []);
+  let decodeAttempts = 0;
+  harness.createImageBitmapImpl = async () => {
+    decodeAttempts += 1;
+    throw new TypeError('native decoder rejected bytes');
+  };
+  harness.createObjectUrl = null;
+  harness.revokeObjectUrl = null;
+  await assert.rejects(
+    () => canonicalizeVisionImage(file(source, 'image/heic', 'corrupt.heic'), harness),
+    (error) => error instanceof VisionImageInputError
+      && error.code === 'heif_decode_unavailable'
+      && /Photos.*export\/share.*JPEG or PNG/u.test(error.message)
+  );
+  assert.equal(decodeAttempts, 2, 'both feature-detected createImageBitmap overloads are attempted');
+});
+
+test('bounds HEIC decoded pixels and releases late native decodes after abort or timeout', async () => {
+  const source = isoFileType();
+  const overLimitCalls = [];
+  await assert.rejects(
+    () => canonicalizeVisionImage(
+      file(source, 'image/heic'),
+      browserHarness(JPEG_BYTES, 'image/jpeg', {
+        width: BROWSER_VISION_IMAGE_LIMITS.sourceMaximumEdge + 1,
+        height: 1
+      }, overLimitCalls)
+    ),
+    /decoded image dimensions exceed the safe decode limit/u
+  );
+  assert.deepEqual(overLimitCalls, [['close']]);
+
+  for (const mode of ['abort', 'timeout']) {
+    const pending = Promise.withResolvers();
+    const started = Promise.withResolvers();
+    const calls = [];
+    const harness = browserHarness(JPEG_BYTES, 'image/jpeg', { width: 1, height: 1 }, calls);
+    harness.createImageBitmapImpl = () => {
+      started.resolve();
+      return pending.promise;
+    };
+    harness.createObjectUrl = null;
+    harness.revokeObjectUrl = null;
+    const controller = new AbortController();
+    const preparation = canonicalizeVisionImage(file(source, 'image/heic'), {
+      ...harness,
+      signal: controller.signal,
+      timeoutMs: mode === 'abort' ? 1_000 : 5
+    });
+    await started.promise;
+    if (mode === 'abort') controller.abort();
+    await assert.rejects(
+      () => preparation,
+      (error) => error instanceof VisionImageInputError
+        && error.code === (mode === 'abort' ? 'image_preparation_aborted' : 'image_preparation_timeout')
+    );
+    pending.resolve({ width: 1, height: 1, close() { calls.push(['lateClose']); } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, [['lateClose']]);
+  }
 });
 
 test('retries createImageBitmap without options for Safari implementations that reject the overload', async () => {
@@ -258,6 +446,44 @@ test('retries createImageBitmap without options for Safari implementations that 
   assert.equal(result.mediaType, 'image/jpeg');
   assert.deepEqual(arities, [2, 1]);
   assert.deepEqual(calls.at(-1), ['close']);
+});
+
+test('canonicalizes HEIC through the feature-detected HTMLImageElement fallback', async () => {
+  const source = isoFileType();
+  const calls = [];
+  const harness = browserHarness(JPEG_BYTES, 'image/jpeg', { width: 1, height: 1 }, calls);
+  const canvasDocument = harness.document;
+  const image = {
+    naturalWidth: 1,
+    naturalHeight: 1,
+    decoding: '',
+    src: '',
+    async decode() { calls.push(['heicImageDecode', this.src]); },
+    removeAttribute(name) { calls.push(['removeAttribute', name]); this.src = ''; }
+  };
+  harness.document = {
+    createElement(name) {
+      if (name === 'img') return image;
+      return canvasDocument.createElement(name);
+    }
+  };
+  harness.createImageBitmapImpl = null;
+  harness.createObjectUrl = (blob) => {
+    calls.push(['createHeicObjectUrl', blob.type]);
+    return 'blob:native-heic-photo';
+  };
+  harness.revokeObjectUrl = (url) => calls.push(['revokeObjectUrl', url]);
+
+  const result = await canonicalizeVisionImage(file(source, '', 'PHOTO.HEIC'), harness);
+  assert.deepEqual([result.mediaType, result.width, result.height], ['image/jpeg', 1, 1]);
+  assert.deepEqual(calls.slice(0, 2), [
+    ['createHeicObjectUrl', 'image/heic'],
+    ['heicImageDecode', 'blob:native-heic-photo']
+  ]);
+  assert.deepEqual(calls.slice(-2), [
+    ['removeAttribute', 'src'],
+    ['revokeObjectUrl', 'blob:native-heic-photo']
+  ]);
 });
 
 test('uses and cleans up a Safari HTMLImageElement decoder when createImageBitmap is unavailable', async () => {
@@ -361,17 +587,16 @@ test('C2PA caBX metadata strips with CRC validation, idempotence, and strict ser
 test('rejects unsupported, oversized, forged, changed, and over-cap canonical images', async () => {
   const png = Buffer.from(createPwaIcon(192));
   assert.throws(() => inspectVisionImageBytes(png, 'image/gif'), /JPEG or PNG/u);
-  await assert.rejects(() => canonicalizeVisionImage(file(png, 'image/gif'), {}), /JPEG or PNG image up to 24 MiB/u);
 
   const oversized = {
     size: BROWSER_VISION_IMAGE_LIMITS.sourceBytes + 1,
     type: 'image/png',
     async arrayBuffer() { return new ArrayBuffer(0); }
   };
-  await assert.rejects(() => canonicalizeVisionImage(oversized, {}), /JPEG or PNG image up to 24 MiB/u);
-
-  const heic = { ...file(png, 'image/heic') };
-  await assert.rejects(() => canonicalizeVisionImage(heic, {}), /HEIC\/HEIF.*safety checks/u);
+  await assert.rejects(
+    () => canonicalizeVisionImage(oversized, {}),
+    /JPEG, PNG, HEIC, or HEIF still image up to 24 MiB/u
+  );
 
   const decodeBombHeader = rewritePngDimensions(png, BROWSER_VISION_IMAGE_LIMITS.sourceMaximumEdge + 1, 1);
   const decodeBombCalls = [];
@@ -389,7 +614,7 @@ test('rejects unsupported, oversized, forged, changed, and over-cap canonical im
   const calls = [];
   await assert.rejects(
     () => canonicalizeVisionImage(file(forged, 'image/png'), browserHarness(png, 'image/png', { width: 192, height: 192 }, calls)),
-    /valid PNG/u
+    /not a supported JPEG, PNG, HEIC, or HEIF/u
   );
   assert.equal(calls.length, 0);
 

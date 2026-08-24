@@ -1,5 +1,10 @@
 import { AgintiBrowserClient, selectDefaultMode } from "./aginti-client.js";
-import { AgintiProtocolError, FAIL_CLOSED_AGENT_CAPABILITIES, validateAgentCapabilities } from "./aginti-protocol.js";
+import {
+  AgintiProtocolError,
+  FAIL_CLOSED_AGENT_CAPABILITIES,
+  validateAgentCapabilities,
+  validateAgentSearch,
+} from "./aginti-protocol.js";
 import { CloudSessionClient } from "./cloud-session-client.js";
 import {
   createBrowserOpaqueId,
@@ -765,6 +770,7 @@ function elementMap(document) {
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
     "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+    "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
   ];
   return Object.freeze(Object.fromEntries(ids.map((id) => {
     const value = document.getElementById(id);
@@ -949,6 +955,7 @@ export function createBrowserApp({
     agentReplayOfferResume: true,
     agentCancelPending: false,
     agentPendingResume: null,
+    agentSearchSelected: false,
     streamAbort: null,
     streamKind: null,
     viewEpoch: 0,
@@ -1086,6 +1093,7 @@ export function createBrowserApp({
     state.chatFinalization = null;
     state.runId = null;
     state.agentRunStatus = null;
+    state.agentSearchSelected = false;
     state.mode = "chat";
     state.authRecoveryPending = true;
     state.authRecoveryUsername = recoveryUsername;
@@ -1173,6 +1181,45 @@ export function createBrowserApp({
       || state.agentPendingResume !== null;
   }
 
+  function updateSearchControl() {
+    const capability = state.capabilities.search;
+    const available = state.session.authenticated && state.mode === "agent"
+      && state.capabilities.enabled === true && capability?.enabled === true;
+    if (!available) state.agentSearchSelected = false;
+    const maximum = available ? capability.maximumSources : 0;
+    if (available && !capability.modes.includes(elements.search_mode.value)) elements.search_mode.value = capability.modes[0];
+    if (available) {
+      const selectedLimit = Number(elements.search_limit.value);
+      if (!Number.isSafeInteger(selectedLimit) || selectedLimit < 1 || selectedLimit > maximum) {
+        elements.search_limit.value = String(Math.min(8, maximum));
+      }
+    }
+    elements.search_controls.hidden = !available;
+    elements.search_toggle.setAttribute("aria-pressed", state.agentSearchSelected ? "true" : "false");
+    elements.search_options.hidden = !available || !state.agentSearchSelected;
+    elements.search_limit.max = String(maximum);
+    const disabled = !available || interactionLocked();
+    elements.search_toggle.disabled = disabled;
+    elements.search_mode.disabled = disabled || !state.agentSearchSelected;
+    elements.search_limit.disabled = disabled || !state.agentSearchSelected;
+  }
+
+  function selectedAgentSearch() {
+    if (!state.agentSearchSelected) return undefined;
+    const capability = state.capabilities.search;
+    if (state.mode !== "agent" || state.capabilities.enabled !== true || capability?.enabled !== true) {
+      throw new TypeError("Agent search is not available");
+    }
+    const search = validateAgentSearch({
+      mode: elements.search_mode.value,
+      limit: Number(elements.search_limit.value),
+    });
+    if (!capability.modes.includes(search.mode) || search.limit > capability.maximumSources) {
+      throw new TypeError("Agent search selection exceeds the negotiated capability");
+    }
+    return search;
+  }
+
   function updateImageControl() {
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
@@ -1220,6 +1267,7 @@ export function createBrowserApp({
           || (pendingChatDeletion && button.dataset.threadDeleteRetry !== "true");
       }
     }
+    updateSearchControl();
     scheduleSafeUpdateReload();
   }
 
@@ -1247,6 +1295,7 @@ export function createBrowserApp({
     if (changed) {
       state.viewEpoch += 1;
       state.streamAbort?.abort();
+      state.agentSearchSelected = false;
     }
     state.mode = nextMode;
     if (remember && state.session.authenticated) rememberWorkspaceMode(state.mode);
@@ -2914,7 +2963,7 @@ export function createBrowserApp({
     }
   }
 
-  async function sendAgent(text) {
+  async function sendAgent(text, search) {
     const session = state.session;
     const agent = state.agent;
     const current = () => state.session === session && state.agent === agent && state.session.authenticated;
@@ -2929,8 +2978,15 @@ export function createBrowserApp({
       renderThreads();
     }
     messageNode("user", text);
-    const { run } = await agent.startRun(threadId, text);
+    const { run } = await agent.startRun(threadId, text, {
+      idempotency: createBrowserOpaqueId("agent_start"),
+      ...(search === undefined ? {} : { search }),
+    });
     if (!current()) return;
+    if (search !== undefined) {
+      state.agentSearchSelected = false;
+      updateSearchControl();
+    }
     correlatedAgentRun(run, { runId: run?.id, threadId });
     await streamAgentRun(run, { expectedThreadId: threadId });
   }
@@ -3285,6 +3341,14 @@ export function createBrowserApp({
     const submissionSession = state.session;
     const submissionMode = state.mode;
     const submissionChat = state.chat;
+    let agentSearch;
+    if (submissionMode === "agent") {
+      try { agentSearch = selectedAgentSearch(); }
+      catch {
+        showToast("Choose a valid Search mode and source limit before running the Agent.");
+        return;
+      }
+    }
     if (state.mode === "chat") fenceAttachmentRestorationsForSend();
     let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
     let selected = detachedImage?.selected ?? Object.freeze([]);
@@ -3307,7 +3371,7 @@ export function createBrowserApp({
     elements.send_message.disabled = true;
     updateImageControl();
     try {
-      if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text);
+      if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text, agentSearch);
       else await sendChat(text, attachments, {
         localPreviews,
         onAccepted() {
@@ -3449,6 +3513,7 @@ export function createBrowserApp({
       state.runId = null;
       state.agentRunStatus = null;
       state.agentPendingResume = null;
+      state.agentSearchSelected = false;
       state.agentReplayFailed = false;
       clearConversation();
       state.agent = createAgentClient(state.session);
@@ -3705,6 +3770,7 @@ export function createBrowserApp({
     state.runId = null;
     state.agentRunStatus = null;
     state.agentPendingResume = null;
+    state.agentSearchSelected = false;
     state.agentReplayFailed = false;
     clearConversation();
     purgeAttachmentBlobCache();
@@ -3870,6 +3936,14 @@ export function createBrowserApp({
               }
             }
           }
+          let search;
+          if (text !== undefined) {
+            try { search = selectedAgentSearch(); }
+            catch {
+              showToast("Choose a valid Search mode and source limit before resuming the Agent.");
+              return;
+            }
+          }
           resumeTicket = Object.freeze({
             session: requestedSession,
             agent: requestedAgent,
@@ -3878,6 +3952,7 @@ export function createBrowserApp({
             epoch: requestedEpoch,
             draft,
             text,
+            search,
             idempotency: createBrowserOpaqueId("agent_resume"),
           });
           state.agentPendingResume = resumeTicket;
@@ -3901,7 +3976,10 @@ export function createBrowserApp({
         const response = await requestedAgent.resumeRun(
           requestedRunId,
           resumeTicket.text,
-          { idempotency: resumeTicket.idempotency },
+          {
+            idempotency: resumeTicket.idempotency,
+            ...(resumeTicket.search === undefined ? {} : { search: resumeTicket.search }),
+          },
         );
         if (!ownsAgentResume() || state.agentPendingResume !== resumeTicket) return;
         const { run } = response;
@@ -3914,6 +3992,7 @@ export function createBrowserApp({
           if (elements.message_input.value === resumeTicket.draft) elements.message_input.value = "";
           messageNode("user", resumeTicket.text, { runId: resumedRun.id });
         }
+        if (resumeTicket.search !== undefined) state.agentSearchSelected = false;
         await streamAgentRun(resumedRun, {
           expectedRunId: resumedRun.id,
           expectedThreadId: requestedThreadId,
@@ -4330,6 +4409,11 @@ export function createBrowserApp({
     elements.new_thread.addEventListener("click", newConversation);
     elements.stop_run.addEventListener("click", () => { void stop(); });
     elements.resume_run.addEventListener("click", () => { void resume(); });
+    elements.search_toggle.addEventListener("click", () => {
+      if (elements.search_toggle.disabled || elements.search_controls.hidden) return;
+      state.agentSearchSelected = !state.agentSearchSelected;
+      updateSearchControl();
+    });
     elements.agent_mode.addEventListener("click", () => setMode("agent"));
     elements.chat_mode.addEventListener("click", () => setMode("chat"));
     elements.theme_picker.addEventListener("change", () => applyTheme(elements.theme_picker.value, { document }));

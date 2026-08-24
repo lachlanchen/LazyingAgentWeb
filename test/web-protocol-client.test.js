@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   AGINTI_RPC_PATHS,
+  AGINTI_SEARCH_MODES,
   AgintiProtocolError,
   FAIL_CLOSED_AGENT_CAPABILITIES,
   canonicalJson,
@@ -11,6 +12,7 @@ import {
   initialEventCursor,
   validateAgentCapabilities,
   validateAgentRequest,
+  validateAgentSearch,
   validateAgentResponse,
   validateArtifact,
   validateEventEnvelope,
@@ -99,6 +101,28 @@ function artifact() {
   };
 }
 
+function sourceArtifact(overrides = {}) {
+  return {
+    id: ARTIFACT_ID,
+    title: "Grounded sources",
+    kind: "sources",
+    spec: {
+      schemaVersion: "1",
+      sources: [{
+        index: 1,
+        title: "Primary source",
+        url: "https://example.test/research",
+        snippet: "A bounded evidence summary.",
+        providers: ["provider-one"],
+        kind: "web",
+        publishedDate: "2026-08-20",
+        doi: null,
+      }],
+    },
+    ...overrides,
+  };
+}
+
 function event({ seq, type, payload, previousHash, runId = RUN_ID, threadId = THREAD_ID, extra = {} }) {
   const envelope = {
     schemaVersion: "1",
@@ -133,6 +157,21 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
     threadId: THREAD_ID,
     input: { text: "Plot this" },
   }), { threadId: THREAD_ID, input: { text: "Plot this" } });
+  assert.deepEqual(validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
+    threadId: THREAD_ID,
+    input: { text: "Find evidence", search: { mode: "both", limit: 12 } },
+  }), { threadId: THREAD_ID, input: { text: "Find evidence", search: { mode: "both", limit: 12 } } });
+  assert.deepEqual(validateAgentSearch({ mode: "papers", limit: 1 }), { mode: "papers", limit: 1 });
+  for (const search of [
+    { mode: "auto", limit: 5 },
+    { mode: "web", limit: 0 },
+    { mode: "papers", limit: 21 },
+    { mode: "both", limit: 5, query: "browser override" },
+  ]) assert.throws(() => validateAgentSearch(search));
+  const accessorSearch = {};
+  Object.defineProperty(accessorSearch, "mode", { enumerable: true, get() { return "web"; } });
+  Object.defineProperty(accessorSearch, "limit", { enumerable: true, value: 5 });
+  assert.throws(() => validateAgentSearch(accessorSearch), /data properties/u);
   assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
     threadId: THREAD_ID,
     input: { text: "x\ud800" },
@@ -188,7 +227,50 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     actions: { cancel: true, resume: true, retry: false },
   });
   assert.equal(validateAgentCapabilities(enabled).enabled, true);
+  assert.equal(validateAgentCapabilities(enabled).search, undefined, "legacy capability stays byte-shape compatible");
+  assert.deepEqual(validateAgentCapabilities(enabled), enabled);
+  assert.equal(canonicalJson(validateAgentCapabilities(enabled)), canonicalJson(enabled));
+  assert.equal(digest(canonicalJson(validateAgentCapabilities(enabled))), digest(canonicalJson(enabled)));
+  assert.equal(Object.hasOwn(FAIL_CLOSED_AGENT_CAPABILITIES, "search"), false);
+  const explicitlyDisabledSearch = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+    search: { enabled: false, modes: [], maximumSources: 0 },
+  });
+  assert.deepEqual(validateAgentCapabilities(explicitlyDisabledSearch), enabled);
+  assert.equal(Object.hasOwn(validateAgentCapabilities(explicitlyDisabledSearch), "search"), false);
   assert.equal(selectDefaultMode(enabled), "agent");
+  const searchEnabled = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+    search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 20 },
+    artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" },
+  });
+  assert.deepEqual(validateAgentCapabilities(searchEnabled).search, {
+    enabled: true,
+    modes: ["web", "papers", "both"],
+    maximumSources: 20,
+  });
+  for (const invalid of [
+    { ...searchEnabled, search: { enabled: true, modes: ["web", "both", "papers"], maximumSources: 20 } },
+    { ...searchEnabled, search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 21 } },
+    { ...searchEnabled, artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" } },
+    { ...capabilities(), search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 20 }, artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" } },
+  ]) assert.equal(failClosedCapabilities(invalid), FAIL_CLOSED_AGENT_CAPABILITIES);
+  const accessorModes = [];
+  Object.defineProperty(accessorModes, "0", { enumerable: true, get() { return "web"; } });
+  accessorModes.push("papers", "both");
+  assert.equal(failClosedCapabilities({
+    ...searchEnabled,
+    search: { ...searchEnabled.search, modes: accessorModes },
+  }), FAIL_CLOSED_AGENT_CAPABILITIES);
+  const sparseModes = new Array(3);
+  sparseModes[0] = "web";
+  sparseModes[2] = "both";
+  assert.equal(failClosedCapabilities({
+    ...searchEnabled,
+    search: { ...searchEnabled.search, modes: sparseModes },
+  }), FAIL_CLOSED_AGENT_CAPABILITIES);
   for (const invalid of [
     { ...enabled, agent: { kind: "adapter", label: "Agent" } },
     { ...enabled, model: { label: "DeepSeek" } },
@@ -198,6 +280,68 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     assert.equal(failClosedCapabilities(invalid), FAIL_CLOSED_AGENT_CAPABILITIES);
     assert.equal(selectDefaultMode(invalid), "chat");
   }
+});
+
+test("sources artifacts are exact, bounded, credential-free HTTPS presentation data", () => {
+  const normalized = validateArtifact(sourceArtifact());
+  assert.equal(normalized.kind, "sources");
+  assert.equal(normalized.spec.sources[0].url, "https://example.test/research");
+  assert.equal(Object.isFrozen(normalized.spec.sources[0]), true);
+
+  const invalidUrls = [
+    "http://example.test/research",
+    "https://user:password@example.test/research",
+    "https://example.test/research#private",
+    "https://example.test/research?access_token=secret",
+    "https://example.test/research?X-Amz-Credential=secret&X-Amz-Signature=signed",
+    "https://example.test/research?AWSAccessKeyId=secret",
+    "https://example.test/research?GoogleAccessId=secret",
+    "https://example.test/research?sig=secret",
+    "javascript:alert(1)",
+  ];
+  for (const url of invalidUrls) {
+    const candidate = sourceArtifact();
+    candidate.spec.sources[0].url = url;
+    assert.throws(() => validateArtifact(candidate), /HTTPS|credential|fragment/u);
+  }
+  for (const mutate of [
+    (source) => { source.index = 2; },
+    (source) => { source.title = "<img onerror=alert(1)>"; },
+    (source) => { source.snippet = "read /home/aginti/private"; },
+    (source) => { source.providers = ["same", "same"]; },
+    (source) => { source.kind = "file"; },
+    (source) => { source.publishedDate = "2025-02-29"; },
+    (source) => { source.doi = "not-a-doi"; },
+    (source) => { source.extra = "private"; },
+  ]) {
+    const candidate = sourceArtifact();
+    mutate(candidate.spec.sources[0]);
+    assert.throws(() => validateArtifact(candidate));
+  }
+  const sparse = sourceArtifact();
+  sparse.spec.sources = new Array(1);
+  assert.throws(() => validateArtifact(sparse), /sparse/u);
+  const accessor = sourceArtifact();
+  const providerItems = [];
+  Object.defineProperty(providerItems, "0", { enumerable: true, get() { return "provider-one"; } });
+  providerItems.length = 1;
+  accessor.spec.sources[0].providers = providerItems;
+  assert.throws(() => validateArtifact(accessor), /data entries/u);
+  const tooMany = sourceArtifact();
+  tooMany.spec.sources = Array.from({ length: 21 }, (unused, index) => ({
+    ...sourceArtifact().spec.sources[0],
+    index: index + 1,
+    url: `https://example.test/research/${index + 1}`,
+  }));
+  assert.throws(() => validateArtifact(tooMany), /1-20/u);
+  const oversized = sourceArtifact();
+  oversized.spec.sources = Array.from({ length: 20 }, (unused, index) => ({
+    ...sourceArtifact().spec.sources[0],
+    index: index + 1,
+    url: `https://example.test/research/${index + 1}`,
+    snippet: "e".repeat(4_000),
+  }));
+  assert.throws(() => validateArtifact(oversized), /48 KiB/u);
 });
 
 test("public responses and artifacts reject private state, active content, URLs, and oversized data", () => {
@@ -320,11 +464,15 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
       if (url.endsWith(AGINTI_RPC_PATHS.threadsCreate)) {
         return jsonResponse({ schemaVersion: "1", thread: publicThread() });
       }
+      if (url.endsWith(AGINTI_RPC_PATHS.runsStart)) {
+        return jsonResponse({ schemaVersion: "1", run: publicRun() });
+      }
       return jsonResponse({ schemaVersion: "1", threads: [], nextBefore: null });
     },
   });
   await client.listThreads();
   await client.createThread({ title: "Plot values" });
+  await client.startRun(THREAD_ID, "Find grounded evidence", { search: { mode: "web", limit: 5 } });
   assert.equal(calls[0].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsList}`);
   assert.equal(calls[1].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsCreate}`);
   assert.equal(calls[0].options.method, "POST");
@@ -332,6 +480,12 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   assert.equal(calls[0].options.headers.get("idempotency-key"), null);
   assert.equal(calls[1].options.headers.get("idempotency-key"), "mutation-key-1234567890");
   assert.equal(calls[1].options.headers.get("x-csrf-token"), "csrf-token-value-long-enough");
+  assert.equal(calls[2].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.runsStart}`);
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
+    threadId: THREAD_ID,
+    input: { text: "Find grounded evidence", search: { mode: "web", limit: 5 } },
+  });
+  assert.equal(calls[2].options.headers.get("idempotency-key"), "mutation-key-1234567890");
   for (const name of [
     "authorization",
     "x-aginti-principal-id",

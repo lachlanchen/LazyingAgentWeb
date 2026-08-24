@@ -416,11 +416,21 @@ export class AgintiBrowserClient {
   getThread(threadId, options) { return this.call(AGINTI_RPC_PATHS.threadsGet, { threadId }, options); }
   updateThread(body, options) { return this.call(AGINTI_RPC_PATHS.threadsUpdate, body, options); }
   deleteThread(threadId, options) { return this.call(AGINTI_RPC_PATHS.threadsDelete, { threadId }, options); }
-  startRun(threadId, text, options) { return this.call(AGINTI_RPC_PATHS.runsStart, { threadId, input: { text } }, options); }
+  startRun(threadId, text, { search, ...options } = {}) {
+    return this.call(AGINTI_RPC_PATHS.runsStart, {
+      threadId,
+      input: { text, ...(search === undefined ? {} : { search }) },
+    }, options);
+  }
   runStatus(runId, options) { return this.call(AGINTI_RPC_PATHS.runsStatus, { runId }, options); }
   cancelRun(runId, options) { return this.call(AGINTI_RPC_PATHS.runsCancel, { runId }, options); }
-  resumeRun(runId, text, options) {
-    return this.call(AGINTI_RPC_PATHS.runsResume, text === undefined ? { runId } : { runId, input: { text } }, options);
+  resumeRun(runId, text, { search, ...options } = {}) {
+    if (text === undefined && search !== undefined) throw new TypeError("search requires a corrected resume prompt");
+    return this.call(
+      AGINTI_RPC_PATHS.runsResume,
+      text === undefined ? { runId } : { runId, input: { text, ...(search === undefined ? {} : { search }) } },
+      options,
+    );
   }
   listArtifacts(body, options) { return this.call(AGINTI_RPC_PATHS.artifactsList, body, options); }
   getArtifact(artifactId, options) { return this.call(AGINTI_RPC_PATHS.artifactsGet, { artifactId }, options); }

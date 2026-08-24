@@ -540,6 +540,21 @@ ${modulePreloads}
           <span id="image-preview-label"></span>
           <button id="remove-image" type="button" aria-label="Remove all selected images">Remove</button>
         </div>
+        <div id="search-controls" class="search-controls" hidden>
+          <button id="search-toggle" type="button" aria-pressed="false">Search</button>
+          <div id="search-options" class="search-options" hidden>
+            <label>Sources
+              <select id="search-mode" autocomplete="off">
+                <option value="web" selected>Web</option>
+                <option value="papers">Papers</option>
+                <option value="both">Web + papers</option>
+              </select>
+            </label>
+            <label>Limit
+              <input id="search-limit" type="number" inputmode="numeric" min="1" max="20" value="8" required>
+            </label>
+          </div>
+        </div>
         <label class="sr-only" for="message-input">Message</label>
         <textarea id="message-input" name="message" rows="1" maxlength="32000" placeholder="Message LocalLLM" required></textarea>
         <div class="composer-actions">
@@ -673,6 +688,18 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-rejected { color: var(--danger); }
 .composer { display: flex; gap: .75rem; align-items: end; padding: .8rem max(1rem, calc((100% - 850px) / 2)); border-top: 1px solid var(--line); background: var(--surface); }
 .composer textarea { min-height: 48px; max-height: 180px; flex: 1; resize: vertical; padding: .75rem; }
+.search-controls { display: flex; align-items: end; gap: .45rem; }
+.search-controls > button { min-height: 48px; }
+.search-controls > button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+.search-options { display: flex; gap: .4rem; }
+.search-options label { display: grid; gap: .2rem; color: var(--muted); font-size: .72rem; }
+.search-options select, .search-options input { min-height: 32px; padding: .35rem; }
+.search-options input { width: 4.5rem; }
+.artifact-sources { display: grid; gap: .65rem; padding: 0; list-style: none; }
+.artifact-source-card { padding: .75rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+.artifact-source-title { margin: 0; font-size: 1rem; }
+.artifact-source-snippet { margin: .45rem 0; }
+.artifact-source-metadata { margin: .35rem 0 0; color: var(--muted); font-size: .78rem; }
 .image-button { min-height: 48px; }
 .image-preview { display: flex; max-width: 190px; align-items: center; gap: .45rem; padding: .35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .image-preview img { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; }
@@ -702,6 +729,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .topbar { gap: .45rem; }
   .mode-switch button { padding-inline: .55rem; }
   .composer { flex-direction: column; align-items: stretch; }
+  .search-controls { align-items: stretch; }
+  .search-options { flex: 1; }
+  .search-options label { flex: 1; }
+  .search-options select, .search-options input { width: 100%; }
   .image-preview { max-width: 100%; }
   .message-attachments { grid-template-columns: minmax(0, 1fr); }
   .composer-actions { justify-content: flex-end; }

@@ -50,6 +50,8 @@ export const AGINTI_RUN_STATUSES = Object.freeze([
   "cancelled",
 ]);
 
+export const AGINTI_SEARCH_MODES = Object.freeze(["web", "papers", "both"]);
+
 export const FAIL_CLOSED_AGENT_CAPABILITIES = Object.freeze({
   schemaVersion: AGINTI_SCHEMA_VERSION,
   enabled: false,
@@ -82,6 +84,8 @@ const UNSAFE_PRESENTATION = /[<>]|(?:javascript\s*:|(?:https?|data|file)\s*:\/\/
 const CONTROL = /\u0000|[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ZERO_HASH = "0".repeat(64);
 const MAX_PLOT_MAGNITUDE = Number.MAX_SAFE_INTEGER;
+const SEARCH_MODES = new Set(AGINTI_SEARCH_MODES);
+const CREDENTIAL_QUERY_NAME = /(?:(?:^|[_-])(?:access[_-]?token|api[_-]?key|auth(?:orization)?|credential|key|password|secret|signature|token)(?:$|[_-])|^(?:(?:aws|google)?accesskeyid|googleaccessid|sig)$)/iu;
 const utf8 = new TextEncoder();
 const verifiedEvents = new WeakSet();
 
@@ -125,6 +129,26 @@ function exact(value, allowed, label, required = allowed) {
   }
   for (const key of required) {
     if (!Object.hasOwn(value, key)) invalid(`${label}.${key} is required`);
+  }
+  return value;
+}
+
+function denseDataArray(value, label, { minimum = 0, maximum } = {}) {
+  if (!Array.isArray(value) || value.length < minimum || value.length > maximum) {
+    invalid(`${label} must contain ${minimum}-${maximum} entries`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (key === "length") continue;
+    if (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/u.test(key)
+        || Number(key) >= value.length) invalid(`${label} contains an unsupported field`);
+    const descriptor = descriptors[key];
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+      invalid(`${label} must contain only enumerable data entries`);
+    }
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(descriptors, String(index))) invalid(`${label} may not contain sparse entries`);
   }
   return value;
 }
@@ -239,13 +263,25 @@ function title(value, { optional = false } = {}) {
   return label(value, "title", 120);
 }
 
+export function validateAgentSearch(value) {
+  const search = exact(value, ["mode", "limit"], "input.search");
+  if (!SEARCH_MODES.has(search.mode)) invalid("input.search.mode must be web, papers, or both");
+  return Object.freeze({
+    mode: search.mode,
+    limit: boundedInteger(search.limit, "input.search.limit", { minimum: 1, maximum: 20 }),
+  });
+}
+
 function input(value, { optional = false } = {}) {
   if (optional && value === undefined) return undefined;
-  const object = exact(value, ["text"], "input");
+  const object = exact(value, ["text", "search"], "input", ["text"]);
   const text = boundedText(object.text, "input.text", 32_000, { minimum: 1 }).trim();
   if (!text) invalid("input.text must contain non-whitespace text");
   if (utf8.encode(text).byteLength > 32 * 1024) invalid("input.text exceeds the UTF-8 byte limit");
-  return Object.freeze({ text });
+  return Object.freeze({
+    text,
+    ...(object.search === undefined ? {} : { search: validateAgentSearch(object.search) }),
+  });
 }
 
 export function validateAgentRequest(pathname, value = {}) {
@@ -438,17 +474,87 @@ export function validateMarkdownSpec(value) {
   return Object.freeze({ schemaVersion: AGINTI_SCHEMA_VERSION, markdown });
 }
 
+function sourceUrl(value, name) {
+  const raw = boundedText(value, name, 2_048, { minimum: 1 });
+  let parsed;
+  try { parsed = new URL(raw); }
+  catch { invalid(`${name} must be an HTTPS URL`); }
+  if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password
+      || (parsed.port && parsed.port !== "443") || parsed.hash) {
+    invalid(`${name} must be a credential-free HTTPS URL without a fragment`);
+  }
+  for (const [key] of parsed.searchParams) {
+    if (CREDENTIAL_QUERY_NAME.test(key)) invalid(`${name} may not contain credential query fields`);
+  }
+  return parsed.href;
+}
+
+function sourceDate(value, name) {
+  if (value === null) return null;
+  const result = boundedText(value, name, 10, { minimum: 10 });
+  const parsed = new Date(`${result}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(result) || !Number.isFinite(parsed.getTime())
+      || parsed.toISOString().slice(0, 10) !== result) {
+    invalid(`${name} must be a canonical calendar date or null`);
+  }
+  return result;
+}
+
+function sourceDoi(value, name) {
+  if (value === null) return null;
+  const result = boundedText(value, name, 300, { minimum: 7, presentation: true }).trim();
+  if (!/^10\.\d{4,9}\/[A-Za-z0-9][A-Za-z0-9._;()/:+-]*$/u.test(result)) {
+    invalid(`${name} must be a DOI or null`);
+  }
+  return result;
+}
+
+export function validateSourcesSpec(value) {
+  const spec = exact(value, ["schemaVersion", "sources"], "sources spec");
+  if (spec.schemaVersion !== AGINTI_SCHEMA_VERSION) invalid("sources spec schemaVersion must be 1");
+  const sourceItems = denseDataArray(spec.sources, "sources", { minimum: 1, maximum: 20 });
+  const sources = sourceItems.map((source, offset) => {
+    const item = exact(
+      source,
+      ["index", "title", "url", "snippet", "providers", "kind", "publishedDate", "doi"],
+      `sources[${offset}]`,
+    );
+    if (item.index !== offset + 1) invalid(`sources[${offset}].index must match its one-based position`);
+    const providerItems = denseDataArray(item.providers, `sources[${offset}].providers`, { minimum: 1, maximum: 12 });
+    const providers = providerItems.map((provider, index) => label(
+      provider,
+      `sources[${offset}].providers[${index}]`,
+      100,
+    ));
+    if (new Set(providers).size !== providers.length) invalid(`sources[${offset}].providers must be unique`);
+    if (!["web", "paper"].includes(item.kind)) invalid(`sources[${offset}].kind must be web or paper`);
+    return Object.freeze({
+      index: item.index,
+      title: label(item.title, `sources[${offset}].title`, 500),
+      url: sourceUrl(item.url, `sources[${offset}].url`),
+      snippet: boundedText(item.snippet, `sources[${offset}].snippet`, 4_000, { presentation: true }).trim(),
+      providers: Object.freeze(providers),
+      kind: item.kind,
+      publishedDate: sourceDate(item.publishedDate, `sources[${offset}].publishedDate`),
+      doi: sourceDoi(item.doi, `sources[${offset}].doi`),
+    });
+  });
+  return Object.freeze({ schemaVersion: AGINTI_SCHEMA_VERSION, sources: Object.freeze(sources) });
+}
+
 export function validateArtifact(value) {
   const artifact = exact(value, ["id", "title", "kind", "spec"], "artifact");
   const kind = artifact.kind;
-  if (!["plot", "table", "markdown"].includes(kind)) invalid("artifact kind is unsupported");
+  if (!["plot", "table", "markdown", "sources"].includes(kind)) invalid("artifact kind is unsupported");
   const normalized = Object.freeze({
     id: validateArtifactId(artifact.id),
     title: title(artifact.title),
     kind,
     spec: kind === "plot"
       ? validatePlotSpec(artifact.spec)
-      : (kind === "table" ? validateTableSpec(artifact.spec) : validateMarkdownSpec(artifact.spec)),
+      : (kind === "table"
+        ? validateTableSpec(artifact.spec)
+        : (kind === "markdown" ? validateMarkdownSpec(artifact.spec) : validateSourcesSpec(artifact.spec))),
   });
   if (utf8.encode(JSON.stringify(normalized)).byteLength > 48 * 1024) {
     invalid("artifact exceeds its 48 KiB public contract", "ARTIFACT_TOO_LARGE");
@@ -629,8 +735,9 @@ export function assertVerifiedAgentEvent(value) {
 export function validateAgentCapabilities(value) {
   const response = exact(
     value,
-    ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "artifacts"],
+    ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "search", "artifacts"],
     "agent capabilities",
+    ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "artifacts"],
   );
   if (response.schemaVersion !== AGINTI_SCHEMA_VERSION || typeof response.enabled !== "boolean") {
     invalid("agent capabilities schemaVersion or enabled flag is invalid");
@@ -639,16 +746,35 @@ export function validateAgentCapabilities(value) {
   const model = exact(response.model, ["label"], "agent capabilities model");
   const actions = exact(response.actions, ["cancel", "resume", "retry"], "agent capabilities actions");
   const attachments = exact(response.attachments, ["enabled"], "agent capabilities attachments");
+  const search = response.search === undefined
+    ? { enabled: false, modes: [], maximumSources: 0 }
+    : exact(response.search, ["enabled", "modes", "maximumSources"], "agent capabilities search");
   const artifacts = exact(response.artifacts, ["kinds", "schemaVersion"], "agent capabilities artifacts");
   if (agent.kind !== "aginti" || agent.label !== "AgInTi Agent") invalid("agent authority must be AgInTi");
   if (model.label !== "LocalLLM") invalid("agent inference label must be LocalLLM");
-  if (![actions.cancel, actions.resume, actions.retry, attachments.enabled].every((flag) => typeof flag === "boolean")) {
+  if (![actions.cancel, actions.resume, actions.retry, attachments.enabled, search.enabled].every((flag) => typeof flag === "boolean")) {
     invalid("agent capability flags must be booleans");
   }
   if (actions.retry || attachments.enabled) invalid("retry and attachments are not enabled in protocol v1");
+  const searchModes = search.enabled ? AGINTI_SEARCH_MODES : [];
+  const maximumSources = search.enabled
+    ? boundedInteger(search.maximumSources, "agent capabilities search maximumSources", { minimum: 1, maximum: 20 })
+    : 0;
+  denseDataArray(search.modes, "agent capabilities search modes", {
+    minimum: searchModes.length,
+    maximum: searchModes.length,
+  });
+  if (canonicalJson(search.modes) !== canonicalJson(searchModes)
+      || (!search.enabled && search.maximumSources !== 0)) {
+    invalid("agent search capabilities are invalid");
+  }
+  if (search.enabled && !response.enabled) invalid("disabled capabilities may not advertise search");
+  const artifactKinds = search.enabled
+    ? ["plot", "table", "markdown", "sources"]
+    : ["plot", "table", "markdown"];
   if (artifacts.schemaVersion !== AGINTI_SCHEMA_VERSION
       || !Array.isArray(artifacts.kinds)
-      || canonicalJson(artifacts.kinds) !== canonicalJson(["plot", "table", "markdown"])) {
+      || canonicalJson(artifacts.kinds) !== canonicalJson(artifactKinds)) {
     invalid("agent artifact capabilities are invalid");
   }
   if (!response.enabled && (actions.cancel || actions.resume)) invalid("disabled capabilities may not advertise actions");
@@ -659,7 +785,10 @@ export function validateAgentCapabilities(value) {
     model: Object.freeze({ label: "LocalLLM" }),
     actions: Object.freeze({ cancel: actions.cancel, resume: actions.resume, retry: false }),
     attachments: Object.freeze({ enabled: false }),
-    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: AGINTI_SCHEMA_VERSION }),
+    ...(search.enabled ? {
+      search: Object.freeze({ enabled: search.enabled, modes: Object.freeze(searchModes), maximumSources }),
+    } : {}),
+    artifacts: Object.freeze({ kinds: Object.freeze(artifactKinds), schemaVersion: AGINTI_SCHEMA_VERSION }),
   });
 }
 

@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.21 candidate; v0.1.20 production):** production is promoted
+> **Deployment status (v0.1.21 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -14,12 +14,16 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > retain public failure reasons across reload, and follow exact idempotent Resume
 > successor runs with an optional corrected prompt. Direct Chat remembers the
 > user's non-private workspace-mode preference across a full reload, while
-> confirmed sign-out fences stale history reads. The v0.1.21 candidate also
+> confirmed sign-out fences stale history reads. The accepted v0.1.21 release also
 > keeps failed-predecessor and corrected-success messages in chronological
 > order when their verified output and plot artifacts are restored after reload.
-> Accepted artifacts remain limited to declarative plot, table, and Markdown schemas; voice
-> messages, web/deep research, and general artifact file upload/download remain
-> unavailable.
+> The baseline accepted artifacts remain declarative plot, table, and Markdown
+> schemas. This source tree also defines a default-disabled grounded-search
+> extension: only an exact AgInTi capability may reveal the explicit Search
+> controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and
+> admit bounded HTTPS-only `sources` artifacts. Current production does not
+> claim that capability, and the browser has no direct LocalLLM search route.
+> Voice messages and general artifact file upload/download remain unavailable.
 
 The ownership model, Chat/Agent data planes, recovery semantics, artifact
 boundary, and replaceable-node contract are specified in
@@ -30,7 +34,8 @@ boundary, and replaceable-node contract are specified in
 - A bright-by-default installable PWA with persistent theme and workspace-mode preferences,
   browser-password-manager integration, durable thread restoration, resumable
   streaming, explicit cancellation, optional one-to-four-image Direct Chat input,
-  Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering.
+  Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering,
+  plus capability-gated text-only source cards that never fetch automatically.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
   admission, owner-safe response projections, and graceful job draining.
@@ -58,7 +63,9 @@ boundary, and replaceable-node contract are specified in
   identity/session context, validates exact requests and responses, and sends
   only `x-aginti-principal-id`, `x-aginti-browser-session-id`, and standard
   `Idempotency-Key` authority to AgInTi. LazyEdge remains an opaque transport;
-  Agent state and decisions never move into this package.
+  Agent state and decisions never move into this package. Search-bearing run
+  inputs receive a fresh server-side capability preflight, so a disabled or
+  legacy AgInTi never receives the extension field.
 
 ## Component boundaries
 

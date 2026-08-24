@@ -740,6 +740,14 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
   assert.doesNotMatch(contexts[0].context.browserSession, /__Host|lachlanchen/u);
   assert.deepEqual(state.controlStore.listThreads({ accountId: PRINCIPAL_ID }), []);
 
+  const forgedSearch = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
+    threadId: 'thr_00000000-0000-4000-8000-000000000000',
+    input: { text: 'search despite disabled capability', search: { mode: 'web', limit: 5 } }
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: IDEMPOTENCY });
+  assert.equal(forgedSearch.status, 409);
+  assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/start'), false, 'disabled Search never reaches AgInTi');
+  assert.deepEqual(Object.keys(contexts.at(-1).context).sort(), ['browserSession', 'principalId', 'signal']);
+
   const unavailableState = testState(t);
   const unavailable = await unavailableState.start();
   const unavailableAuth = await login(unavailable.baseUrl);
@@ -754,6 +762,78 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
     input: { text: 'hello' }
   }, { cookie: unavailableAuth.cookie, csrf: unavailableAuth.csrf, idempotency: IDEMPOTENCY });
   assert.equal(bypass.status, 503);
+});
+
+test('preflights negotiated Agent Search and forwards one exact run without a LocalLLM browser route', async (t) => {
+  const calls = [];
+  const threadId = 'thr_12345678-1234-4123-8123-123456789abc';
+  const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
+  const capability = {
+    schemaVersion: '1',
+    enabled: true,
+    agent: { kind: 'aginti', label: 'AgInTi Agent' },
+    model: { label: 'LocalLLM' },
+    actions: { cancel: true, resume: true, retry: false },
+    attachments: { enabled: false },
+    search: { enabled: true, modes: ['web', 'papers', 'both'], maximumSources: 12 },
+    artifacts: { kinds: ['plot', 'table', 'markdown', 'sources'], schemaVersion: '1' }
+  };
+  const adapter = {
+    async capabilities(context) {
+      calls.push({ path: '/agent/v1/capabilities', body: {}, context });
+      return capability;
+    },
+    async rpc(path, body, context) {
+      calls.push({ path, body, context });
+      return {
+        schemaVersion: '1',
+        run: {
+          id: runId,
+          threadId,
+          previousRunId: null,
+          status: 'starting',
+          createdAt: '2026-08-20T08:00:00.000Z',
+          startedAt: null,
+          completedAt: null,
+          cancelRequestedAt: null,
+          output: '',
+          error: null,
+          authority: { kind: 'aginti', snapshotHash: null, runtimeRevision: null, contextDigest: null },
+          eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: '0'.repeat(64), prunedThroughSeq: 0 }
+        }
+      };
+    }
+  };
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const search = { mode: 'both', limit: 7 };
+  const response = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
+    threadId,
+    input: { text: 'Compare current evidence', search }
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: IDEMPOTENCY });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).run.id, runId);
+  assert.deepEqual(calls.map(({ path }) => path), ['/agent/v1/capabilities', '/agent/v1/runs/start']);
+  assert.deepEqual(calls[1].body, { threadId, input: { text: 'Compare current evidence', search } });
+  assert.deepEqual(Object.keys(calls[0].context).sort(), ['browserSession', 'principalId', 'signal']);
+  assert.equal(calls[1].context.idempotencyKey, IDEMPOTENCY);
+
+  const beforeInvalid = calls.length;
+  const invalid = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
+    threadId,
+    input: { text: 'Too many', search: { mode: 'web', limit: 21 } }
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000002' });
+  assert.equal(invalid.status, 400);
+  assert.equal(calls.length, beforeInvalid);
+
+  for (const path of ['/api/transport/localllm/search', '/api/localllm/search', '/api/search']) {
+    const direct = await post(baseUrl, path, {
+      query: 'must not exist'
+    }, { cookie: auth.cookie, csrf: auth.csrf });
+    assert.equal(direct.status, 404);
+  }
+  assert.equal(calls.length, beforeInvalid);
 });
 
 test('uses its own AgInTi adapter contract over application-neutral LazyEdge transport', async (t) => {

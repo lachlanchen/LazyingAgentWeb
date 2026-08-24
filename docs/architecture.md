@@ -3,12 +3,15 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. Current v0.1.20 production and the v0.1.21 replay-order candidate enable Agent only through the
+is fail-closed. Current v0.1.21 production enables Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
-Voice messages, web/deep research, and general artifact file upload/download
-remain unavailable. The accepted Agent artifact surface is limited to the
-declarative plot, table, and Markdown schemas described below.
+Voice messages and general artifact file upload/download remain unavailable.
+Grounded search is a default-disabled protocol extension: the UI remains absent
+unless AgInTi proves the exact Search capability, and current production makes
+no claim that it does. The baseline Agent artifact surface is declarative plot,
+table, and Markdown; the negotiated extension adds only bounded text/HTTPS
+`sources` artifacts.
 Exact requests containing one canonical fenced `python` block take a
 deterministic bounded-execution path, bypass model planning, and preserve
 failure and successor-run state for durable reload and exact idempotent Resume
@@ -349,8 +352,14 @@ tool interface and no hosted-provider, model, node, or authority fallback.
 AgInTi registers artifacts by opaque ID and validates ownership, provenance,
 size, type and digest. The cloud never accepts a model-supplied path or URL.
 Initial inline rendering is limited to exact versioned declarative plot, table
-and Markdown schemas. Plot data is finite, URL-free and expression-free; the
-browser builds DOM/SVG with text nodes. Active HTML, SVG and PDF are never
+and Markdown schemas. A separately negotiated Search capability adds a
+`sources` schema of at most 20 entries and 48 KiB total. Each entry has an exact
+one-based index, literal title/snippet/provider metadata, `web` or `paper` kind,
+nullable canonical publication date and DOI, and a credential-free HTTPS URL.
+Source cards create text nodes and `noopener noreferrer` anchors only; they do
+not issue fetches, previews, preloads, or image requests. Plot data is finite,
+URL-free and expression-free; the browser builds DOM/SVG with text nodes.
+Active HTML, SVG and PDF are never
 served inline on the authenticated origin. File downloads, uploads and vision
 inputs remain disabled until their independent byte, MIME, decompression,
 ownership and sandbox acceptance matrices pass. Direct Chat's bounded multi-image
@@ -398,9 +407,11 @@ admission, tunnel outage and rollback. A live Docker/model acceptance run is
 additionally blocked whenever the shared-workstation resource policy fails.
 Releases are immutable and retain the current and immediately previous
 reproducible package with an executable rollback. Passing offline package tests
-alone does not authorize deployment. Current v0.1.20 production and the v0.1.21 candidate expose Agent
+alone does not authorize deployment. Current v0.1.21 production exposes Agent
 only while AgInTi returns the accepted native capability proof; removing or
 invalidating that proof disables Agent. A live PWA or Direct Chat deployment
 alone neither authorizes nor implies Agent enablement, and Direct Chat remains a
-separate LocalLLM path. Voice messages, web/deep research, and general artifact
-file upload/download remain outside the accepted capability.
+separate LocalLLM path. Search-bearing Agent start/resume requests are
+preflighted against AgInTi's current capability before the mutation is
+forwarded; there is no Web-to-LocalLLM search route. Voice messages and general
+artifact file upload/download remain outside the accepted capability.

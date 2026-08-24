@@ -175,6 +175,7 @@ const APP_IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
 ];
 
 function appDocument({ basePath = "/", releaseId = CURRENT_RELEASE } = {}) {
@@ -2575,7 +2576,7 @@ test("Markdown renders text-only DOM and asks pinned KaTeX for MathML with trust
   assert.match(target.textContent, /<script>alert\(1\)<\/script>/u);
 });
 
-test("plot, table, and Markdown artifacts render declaratively while active content fails closed", () => {
+test("plot, table, Markdown, and source artifacts render declaratively while active content fails closed", () => {
   const document = new DomDocument();
   const renderer = createSafeRenderer({ document });
   const target = document.createElement("section");
@@ -2606,6 +2607,30 @@ test("plot, table, and Markdown artifacts render declaratively while active cont
     markdown: "**Safe result** with $x^2$",
   })), true);
   assert.match(target.textContent, /Safe result/u);
+
+  assert.equal(renderer.renderArtifact(target, artifact("sources", {
+    schemaVersion: "1",
+    sources: [{
+      index: 1,
+      title: "Primary & verified source",
+      url: "https://example.test/research",
+      snippet: "Evidence rendered only as literal text.",
+      providers: ["provider-one", "provider-two"],
+      kind: "paper",
+      publishedDate: "2026-08-20",
+      doi: "10.1234/example.1",
+    }],
+  })), true);
+  const sourceNodes = target.walk();
+  const sourceAnchors = sourceNodes.filter((node) => node.tagName === "a");
+  assert.equal(sourceAnchors.length, 1);
+  assert.equal(sourceAnchors[0].getAttribute("href"), "https://example.test/research");
+  assert.equal(sourceAnchors[0].getAttribute("target"), "_blank");
+  assert.equal(sourceAnchors[0].getAttribute("rel"), "noopener noreferrer");
+  assert.equal(sourceAnchors[0].textContent, "Primary & verified source");
+  assert.match(target.textContent, /Evidence rendered only as literal text/u);
+  assert.match(target.textContent, /Paper · provider-one, provider-two · 2026-08-20 · DOI 10\.1234\/example\.1/u);
+  assert.equal(sourceNodes.some((node) => ["img", "iframe", "script", "link"].includes(node.tagName)), false);
 
   assert.equal(renderer.renderArtifact(target, {
     ...artifact("markdown", { schemaVersion: "1", markdown: "safe" }),

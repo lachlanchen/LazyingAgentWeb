@@ -103,6 +103,7 @@ const IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
+  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
 ];
 
 class Document {
@@ -602,11 +603,78 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(enabled.document.getElementById("workspace").dataset.mode, "agent");
   assert.equal(enabled.document.getElementById("mode-switch").hidden, false);
   assert.equal(enabled.document.getElementById("agent-mode").getAttribute("aria-pressed"), "true");
+  assert.equal(enabled.document.getElementById("search-controls").hidden, true, "legacy Agent capability keeps Search absent");
 
   const malformed = harness({ agent: baseAgent({ ...capabilities({ enabled: true }), runtime: { model: "browser-choice" } }) });
   await malformed.app.initialize();
   assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+});
+
+test("negotiated Agent Search binds one immutable selection to one start mutation", async () => {
+  const completed = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  const accepted = Promise.withResolvers();
+  const observed = Promise.withResolvers();
+  const starts = [];
+  const capability = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+    search: { enabled: true, modes: ["web", "papers", "both"], maximumSources: 12 },
+    artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" },
+  });
+  const agent = {
+    ...baseAgent(capability),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun(threadId, text, options) {
+      starts.push({ threadId, text, options });
+      observed.resolve();
+      return await accepted.promise;
+    },
+    async *streamRunEvents() {
+      yield { event: completed, cursor: { seq: completed.seq, hash: completed.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  const controls = browser.document.getElementById("search-controls");
+  const toggle = browser.document.getElementById("search-toggle");
+  const options = browser.document.getElementById("search-options");
+  const mode = browser.document.getElementById("search-mode");
+  const limit = browser.document.getElementById("search-limit");
+  assert.equal(controls.hidden, false);
+  assert.equal(options.hidden, true);
+  assert.equal(mode.value, "web");
+  assert.equal(limit.value, "8");
+  assert.equal(limit.max, "12");
+  toggle.dispatch("click");
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.equal(options.hidden, false);
+  mode.value = "both";
+  limit.value = "7";
+  browser.document.getElementById("message-input").value = "Compare current evidence";
+  const sending = browser.app.submitMessage({ preventDefault() {} });
+  await observed.promise;
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].options.search, { mode: "both", limit: 7 });
+  assert.equal(Object.isFrozen(starts[0].options.search), true);
+  assert.match(starts[0].options.idempotency, /^agent_start_/u);
+  mode.value = "papers";
+  limit.value = "20";
+  assert.deepEqual(starts[0].options.search, { mode: "both", limit: 7 }, "DOM changes cannot alter the dispatched ticket");
+  accepted.resolve({ run: run() });
+  await sending;
+  assert.equal(starts.length, 1);
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  assert.equal(options.hidden, true);
+  toggle.dispatch("click");
+  mode.value = "web";
+  limit.value = "20";
+  const rejectedDraft = "Do not dispatch beyond the capability";
+  browser.document.getElementById("message-input").value = rejectedDraft;
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts.length, 1);
+  assert.equal(browser.document.getElementById("message-input").value, rejectedDraft);
+  assert.match(browser.document.getElementById("toast").textContent, /valid Search mode and source limit/u);
 });
 
 test("a user-selected Chat workspace survives reload without an automatic Agent handoff changing it", {
@@ -812,6 +880,24 @@ test("completed Agent reload replays the verified ledger into the existing messa
         series: [{ name: "Value", data: [1, 2] }],
       },
     } }],
+    ["artifact.created", { artifact: {
+      id: SECOND_ARTIFACT_ID,
+      title: "Restored sources",
+      kind: "sources",
+      spec: {
+        schemaVersion: "1",
+        sources: [{
+          index: 1,
+          title: "Verified primary source",
+          url: "https://example.test/research",
+          snippet: "Evidence restored from the verified run ledger.",
+          providers: ["provider-one"],
+          kind: "web",
+          publishedDate: "2026-08-20",
+          doi: null,
+        }],
+      },
+    } }],
     ["output.completed", {}],
     ["run.completed", {}],
   ]);
@@ -827,7 +913,12 @@ test("completed Agent reload replays the verified ledger into the existing messa
   let starts = 0;
   let resumes = 0;
   const agent = {
-    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    ...baseAgent(capabilities({
+      enabled: true,
+      actions: { cancel: true, resume: true, retry: false },
+      search: { enabled: true, modes: ["web", "papers", "both"], maximumSources: 20 },
+      artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" },
+    })),
     async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
     async getThread(threadId) { assert.equal(threadId, THREAD_ID); return { thread }; },
     async runStatus(runId) {
@@ -855,10 +946,11 @@ test("completed Agent reload replays the verified ledger into the existing messa
   assert.equal(assistant.dataset.runId, RUN_ID);
   assert.match(assistant.textContent, /Restored verified answer/u);
   assert.match(assistant.textContent, /Restored plot/u);
+  assert.match(assistant.textContent, /Restored sources/u);
   const inlineArtifacts = assistant.children.find((node) => node.className === "message-artifacts");
   assert(inlineArtifacts);
   assert.equal(inlineArtifacts.hidden, false);
-  assert.equal(inlineArtifacts.children.length, 1, "ledger replay projects each artifact exactly once");
+  assert.equal(inlineArtifacts.children.length, 2, "ledger replay projects each run-bound artifact exactly once");
   assert.match(browser.document.getElementById("agent-plan").textContent, /Compute values/u);
   assert.match(browser.document.getElementById("agent-timeline").textContent, /Prepared bounded plot data/u);
   assert.equal(browser.document.getElementById("agent-artifacts").children.length, 0);
@@ -1303,7 +1395,12 @@ test("Agent corrected Resume retries one ambiguous mutation with the same body a
   const calls = [];
   let streams = 0;
   const agent = {
-    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    ...baseAgent(capabilities({
+      enabled: true,
+      actions: { cancel: true, resume: true, retry: false },
+      search: { enabled: true, modes: ["web", "papers", "both"], maximumSources: 20 },
+      artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" },
+    })),
     async createThread() { return { thread: agentThread() }; },
     async startRun() { return { run: run("running") }; },
     async resumeRun(...args) {
@@ -1324,6 +1421,9 @@ test("Agent corrected Resume retries one ambiguous mutation with the same body a
   const input = browser.document.getElementById("message-input");
   const correctedDraft = "  Corrected exact request.  ";
   input.value = correctedDraft;
+  browser.document.getElementById("search-toggle").dispatch("click");
+  browser.document.getElementById("search-mode").value = "papers";
+  browser.document.getElementById("search-limit").value = "4";
 
   await browser.app.resume();
 
@@ -1335,6 +1435,8 @@ test("Agent corrected Resume retries one ambiguous mutation with the same body a
   assert.equal(browser.document.getElementById("chat-mode").disabled, true);
   const laterDraft = "A later draft must survive acceptance";
   input.value = laterDraft;
+  browser.document.getElementById("search-mode").value = "web";
+  browser.document.getElementById("search-limit").value = "20";
 
   await browser.app.resume();
 
@@ -1342,6 +1444,8 @@ test("Agent corrected Resume retries one ambiguous mutation with the same body a
   assert.deepEqual(calls[0].slice(0, 2), [RUN_ID, correctedDraft.trim()]);
   assert.deepEqual(calls[1].slice(0, 2), [RUN_ID, correctedDraft.trim()]);
   assert.equal(calls[0][2].idempotency, calls[1][2].idempotency);
+  assert.deepEqual(calls[0][2].search, { mode: "papers", limit: 4 });
+  assert.deepEqual(calls[1][2].search, { mode: "papers", limit: 4 });
   assert.match(calls[0][2].idempotency, /^agent_resume_[A-Za-z0-9._~-]+$/u);
   assert.equal(input.value, laterDraft, "acceptance never consumes composer work created after the ticket");
   const users = browser.document.getElementById("messages").children

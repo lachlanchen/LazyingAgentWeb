@@ -51,7 +51,9 @@ test("uses only AgInTi-owned identity headers and standard mutation idempotency"
     credentialProvider: async () => TOKEN,
     fetchImpl: async (url, init) => {
       calls.push({ url, init, headers: new Headers(init.headers) });
-      if (url.endsWith(AGINTI_RPC_PATHS.threadsCreate)) return new Response("", { status: 503 });
+      if (url.endsWith(AGINTI_RPC_PATHS.threadsCreate) || url.endsWith(AGINTI_RPC_PATHS.runsStart)) {
+        return new Response("", { status: 503 });
+      }
       return new Response(JSON.stringify(CAPABILITIES), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -75,6 +77,18 @@ test("uses only AgInTi-owned identity headers and standard mutation idempotency"
     (error) => error instanceof AgintiAdapterError && error.statusCode === 503,
   );
   assert.equal(calls[1].headers.get(AGINTI_INTERNAL_HEADERS.idempotency), idempotencyKey);
+  await assert.rejects(
+    adapter.rpc(AGINTI_RPC_PATHS.runsStart, {
+      threadId: "thr_12345678-1234-4123-8123-123456789abc",
+      input: { text: "Find evidence", search: { mode: "papers", limit: 6 } },
+    }, { ...CONTEXT, idempotencyKey: "agent-search-00000001" }),
+    (error) => error instanceof AgintiAdapterError && error.statusCode === 503,
+  );
+  assert.deepEqual(JSON.parse(calls[2].init.body), {
+    threadId: "thr_12345678-1234-4123-8123-123456789abc",
+    input: { text: "Find evidence", search: { mode: "papers", limit: 6 } },
+  });
+  assert.equal(calls[2].headers.get(AGINTI_INTERNAL_HEADERS.idempotency), "agent-search-00000001");
 });
 
 test("rejects ambient, remote, malformed, accessor, and confused request authority before fetch", async () => {
@@ -92,6 +106,10 @@ test("rejects ambient, remote, malformed, accessor, and confused request authori
   await assert.rejects(adapter.rpc(AGINTI_RPC_PATHS.capabilities, {}, { ...CONTEXT, extra: true }), TypeError);
   await assert.rejects(adapter.rpc(AGINTI_RPC_PATHS.capabilities, {}, { ...CONTEXT, idempotencyKey: "read-key-00000001" }), TypeError);
   await assert.rejects(adapter.rpc(AGINTI_RPC_PATHS.threadsCreate, { title: "A" }, CONTEXT), TypeError);
+  await assert.rejects(adapter.rpc(AGINTI_RPC_PATHS.runsStart, {
+    threadId: "thr_12345678-1234-4123-8123-123456789abc",
+    input: { text: "Find evidence", search: { mode: "web", limit: 5, endpoint: "http://127.0.0.1:8000" } },
+  }, { ...CONTEXT, idempotencyKey: "agent-search-00000001" }));
   const accessor = {};
   Object.defineProperty(accessor, "principalId", { enumerable: true, get() { return CONTEXT.principalId; } });
   Object.defineProperty(accessor, "browserSession", { enumerable: true, value: CONTEXT.browserSession });

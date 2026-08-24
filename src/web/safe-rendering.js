@@ -565,6 +565,37 @@ function renderTable(document, target, artifact) {
   target.appendChild(wrapper);
 }
 
+function renderSources(document, target, artifact) {
+  const list = createNode(document, "ol", "artifact-sources");
+  artifact.spec.sources.forEach((source) => {
+    const item = createNode(document, "li", "artifact-source-card");
+    const heading = createNode(document, "h4", "artifact-source-title");
+    const anchor = createNode(document, "a");
+    anchor.setAttribute("href", source.url);
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noopener noreferrer");
+    appendText(document, anchor, source.title);
+    heading.appendChild(anchor);
+    item.appendChild(heading);
+    if (source.snippet) {
+      const snippet = createNode(document, "p", "artifact-source-snippet");
+      appendText(document, snippet, source.snippet);
+      item.appendChild(snippet);
+    }
+    const metadata = createNode(document, "p", "artifact-source-metadata");
+    const values = [
+      source.kind === "paper" ? "Paper" : "Web",
+      source.providers.join(", "),
+      source.publishedDate,
+      source.doi === null ? null : `DOI ${source.doi}`,
+    ].filter((value) => value !== null);
+    appendText(document, metadata, values.join(" · "));
+    item.appendChild(metadata);
+    list.appendChild(item);
+  });
+  target.appendChild(list);
+}
+
 export function createSafeRenderer({
   document = globalThis.document,
   katex,
@@ -606,11 +637,11 @@ export function createSafeRenderer({
       try {
         if (artifact.kind === "plot") renderPlot(document, target, artifact);
         else if (artifact.kind === "table") renderTable(document, target, artifact);
-        else {
+        else if (artifact.kind === "markdown") {
           const markdown = createNode(document, "div", "artifact-markdown");
           renderMarkdown(markdown, artifact.spec.markdown);
           target.appendChild(markdown);
-        }
+        } else renderSources(document, target, artifact);
       } catch {
         target.replaceChildren();
         target.dataset.status = "rejected";

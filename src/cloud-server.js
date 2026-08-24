@@ -1440,6 +1440,28 @@ export function createCloudRequestHandler({
       ...(mutation ? { idempotencyKey } : {}),
       signal
     });
+    const readContextFor = (signal) => Object.freeze({
+      principalId: configuredAccount.principalId,
+      browserSession: session.browserSession,
+      signal
+    });
+    const requestedSearch = input.input?.search;
+    if (requestedSearch !== undefined) {
+      const proof = await withTimeout(
+        (signal) => agintiAdapter.capabilities(readContextFor(signal)),
+        { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi capability check timed out' }
+      );
+      let capability;
+      try { capability = validateAgentResponse(AGINTI_RPC_PATHS.capabilities, proof); }
+      catch (error) {
+        throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid capability response.', { cause: error });
+      }
+      if (capability.enabled !== true || capability.search?.enabled !== true
+          || !capability.search.modes.includes(requestedSearch.mode)
+          || requestedSearch.limit > capability.search.maximumSources) {
+        throw new CloudHttpError(409, 'agent_search_unavailable', 'AgInTi Search is not enabled for this session.');
+      }
+    }
     if (nativePath === AGINTI_RPC_PATHS.runsEvents) {
       const streamDeadline = deadlineSignal(requestSignal, limits.sseLifetimeMs, 'Agent event stream reached its reconnect boundary');
       try {

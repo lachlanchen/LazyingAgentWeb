@@ -3720,7 +3720,11 @@ test("a legacy v2 mode-switch list mismatch migrates one encrypted row and perfo
   await settlePwaActions();
   assert.equal(harness.document.getElementById("workspace").dataset.mode, "chat");
   harness.document.getElementById("agent-mode").dispatch("click");
-  await settlePwaActions(4);
+  assert.equal(
+    await settlePwaUntil(() => listCalls === 2 && harness.replacements.length === 1),
+    true,
+    "the bounded release-fence migration did not settle",
+  );
 
   assert.equal(listCalls, 2, "the release fence is raised by the Agent list read after mode switching");
   assert.equal(mutations, 0);

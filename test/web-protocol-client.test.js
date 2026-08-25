@@ -107,6 +107,21 @@ function artifact() {
   };
 }
 
+function fileArtifact() {
+  return {
+    id: ARTIFACT_ID,
+    title: "Compiled paper",
+    kind: "file",
+    spec: {
+      schemaVersion: "1",
+      filename: "paper.pdf",
+      mime: "application/pdf",
+      bytes: 32_768,
+      sha256: "c".repeat(64),
+    },
+  };
+}
+
 function sourceArtifact(overrides = {}) {
   return {
     id: ARTIFACT_ID,
@@ -641,6 +656,32 @@ test("event ledger verifies exact hashes, ownership, sequence, and previous hash
     previousHash: ZERO_HASH,
     digest: async (value) => digest(value),
   }), /may not contain HTML/u);
+  const receiptDigest = "d".repeat(64);
+  const fileCreated = event({
+    seq: 1,
+    type: "artifact.created",
+    payload: { artifact: fileArtifact(), receiptDigest },
+    previousHash: ZERO_HASH,
+  });
+  assert.equal(validateEventEnvelope(fileCreated).payload.receiptDigest, receiptDigest);
+  assert.throws(() => validateEventEnvelope(event({
+    seq: 1,
+    type: "artifact.created",
+    payload: { artifact: fileArtifact() },
+    previousHash: ZERO_HASH,
+  })), /receiptDigest/u);
+  assert.throws(() => validateEventEnvelope(event({
+    seq: 1,
+    type: "artifact.updated",
+    payload: { artifact: fileArtifact(), receiptDigest: receiptDigest.toUpperCase() },
+    previousHash: ZERO_HASH,
+  })), /receiptDigest/u);
+  assert.throws(() => validateEventEnvelope(event({
+    seq: 1,
+    type: "artifact.created",
+    payload: { artifact: artifact(), receiptDigest },
+    previousHash: ZERO_HASH,
+  })), /unsupported field/u);
   assert.throws(() => validateEventEnvelope({ ...first, stdout: "secret" }), /unsupported field/u);
 });
 

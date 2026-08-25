@@ -639,8 +639,18 @@ export function validateEventPayload(type, value) {
     return Object.freeze({ text: boundedText(payload.text, "output.delta text", 4_000, { minimum: 1 }) });
   }
   if (type === "artifact.created" || type === "artifact.updated") {
-    const payload = exact(value, ["artifact"], `${type} payload`);
-    return Object.freeze({ artifact: validateArtifact(payload.artifact) });
+    const eventLabel = `${type} payload`;
+    const payload = exact(value, ["artifact", "receiptDigest"], eventLabel, ["artifact"]);
+    const artifact = validateArtifact(payload.artifact);
+    if (artifact.kind === "file") {
+      exact(value, ["artifact", "receiptDigest"], eventLabel);
+      if (typeof payload.receiptDigest !== "string" || !DIGEST.test(payload.receiptDigest)) {
+        invalid(`${type} file receiptDigest must be a lowercase SHA-256 digest`);
+      }
+      return Object.freeze({ artifact, receiptDigest: payload.receiptDigest });
+    }
+    exact(value, ["artifact"], eventLabel);
+    return Object.freeze({ artifact });
   }
   exact(value, [], `${type} payload`);
   return Object.freeze({});

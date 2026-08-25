@@ -848,6 +848,34 @@ test("resumable POST SSE reconnects from the verified cursor without restarting 
   assert.deepEqual(cursors.map((value) => value.seq), [1, 2]);
 });
 
+test("terminal Agent delivery never waits for an unsettled browser body cancellation", async () => {
+  const completed = event({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  const bytes = new TextEncoder().encode(
+    `id: ${completed.id}\nevent: ${completed.type}\ndata: ${JSON.stringify(completed)}\n\n`,
+  );
+  let cancelCalled = false;
+  const client = new AgintiBrowserClient({
+    transportEndpoint: "/api/edge",
+    baseUrl: "https://llm.lazying.art/",
+    digest: async (value) => digest(value),
+    fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(bytes); },
+      cancel() {
+        cancelCalled = true;
+        return new Promise(() => {});
+      },
+    }), { headers: { "content-type": "text/event-stream" } }),
+  });
+  const iterator = client.streamRunEvents({ runId: RUN_ID, threadId: THREAD_ID });
+  assert.equal((await iterator.next()).value.event.type, "run.completed");
+  const detached = await Promise.race([
+    iterator.return().then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(detached, true);
+  assert.equal(cancelCalled, true);
+});
+
 test("ledger corruption fails immediately and is never treated as a reconnectable outage", async () => {
   const bad = event({ seq: 1, type: "output.delta", payload: { text: "Hello" }, previousHash: ZERO_HASH });
   bad.hash = "e".repeat(64);

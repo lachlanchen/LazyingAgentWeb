@@ -272,6 +272,19 @@ function parseSseBlock(block) {
   return { id: fields.id, type: fields.event, value };
 }
 
+function detachReader(reader) {
+  // A verified terminal ledger event is sufficient to release the UI. Some
+  // browser fetch implementations leave the underlying cancel promise pending
+  // after that point, so transport teardown is deliberately best effort.
+  try {
+    const cancellation = reader.cancel();
+    if (cancellation && typeof cancellation.catch === "function") {
+      void cancellation.catch(() => { /* The event delivery transport is already detaching. */ });
+    }
+  } catch { /* The event delivery transport is already detaching. */ }
+  try { reader.releaseLock?.(); } catch { /* Cancellation still owns the reader. */ }
+}
+
 async function* rawSseBlocks(response) {
   if (!response.body || typeof response.body.getReader !== "function") throw new AgintiProtocolError("event stream body is unavailable");
   const reader = response.body.getReader();
@@ -309,10 +322,8 @@ async function* rawSseBlocks(response) {
       yield tail;
     }
   } finally {
-    if (!ended) {
-      try { await reader.cancel(); } catch { /* The underlying transport is already closing. */ }
-    }
-    reader.releaseLock?.();
+    if (!ended) detachReader(reader);
+    else reader.releaseLock?.();
   }
 }
 

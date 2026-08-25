@@ -877,6 +877,44 @@ test("ending event delivery detaches only; durable cancellation requires its exp
   ]);
 });
 
+test("terminal Direct Chat delivery never waits for an unsettled browser body cancellation", async () => {
+  let cancelCalled = false;
+  const first = publicDelta(1, "A");
+  const terminal = completedGeneration({
+    deltaCount: 1,
+    deltaBytes: 1,
+    lastDeltaHash: HASH_B,
+  });
+  const text = [
+    `id: 1\nevent: delta\ndata: ${JSON.stringify(first)}`,
+    `event: generation\ndata: ${JSON.stringify(terminal)}`,
+    "",
+  ].join("\n\n");
+  const bytes = new TextEncoder().encode(text);
+  const client = new DirectChatBrowserClient(clientOptions({
+    fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(bytes); },
+      cancel() {
+        cancelCalled = true;
+        return new Promise(() => {});
+      },
+    }), { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } }),
+  }));
+  const iterator = client.streamRunEvents({
+    threadId: first.threadId,
+    generationId: first.generationId,
+    maxReconnects: 0,
+  });
+  assert.equal((await iterator.next()).value.type, "delta");
+  assert.equal((await iterator.next()).value.type, "generation");
+  const detached = await Promise.race([
+    iterator.return().then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(detached, true);
+  assert.equal(cancelCalled, true);
+});
+
 test("SSE parser rejects owner leakage, gaps, repeated fields, and cursor persistence failure", async () => {
   const cases = [
     `id: 1\nevent: delta\ndata: ${JSON.stringify({ ...publicDelta(1, "A"), accountId: "private" })}\n\n`,

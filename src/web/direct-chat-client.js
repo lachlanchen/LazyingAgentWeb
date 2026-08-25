@@ -721,6 +721,19 @@ function requireNoStore(response) {
   if (!directives.includes("no-store")) throw new DirectChatProtocolError("Direct Chat response is missing its no-store policy");
 }
 
+function detachReader(reader) {
+  // A browser is allowed to defer settlement of the underlying source's
+  // cancel algorithm. Terminal generation authority has already arrived on
+  // the stream, so transport teardown must never keep the composer busy.
+  try {
+    const cancellation = reader.cancel();
+    if (cancellation && typeof cancellation.catch === "function") {
+      void cancellation.catch(() => { /* The delivery transport is already detaching. */ });
+    }
+  } catch { /* The delivery transport is already detaching. */ }
+  try { reader.releaseLock?.(); } catch { /* Cancellation still owns the reader. */ }
+}
+
 function responseMatchesRoute(response, endpoint) {
   if (response?.redirected === true || response?.type === "opaqueredirect") return false;
   if (typeof response?.url !== "string" || response.url === "") return true;
@@ -800,10 +813,8 @@ async function readBoundedBytes(response, maximum) {
     }
     return bytes;
   } finally {
-    if (!completed) {
-      try { await reader.cancel(); } catch { /* The validation failure is authoritative. */ }
-    }
-    reader.releaseLock?.();
+    if (!completed) detachReader(reader);
+    else reader.releaseLock?.();
   }
 }
 
@@ -945,10 +956,8 @@ async function* sseBlocks(response) {
     if (error instanceof DirectChatProtocolError || error?.name === "AbortError" || error?.name === "TimeoutError") throw error;
     throw new DirectChatTransportError("Direct Chat event delivery was interrupted.");
   } finally {
-    if (!completed) {
-      try { await reader.cancel(); } catch { /* Disconnecting delivery never cancels the durable generation. */ }
-    }
-    reader.releaseLock?.();
+    if (!completed) detachReader(reader);
+    else reader.releaseLock?.();
   }
 }
 

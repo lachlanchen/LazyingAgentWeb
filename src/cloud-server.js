@@ -567,9 +567,10 @@ function fetchMetadataState(req) {
   const destination = req.headers['sec-fetch-dest'];
   const present = [site, mode, destination].filter((value) => value !== undefined).length;
   if (present === 0) return 'missing';
-  if (present !== 3 || site !== 'same-origin'
-      || !['cors', 'same-origin'].includes(mode) || destination !== 'empty') return 'invalid';
-  return 'complete';
+  if ((site !== undefined && site !== 'same-origin')
+      || (mode !== undefined && !['cors', 'same-origin'].includes(mode))
+      || (destination !== undefined && destination !== 'empty')) return 'invalid';
+  return present === 3 ? 'complete' : 'partial';
 }
 
 function rejectFetchMetadata() {
@@ -1596,7 +1597,7 @@ export function createCloudRequestHandler({
       outcomeFetchMetadata = fetchMetadataState(req);
       if (outcomeFetchMetadata === 'invalid') rejectFetchMetadata();
       let metadataAuthenticated = null;
-      if (outcomeFetchMetadata === 'missing' && (route.kind === 'chat' || route.kind === 'agent')) {
+      if (outcomeFetchMetadata !== 'complete' && (route.kind === 'chat' || route.kind === 'agent')) {
         try {
           metadataAuthenticated = await authenticate(req);
         } catch (error) {

@@ -3,7 +3,7 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.23 candidate remains compatible with current v0.1.22
+is fail-closed. The v0.1.24 candidate remains compatible with current v0.1.23
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
@@ -89,10 +89,10 @@ Every browser API response carries the immutable current release identity. New
 shells pin that identity on each request; an explicit mismatch is rejected
 before body ingestion, while a missing request header remains a bounded
 compatibility path for already-open predecessor tabs. Exact-origin iOS and PWA
-requests may omit all Fetch Metadata: login remains available, session/logout
-retain their normal CSRF rules, and Chat/Agent proceed only after the browser
-session and CSRF mutation proof validate. Any present partial or wrong Fetch
-Metadata still fails closed. Bounded outcome records contain only route/status
+requests may omit all or part of otherwise-valid Fetch Metadata: login remains
+available, session/logout retain their normal CSRF rules, and Chat/Agent proceed
+only after the browser session and CSRF mutation proof validate. Any present
+wrong Fetch Metadata value still fails closed. Bounded outcome records contain only route/status
 categories and these gate results—never prompts, identifiers, cookies, tokens,
 or credentials.
 

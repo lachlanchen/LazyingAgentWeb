@@ -608,7 +608,7 @@ test('uses secure browser cookies, session-bound CSRF, generic failures, and own
   assert.equal(foreign.status, 404);
 });
 
-test('iOS/PWA requests without Fetch Metadata stay exact-origin, session-bound, release-compatible, and observable', async (t) => {
+test('iOS/PWA requests with missing or partial Fetch Metadata stay exact-origin, session-bound, release-compatible, and observable', async (t) => {
   const outcomes = [];
   const state = testState(t, { requestOutcomeObserver: (outcome) => outcomes.push(outcome) });
   const { baseUrl } = await state.start();
@@ -649,21 +649,31 @@ test('iOS/PWA requests without Fetch Metadata stay exact-origin, session-bound, 
   assert.equal(missingCsrf.status, 403);
   assert.equal((await missingCsrf.json()).error.code, 'fetch_metadata_rejected');
 
-  const partialMetadata = await fetch(`${baseUrl}/api/chat/threads/list`, {
-    method: 'POST',
-    redirect: 'error',
-    headers: {
-      ...publicBoundary(baseUrl),
-      origin: publicOriginFor(baseUrl),
-      'sec-fetch-site': 'same-origin',
-      'content-type': 'application/json',
-      cookie: auth.cookie,
-      'x-csrf-token': auth.csrf
-    },
-    body: '{}'
+  const partialMetadata = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false,
+    headers: { 'sec-fetch-mode': 'cors' }
   });
-  assert.equal(partialMetadata.status, 403);
-  assert.equal((await partialMetadata.json()).error.code, 'fetch_metadata_rejected');
+  assert.equal(partialMetadata.status, 200, 'valid partial WebKit metadata uses the authenticated fallback');
+  assert.deepEqual(await partialMetadata.json(), { threads: [] });
+
+  const partialMissingCsrf = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    fetchMetadataPresent: false,
+    headers: { 'sec-fetch-dest': 'empty' }
+  });
+  assert.equal(partialMissingCsrf.status, 403);
+  assert.equal((await partialMissingCsrf.json()).error.code, 'fetch_metadata_rejected');
+
+  const partialWrongMetadata = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false,
+    headers: { 'sec-fetch-mode': 'no-cors' }
+  });
+  assert.equal(partialWrongMetadata.status, 403);
+  assert.equal((await partialWrongMetadata.json()).error.code, 'fetch_metadata_rejected');
 
   const wrongMetadata = await post(baseUrl, '/api/chat/threads/list', {}, {
     cookie: auth.cookie,
@@ -694,6 +704,8 @@ test('iOS/PWA requests without Fetch Metadata stay exact-origin, session-bound, 
   assert.deepEqual(await stillEmpty.json(), { threads: [] }, 'release rejection happens before mutation ingestion');
 
   assert(outcomes.some((outcome) => outcome.fetchMetadata === 'missing'
+    && outcome.release === 'missing' && outcome.result === 'accepted'));
+  assert(outcomes.some((outcome) => outcome.fetchMetadata === 'partial'
     && outcome.release === 'missing' && outcome.result === 'accepted'));
   assert(outcomes.some((outcome) => outcome.errorCode === 'fetch_metadata_rejected'
     && outcome.fetchMetadata === 'invalid'));

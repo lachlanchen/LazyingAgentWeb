@@ -655,7 +655,7 @@ function artifactByteRange(req) {
   return Object.freeze({ start, ...(end === undefined ? {} : { end }) });
 }
 
-function artifactContentDisposition(filename) {
+function artifactContentDisposition(filename, download = false) {
   const fallback = filename.normalize('NFKD')
     .replace(/\p{M}+/gu, '')
     .replace(/[^A-Za-z0-9._-]+/gu, '_')
@@ -664,7 +664,7 @@ function artifactContentDisposition(filename) {
   const encoded = encodeURIComponent(filename).replace(/['()*]/gu, (value) => (
     `%${value.codePointAt(0).toString(16).toUpperCase()}`
   ));
-  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+  return `${download ? 'attachment' : 'inline'}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function sessionCookie(value, maximumAge) {
@@ -1750,7 +1750,7 @@ export function createCloudRequestHandler({
       expires: '0',
       'content-type': result.mime,
       'content-length': String(result.selectedBytes),
-      'content-disposition': artifactContentDisposition(result.filename),
+      'content-disposition': artifactContentDisposition(result.filename, route.download),
       etag: `"${result.sha256}"`,
       'x-artifact-content-length': String(result.selectedBytes),
       'content-security-policy': "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",

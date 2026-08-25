@@ -730,10 +730,14 @@ function renderFile(runtime, target, artifact) {
   const { document, locationHref, releaseId } = runtime;
   if (releaseId === null) throw new TypeError('file artifact URL requires an immutable web release');
   const base = new URL(locationHref);
-  const href = new URL(`/api/agent/artifacts/${artifact.id}/content`, base);
-  href.search = `?v=${encodeURIComponent(releaseId)}`;
-  if (!['http:', 'https:'].includes(base.protocol) || href.origin !== base.origin
-      || href.username || href.password || href.search !== `?v=${releaseId}` || href.hash) {
+  const openHref = new URL(`/api/agent/artifacts/${artifact.id}/content`, base);
+  openHref.search = `?v=${encodeURIComponent(releaseId)}`;
+  const downloadHref = new URL(openHref.href);
+  downloadHref.search = `?v=${encodeURIComponent(releaseId)}&download=1`;
+  if (!['http:', 'https:'].includes(base.protocol) || openHref.origin !== base.origin
+      || downloadHref.origin !== base.origin || openHref.username || openHref.password
+      || downloadHref.username || downloadHref.password || openHref.search !== `?v=${releaseId}`
+      || downloadHref.search !== `?v=${releaseId}&download=1` || openHref.hash || downloadHref.hash) {
     throw new TypeError('file artifact URL is not same-origin');
   }
   const metadata = createNode(document, 'p', 'artifact-file-metadata');
@@ -741,14 +745,14 @@ function renderFile(runtime, target, artifact) {
   target.appendChild(metadata);
   const controls = createNode(document, 'div', 'artifact-file-controls');
   const open = createNode(document, 'a', 'artifact-file-action artifact-file-open');
-  open.setAttribute('href', href.href);
+  open.setAttribute('href', openHref.href);
   open.setAttribute('target', '_blank');
   open.setAttribute('rel', 'noopener noreferrer');
   open.setAttribute('aria-label', `Open ${artifact.spec.filename}`);
   appendText(document, open, 'Open');
   controls.appendChild(open);
   const download = createNode(document, 'a', 'artifact-file-action artifact-file-download');
-  download.setAttribute('href', href.href);
+  download.setAttribute('href', downloadHref.href);
   download.setAttribute('download', artifact.spec.filename);
   download.setAttribute('rel', 'noopener');
   download.setAttribute('aria-label', `Download ${artifact.spec.filename}`);

@@ -429,7 +429,7 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.ok(result.file.minimumActionHeight >= 44);
       assert.deepEqual(result.file.hrefs, [
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
-        `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
+        `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}&download=1`,
       ]);
       for (const [check, accepted] of Object.entries({
         chatScrollInsideWorkspace: result.shell.chatScrollInsideWorkspace,

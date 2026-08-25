@@ -6083,7 +6083,7 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(fileLinks.length, 2);
   assert.deepEqual(fileLinks.map((node) => node.getAttribute("href")), [
     `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}`,
-    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}`,
+    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}&download=1`,
   ]);
   assert.equal(fileLinks[0].textContent, "Open");
   assert.equal(fileLinks[0].getAttribute("target"), "_blank");

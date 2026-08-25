@@ -247,11 +247,14 @@ async function artifactRequest(baseUrl, artifactId, {
   range,
   release,
   urlRelease = RELEASE_ID,
+  download = false,
   headers = {},
   fetchMetadataPresent = true
 } = {}) {
   const target = new URL(`/api/agent/artifacts/${artifactId}/content`, baseUrl);
-  if (urlRelease !== null) target.search = `?v=${encodeURIComponent(urlRelease)}`;
+  if (urlRelease !== null) {
+    target.search = `?v=${encodeURIComponent(urlRelease)}${download ? '&download=1' : ''}`;
+  }
   return fetch(target, {
     method,
     redirect: 'error',
@@ -1183,12 +1186,20 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
   assert.equal(full.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(full.headers.get('accept-ranges'), 'bytes');
   assert.equal(full.headers.get('etag'), `"${sha256}"`);
-  assert.match(full.headers.get('content-disposition'), /^attachment; filename="resume\.pdf"; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf$/u);
+  assert.match(full.headers.get('content-disposition'), /^inline; filename="resume\.pdf"; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf$/u);
   assert.match(full.headers.get('content-security-policy'), /^sandbox;/u);
   assert.equal(calls[0].context.principalId, PRINCIPAL_ID);
   assert.match(calls[0].context.browserSession, /^[a-f0-9]{64}$/u);
   assert.deepEqual(Object.keys(calls[0].context).sort(), ['browserSession', 'principalId', 'signal']);
   assert.deepEqual(calls[0].input, { artifactId });
+
+  const download = await artifactRequest(baseUrl, artifactId, {
+    cookie: first.cookie,
+    download: true
+  });
+  assert.equal(download.status, 200);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), content);
+  assert.match(download.headers.get('content-disposition'), /^attachment; filename="resume\.pdf"; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf$/u);
 
   const mobileHead = await artifactRequest(baseUrl, artifactId, {
     method: 'HEAD',
@@ -1380,6 +1391,17 @@ test('file artifact ingress rejects auth, release, method, path, and range confu
     { headers: { ...publicBoundary(baseUrl), cookie: auth.cookie } }
   );
   assert.equal(queryConfusion.status, 400);
+  for (const query of [
+    `download=1&v=${RELEASE_ID}`,
+    `v=${RELEASE_ID}&download=0`,
+    `v=${RELEASE_ID}&download=1&download=1`,
+  ]) {
+    const invalidDisposition = await fetch(
+      `${baseUrl}/api/agent/artifacts/${artifactId}/content?${query}`,
+      { headers: { ...publicBoundary(baseUrl), cookie: auth.cookie } }
+    );
+    assert.equal(invalidDisposition.status, 400, query);
+  }
   assert.equal(calls, 0);
 
   const wrongMethod = await post(baseUrl, `/api/agent/artifacts/${artifactId}/content`, {}, {

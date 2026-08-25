@@ -26,7 +26,7 @@ const CONTENT_DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
 const UNSAFE_MESSAGE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ENCODED_PATH_PATTERN = /%(?:2e|2f|5c)/iu;
-const ARTIFACT_CONTENT_TARGET_PATTERN = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content(?:\?v=([A-Za-z0-9][A-Za-z0-9._~-]{0,95}))?$/u;
+const ARTIFACT_CONTENT_TARGET_PATTERN = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content(?:\?v=([A-Za-z0-9][A-Za-z0-9._~-]{0,95})(?:&download=(1))?)?$/u;
 
 export const CLOUD_HTTP_LIMITS = Object.freeze({
   requestTargetBytes: 2_048,
@@ -392,7 +392,8 @@ export function classifyRequestTarget(rawTarget, assets) {
       kind: 'agent_artifact',
       pathname: rawTarget,
       artifactId: artifactContent[1],
-      releaseId: artifactContent[2] ?? null
+      releaseId: artifactContent[2] ?? null,
+      download: artifactContent[3] === '1'
     });
   }
   if (rawTarget.startsWith(AGENT_ARTIFACT_CONTENT_PREFIX)) return Object.freeze({ kind: 'invalid' });

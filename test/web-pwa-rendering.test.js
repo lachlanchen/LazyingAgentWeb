@@ -995,8 +995,22 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   );
   assert.match(
     BRIGHT_APP_CSS,
-    /\.workspace \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;[^}]*grid-template-rows: auto auto auto minmax\(0, 1fr\) auto auto;/u,
+    /\.workspace \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;[^}]*grid-template-areas: "topbar" "offline" "context" "chat" "activity" "composer" "footer";[^}]*grid-template-rows: auto auto auto minmax\(0, 1fr\) auto auto auto;[^}]*grid-template-columns: minmax\(0, 1fr\);/u,
   );
+  for (const [selector, area] of [
+    [".topbar", "topbar"],
+    ["#offline-banner", "offline"],
+    [".context-indicator", "context"],
+    [".chat-scroll", "chat"],
+    [".activity-panel", "activity"],
+    [".composer", "composer"],
+    [".footer-note", "footer"],
+  ]) {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    assert.match(BRIGHT_APP_CSS, new RegExp(`${escaped} \\{[^}]*grid-area: ${area};`, "u"));
+  }
+  assert.match(BRIGHT_APP_CSS, /\.chat-scroll \{[^}]*min-height: 0;[^}]*overflow-y: auto;/u);
+  assert.match(BRIGHT_APP_CSS, /\.footer-note \{[^}]*padding:[^;}]*max\(\.6rem, env\(safe-area-inset-bottom\)\);/u);
   assert.match(
     BRIGHT_APP_CSS,
     /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*flex-direction: column;[^}]*align-items: stretch;/u,

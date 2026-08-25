@@ -190,7 +190,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Narrow scientific ticks</h3><div id="narrow-scientific"></div></article>
       </section>
     </article></section></div>
-    <aside class="activity-panel" hidden></aside><form class="composer"><textarea></textarea><button>Run</button></form><p></p>
+    <aside class="activity-panel"><header><strong>Agent activity</strong><span>Completed</span></header><ol><li>Plan response — Completed</li><li>Run bounded analysis — Completed</li><li>Prepare answer — Completed</li></ol></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><button id="run-agent">Run</button></form><p id="footer-note" class="footer-note">Agent footer</p>
   </section>
 </div>
 <script type="module">
@@ -231,6 +231,8 @@ const GEOMETRY_EXPRESSION = `(() => {
     return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
   };
   const visible = (node) => getComputedStyle(node).display !== 'none' && node.getBoundingClientRect().width > 0;
+  const contains = (outer, inner) => inner.left >= outer.left - .5 && inner.right <= outer.right + .5
+    && inner.top >= outer.top - .5 && inner.bottom <= outer.bottom + .5;
   const overlaps = (nodes) => nodes.some((left, index) => nodes.slice(index + 1).some((right) => {
     const a = left.getBoundingClientRect();
     const b = right.getBoundingClientRect();
@@ -264,6 +266,11 @@ const GEOMETRY_EXPRESSION = `(() => {
   const wideLabels = [...categoricalTarget.querySelectorAll('.plot-label-wide')];
   const compactLabels = [...categoricalTarget.querySelectorAll('.plot-label-compact')];
   const workspace = rectangle(document.querySelector('#workspace'));
+  const chatScroll = rectangle(document.querySelector('.chat-scroll'));
+  const composer = rectangle(document.querySelector('#composer'));
+  const messageInput = rectangle(document.querySelector('#message-input'));
+  const runAgent = rectangle(document.querySelector('#run-agent'));
+  const footer = rectangle(document.querySelector('#footer-note'));
   const sidebar = document.querySelector('#sidebar');
   sidebar.hidden = true;
   const maskedWorkspace = rectangle(document.querySelector('#workspace'));
@@ -271,6 +278,20 @@ const GEOMETRY_EXPRESSION = `(() => {
   return {
     viewport: { width: innerWidth, height: innerHeight },
     workspace,
+    shell: {
+      chatScroll,
+      composer,
+      messageInput,
+      runAgent,
+      footer,
+      chatScrollInsideWorkspace: contains(workspace, chatScroll),
+      composerInsideWorkspace: contains(workspace, composer),
+      inputInsideComposer: contains(composer, messageInput),
+      actionInsideComposer: contains(composer, runAgent),
+      footerInsideWorkspace: contains(workspace, footer),
+      chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
+      composerAboveFooter: composer.bottom <= footer.top + .5,
+    },
     maskPreserved: workspace.left === maskedWorkspace.left && workspace.width === maskedWorkspace.width,
     pageOverflow: document.documentElement.scrollWidth > innerWidth,
     categorical: chart(categoricalTarget),
@@ -325,10 +346,13 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
   try {
     origin = await listen(server);
     profile = await mkdtemp(join(tmpdir(), "lazying-agent-web-plot-"));
+    const requestedCdpPort = process.env.LAZYING_AGENT_WEB_TEST_CDP_PORT === undefined
+      ? 0
+      : validatedDebuggerPort(process.env.LAZYING_AGENT_WEB_TEST_CDP_PORT);
     chrome = spawn(CHROME, [
       "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
       "--no-first-run", "--no-default-browser-check",
-      "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+      "--remote-debugging-address=127.0.0.1", `--remote-debugging-port=${requestedCdpPort}`,
       `--user-data-dir=${profile}`, "about:blank",
     ], { stdio: ["ignore", "ignore", "pipe"] });
     chromeState = observeChrome(chrome);
@@ -367,9 +391,21 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     const iphone = results.get("iphone");
     assert.deepEqual(desktop.viewport, { width: 1_280, height: 900 });
     assert.deepEqual(iphone.viewport, { width: 390, height: 844 });
+    const shellFailures = [];
     for (const [label, result] of [["desktop", desktop], ["iphone", iphone]]) {
       assert.equal(result.pageOverflow, false);
       assert.equal(result.maskPreserved, true);
+      for (const [check, accepted] of Object.entries({
+        chatScrollInsideWorkspace: result.shell.chatScrollInsideWorkspace,
+        composerInsideWorkspace: result.shell.composerInsideWorkspace,
+        inputInsideComposer: result.shell.inputInsideComposer,
+        actionInsideComposer: result.shell.actionInsideComposer,
+        footerInsideWorkspace: result.shell.footerInsideWorkspace,
+        chatScrollAboveComposer: result.shell.chatScrollAboveComposer,
+        composerAboveFooter: result.shell.composerAboveFooter,
+      })) {
+        if (accepted !== true) shellFailures.push({ label, check, shell: result.shell });
+      }
       assert.equal(result.categoricalTickCount, 4);
       assert.equal(result.categoricalFullLabelsPreserved, true);
       assert.equal(result.categoricalAnchors[0], "start");
@@ -404,6 +440,7 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     assert.ok(iphone.categorical.minimumTickHeight >= 10);
     assert.ok(iphone.largeScientific.xTickTexts.every((value) => value.length <= 8 && !value.includes("e+")));
     assert.ok(iphone.smallScientific.xTickTexts.every((value) => value.length <= 8 && !value.includes("e+")));
+    assert.deepEqual(shellFailures, [], `shell layout escaped the clipped workspace: ${JSON.stringify(shellFailures)}`);
   } finally {
     page?.close();
     if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGTERM");

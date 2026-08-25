@@ -440,9 +440,11 @@ function labelsDistinguishValues(values, labels) {
   return true;
 }
 
-function formatPlotTicks(values, { allowOffset = false } = {}) {
-  const readableLabels = values.map((value) => formatPlotTick(value, 3));
-  if (labelsDistinguishValues(values, readableLabels)) return { labels: readableLabels, offset: null };
+function formatPlotTicks(values, { allowOffset = false, preferCompact = false } = {}) {
+  for (let precision = preferCompact ? 2 : 3; precision <= 3; precision += 1) {
+    const readableLabels = values.map((value) => formatPlotTick(value, precision));
+    if (labelsDistinguishValues(values, readableLabels)) return { labels: readableLabels, offset: null };
+  }
   if (allowOffset) {
     const offset = values[0];
     const relative = values.map((value) => value - offset);
@@ -502,7 +504,10 @@ function renderPlot(document, target, artifact) {
   const xTickValues = plot.labels ? null : Array.from({ length: 5 }, (unused, index) => (
     bounds.minX + (bounds.maxX - bounds.minX) * index / 4
   ));
-  const xTickPlan = xTickValues === null ? null : formatPlotTicks(xTickValues, { allowOffset: true });
+  const xTickPlan = xTickValues === null ? null : formatPlotTicks(xTickValues, {
+    allowOffset: true,
+    preferCompact: true,
+  });
   const descriptionId = `plot-description-${artifact.id.slice(4)}`;
   const svg = createSvg(document, "svg", {
     viewBox: `0 0 ${dimensions.width} ${dimensions.height}`,

@@ -16,6 +16,8 @@ const CHROME = [
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
 ].find((candidate) => typeof candidate === "string" && existsSync(candidate)) ?? null;
+const CHROME_STARTUP_TIMEOUT_MS = 20_000;
+const CHROME_DIAGNOSTIC_LIMIT = 4_096;
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -30,6 +32,102 @@ async function retry(operation, attempts = 120) {
     }
   }
   throw lastError ?? new Error("operation timed out");
+}
+
+function observeChrome(chrome) {
+  let exit = null;
+  let spawnError = null;
+  let stderr = "";
+  chrome.stderr.setEncoding("utf8");
+  chrome.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-CHROME_DIAGNOSTIC_LIMIT);
+  });
+  const exited = new Promise((resolve) => {
+    chrome.once("error", (error) => {
+      spawnError = error;
+      resolve();
+    });
+    chrome.once("close", (code, signal) => {
+      exit = { code, signal };
+      resolve();
+    });
+  });
+  return {
+    exited,
+    snapshot: () => ({ exit, spawnError, stderr }),
+  };
+}
+
+function validatedDebuggerPort(value) {
+  const port = Number(value);
+  if (!/^\d{1,5}$/u.test(value) || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`invalid DevTools port ${JSON.stringify(value)}`);
+  }
+  return port;
+}
+
+async function debuggerPort(profile, stderr) {
+  try {
+    const value = await readFile(join(profile, "DevToolsActivePort"), "utf8");
+    const [candidate] = value.trim().split("\n");
+    return validatedDebuggerPort(candidate);
+  } catch (fileError) {
+    const match = /DevTools listening on ws:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})\//u.exec(stderr);
+    if (match) return validatedDebuggerPort(match[1]);
+    throw fileError;
+  }
+}
+
+function chromeStartupError({ exit, spawnError, stderr }, lastReadinessError, timeoutMs) {
+  const status = spawnError
+    ? `spawn error: ${spawnError.message}`
+    : (exit ? `exit code ${String(exit.code)}, signal ${String(exit.signal)}` : "process still running");
+  const summary = spawnError || exit
+    ? `Chrome failed before CDP became ready (${status}).`
+    : `Chrome did not become CDP-ready within ${timeoutMs} ms (${status}).`;
+  const readiness = lastReadinessError instanceof Error ? lastReadinessError.message : "no readiness response";
+  const diagnostic = stderr.trim() || "<empty>";
+  return new Error([
+    summary,
+    `Executable: ${CHROME}`,
+    `Last readiness error: ${readiness}`,
+    `Chrome stderr (last ${CHROME_DIAGNOSTIC_LIMIT} bytes):\n${diagnostic}`,
+  ].join("\n"));
+}
+
+async function waitForExit(exited, timeoutMs) {
+  let timeout;
+  try {
+    await Promise.race([
+      exited,
+      new Promise((resolve) => { timeout = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function waitForChromeDebugger(chromeState, profile, timeoutMs = CHROME_STARTUP_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let lastReadinessError;
+  while (Date.now() < deadline) {
+    const state = chromeState.snapshot();
+    if (state.spawnError || state.exit) throw chromeStartupError(state, lastReadinessError, timeoutMs);
+    try {
+      const port = await debuggerPort(profile, state.stderr);
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (!response.ok) throw new Error(`DevTools readiness returned HTTP ${response.status}`);
+      const version = await response.json();
+      if (typeof version.webSocketDebuggerUrl !== "string") throw new Error("DevTools readiness omitted its browser WebSocket URL");
+      return { port };
+    } catch (error) {
+      lastReadinessError = error;
+    }
+    await Promise.race([delay(50), chromeState.exited]);
+  }
+  throw chromeStartupError(chromeState.snapshot(), lastReadinessError, timeoutMs);
 }
 
 function cdpConnection(url) {
@@ -197,7 +295,7 @@ const GEOMETRY_EXPRESSION = `(() => {
 
 test("real Chrome keeps adversarial Agent plot ticks readable and contained at desktop and iPhone widths", {
   skip: CHROME === null ? "Chrome is unavailable" : false,
-  timeout: 30_000,
+  timeout: 45_000,
 }, async () => {
   const [safeRendering, protocol] = await Promise.all([
     readFile(new URL("../src/web/safe-rendering.js", import.meta.url)),
@@ -222,26 +320,19 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
   let origin;
   let profile;
   let chrome;
-  let exited;
+  let chromeState;
   let page;
   try {
     origin = await listen(server);
     profile = await mkdtemp(join(tmpdir(), "lazying-agent-web-plot-"));
     chrome = spawn(CHROME, [
-      "--headless=new", "--no-sandbox", "--disable-gpu",
+      "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+      "--no-first-run", "--no-default-browser-check",
       "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
       `--user-data-dir=${profile}`, "about:blank",
-    ], { stdio: "ignore" });
-    exited = new Promise((resolve) => {
-      chrome.once("exit", resolve);
-      chrome.once("error", resolve);
-    });
-    const { port } = await retry(async () => {
-      const value = await readFile(join(profile, "DevToolsActivePort"), "utf8");
-      const [candidate] = value.trim().split("\n");
-      if (!/^\d{2,5}$/u.test(candidate)) throw new Error("invalid DevTools port");
-      return { port: Number(candidate) };
-    });
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    chromeState = observeChrome(chrome);
+    const { port } = await waitForChromeDebugger(chromeState, profile);
     const targetResponse = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(origin)}`, { method: "PUT" });
     assert.equal(targetResponse.ok, true);
     const target = await targetResponse.json();
@@ -315,11 +406,11 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     assert.ok(iphone.smallScientific.xTickTexts.every((value) => value.length <= 8 && !value.includes("e+")));
   } finally {
     page?.close();
-    if (chrome?.exitCode === null) chrome.kill("SIGTERM");
-    if (exited) await Promise.race([exited, delay(2_000)]);
-    if (chrome?.exitCode === null) {
+    if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGTERM");
+    if (chromeState) await waitForExit(chromeState.exited, 2_000);
+    if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {
       chrome.kill("SIGKILL");
-      await exited;
+      await chromeState.exited;
     }
     if (server.listening) await closeServer(server);
     if (profile) await rm(profile, { recursive: true, force: true });

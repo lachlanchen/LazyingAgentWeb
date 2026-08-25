@@ -2808,6 +2808,25 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(swatches[0].className.includes("artifact-swatch-0"), true);
   assert.equal(plotNodes.some((node) => node.attributes.has("style") || Object.keys(node.style).length > 0), false);
 
+  const numericTarget = document.createElement("section");
+  const maximum = Number.MAX_SAFE_INTEGER;
+  assert.equal(renderer.renderArtifact(numericTarget, artifact("plot", {
+    schemaVersion: "1",
+    type: "scatter",
+    series: [{ name: "Large values", points: [
+      { x: -maximum, y: -maximum },
+      { x: 0, y: 0 },
+      { x: maximum, y: maximum },
+    ] }],
+  })), true);
+  const numericNodes = numericTarget.walk();
+  const numericXTicks = numericNodes.filter((node) => node.getAttribute("class")?.split(/\s+/u).includes("plot-x-tick"));
+  assert.deepEqual(numericXTicks.map((node) => node.textContent), ["-9e15", "-4.5e15", "0", "4.5e15", "9e15"]);
+  assert.deepEqual(numericXTicks.map((node) => node.getAttribute("aria-label")), [
+    "-9007199254740991", "-4503599627370495.5", "0", "4503599627370495", "9007199254740991",
+  ]);
+  assert.match(numericNodes.find((node) => node.tagName === "desc").textContent, /X-axis absolute ticks: -9007199254740991/u);
+
   assert.equal(renderer.renderArtifact(target, artifact("table", {
     schemaVersion: "1",
     columns: [{ key: "name", label: "Name" }, { key: "value", label: "Value" }],

@@ -184,10 +184,17 @@ test('sends the latest private canonical image only to the fixed vision alias as
     role: 'user',
     content: [
       {
+        type: 'text',
+        text: 'IMAGE 1 OF 1 follows. Inspect the complete image and every distinct visible object in it.'
+      },
+      {
         type: 'image_url',
         image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` }
       },
-      { type: 'text', text: 'Plot y = x².' }
+      {
+        type: 'text',
+        text: 'The image was supplied above. After inspecting every image, follow the exact user message below.\n\nUSER MESSAGE:\nPlot y = x².'
+      }
     ]
   });
   assert.doesNotMatch(JSON.stringify(value), new RegExp(bytes.toString('base64'), 'u'));
@@ -240,9 +247,20 @@ test('sends a bounded ordered image set in one LocalLLM vision message', async (
   await collect(output);
 
   assert.deepEqual(requestBody.messages.at(-1).content, [
+    {
+      type: 'text',
+      text: 'IMAGE 1 OF 2 follows. Inspect the complete image and every distinct visible object in it.'
+    },
     { type: 'image_url', image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` } },
+    {
+      type: 'text',
+      text: 'IMAGE 2 OF 2 follows. Inspect the complete image and every distinct visible object in it.'
+    },
     { type: 'image_url', image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` } },
-    { type: 'text', text: 'Plot y = x².' }
+    {
+      type: 'text',
+      text: 'All 2 images were supplied above in upload order. After inspecting every image, follow the exact user message below.\n\nUSER MESSAGE:\nPlot y = x².'
+    }
   ]);
   await assert.rejects(
     value.generate(generationInput({

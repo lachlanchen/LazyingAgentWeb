@@ -260,6 +260,28 @@ function validateVisionAttachments(value) {
   return Object.freeze(attachments);
 }
 
+function orderedVisionContent(attachments, userMessage) {
+  const total = attachments.length;
+  const content = [];
+  for (let index = 0; index < total; index += 1) {
+    content.push(Object.freeze({
+      type: 'text',
+      text: `IMAGE ${index + 1} OF ${total} follows. Inspect the complete image and every distinct visible object in it.`
+    }));
+    content.push(Object.freeze({
+      type: 'image_url',
+      image_url: Object.freeze({
+        url: `data:${attachments[index].mediaType};base64,${attachments[index].content.toString('base64')}`
+      })
+    }));
+  }
+  content.push(Object.freeze({
+    type: 'text',
+    text: `${total === 1 ? 'The image was supplied above.' : `All ${total} images were supplied above in upload order.`} After inspecting every image, follow the exact user message below.\n\nUSER MESSAGE:\n${userMessage}`
+  }));
+  return Object.freeze(content);
+}
+
 function contentType(response) {
   return response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() ?? '';
 }
@@ -591,15 +613,7 @@ export function createLocalLlmConnector({
         const last = messages.at(-1);
         messages[messages.length - 1] = Object.freeze({
           role: 'user',
-          content: Object.freeze([
-            ...visionAttachments.map((attachment) => Object.freeze({
-              type: 'image_url',
-              image_url: Object.freeze({
-                url: `data:${attachment.mediaType};base64,${attachment.content.toString('base64')}`
-              })
-            })),
-            Object.freeze({ type: 'text', text: last.content })
-          ])
+          content: orderedVisionContent(visionAttachments, last.content)
         });
       }
       const payloadMessages = Object.freeze([

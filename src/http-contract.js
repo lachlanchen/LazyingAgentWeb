@@ -15,6 +15,7 @@ import {
   validateVisionAttachmentRequest,
   validateVisionAttachmentsRequest
 } from './vision-attachment.js';
+import { WEB_RELEASE_HEADER_NAME } from './web/web-release.js';
 
 const RELEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,95}$/u;
 const CONTENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*(?:; charset=utf-8)?$/u;
@@ -58,6 +59,7 @@ export const SESSION_COOKIE_NAME = '__Host-lazying_session';
 export const CSRF_COOKIE_NAME = '__Host-lazying_csrf';
 export const CSRF_HEADER_NAME = 'x-csrf-token';
 export const IDEMPOTENCY_HEADER_NAME = 'idempotency-key';
+export const CLIENT_RELEASE_HEADER_NAME = WEB_RELEASE_HEADER_NAME;
 // The standalone listener is loopback-only. Caddy must delete caller values and
 // overwrite both assertions on every upstream request; they are never accepted
 // from a non-loopback socket peer.

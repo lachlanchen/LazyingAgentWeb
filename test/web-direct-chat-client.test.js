@@ -12,6 +12,8 @@ import {
 import { createPwaIcon } from "../src/web/pwa-assets.js";
 
 const CSRF = "csrf_token_abcdefghijklmnopqrstuvwxyz0123456789";
+const RELEASE = `release-${"a".repeat(64)}`;
+const NEXT_RELEASE = `release-${"b".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
 const LATER = "2026-08-20T08:00:01.000Z";
 const HASH_A = "a".repeat(64);
@@ -105,10 +107,19 @@ function cancelledGeneration(overrides = {}) {
   });
 }
 
-function jsonResponse(value, { status = 200, contentType = "application/json; charset=utf-8", cacheControl = "no-store" } = {}) {
+function jsonResponse(value, {
+  status = 200,
+  contentType = "application/json; charset=utf-8",
+  cacheControl = "no-store",
+  releaseId,
+} = {}) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": contentType, "cache-control": cacheControl },
+    headers: {
+      "content-type": contentType,
+      "cache-control": cacheControl,
+      ...(releaseId === undefined ? {} : { "x-lazying-agent-release": releaseId }),
+    },
   });
 }
 
@@ -139,6 +150,35 @@ function clientOptions(overrides = {}) {
     ...overrides,
   };
 }
+
+test("pinned Direct Chat uses retained session CSRF when iOS hides the cookie and reports release replacement", async () => {
+  const calls = [];
+  let responseRelease = RELEASE;
+  const client = new DirectChatBrowserClient(clientOptions({
+    cookieSource: "",
+    csrfToken: () => CSRF,
+    releaseId: RELEASE,
+    fetchImpl: async (_url, options) => {
+      calls.push(options.headers);
+      return jsonResponse({ visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }, {
+        releaseId: responseRelease,
+      });
+    },
+  }));
+
+  assert.equal((await client.capabilities()).visionInput, false);
+  assert.equal(calls[0].get("x-csrf-token"), CSRF);
+  assert.equal(calls[0].get("x-lazying-agent-release"), RELEASE);
+
+  responseRelease = NEXT_RELEASE;
+  await assert.rejects(
+    () => client.capabilities(),
+    (error) => error instanceof DirectChatTransportError
+      && error.code === "client_release_mismatch"
+      && error.serverRelease === NEXT_RELEASE
+      && error.retryable === false,
+  );
+});
 
 test("prepared create/start requests carry browser IDs and remain byte-identical across retries", async () => {
   const calls = [];

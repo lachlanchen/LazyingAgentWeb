@@ -314,6 +314,11 @@ export async function createStandaloneService({
       visionEnabled: config.localLlm.vision.enabled,
       visionModelAlias: config.localLlm.vision.modelAlias,
       agintiAdapter,
+      requestOutcomeObserver(outcome) {
+        if (outcome.result === 'rejected') {
+          console.warn(JSON.stringify({ event: 'cloud_request_outcome', ...outcome }));
+        }
+      },
       ...(clock === undefined ? {} : { clock })
     });
     if (!server || typeof server.listen !== 'function' || typeof server.shutdown !== 'function'

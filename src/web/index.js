@@ -7,3 +7,4 @@ export * from "./direct-chat-client.js";
 export * from "./presentation-state.js";
 export * from "./pwa-assets.js";
 export * from "./safe-rendering.js";
+export * from "./web-release.js";

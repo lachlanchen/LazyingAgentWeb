@@ -4,6 +4,11 @@ import {
   CloudBrowserTransportError,
   readCloudCsrfCookie,
 } from "./cloud-session-client.js";
+import {
+  addWebReleaseHeader,
+  inspectWebReleaseResponse,
+  optionalWebRelease,
+} from "./web-release.js";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const JSON_RESPONSE_LIMIT = 512 * 1024;
@@ -23,6 +28,7 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9._~-]{16,160}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
 const MODEL_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const ERROR_CODE = /^[a-z][a-z0-9_]{0,79}$/u;
+const CSRF_TOKEN = /^[A-Za-z0-9_-]{32,128}$/u;
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const GENERATION_STATUSES = new Set(["in_progress", ...TERMINAL_STATUSES]);
 const FAILURE_CODES = new Set([
@@ -834,14 +840,35 @@ function transportFailure(error, signal) {
   return new DirectChatTransportError("Direct Chat service is unavailable.");
 }
 
-function requestHeaders(csrf, idempotency) {
-  const headers = new Headers({
+function requestHeaders(csrf, idempotency, releaseId) {
+  const headers = addWebReleaseHeader(new Headers({
     accept: "application/json",
     "content-type": JSON_CONTENT_TYPE,
     [CLOUD_CSRF_HEADER_NAME]: csrf,
-  });
+  }), releaseId);
   if (idempotency !== undefined) headers.set("idempotency-key", idempotency);
   return headers;
+}
+
+function csrfProvider(value) {
+  if (value === undefined) return () => undefined;
+  if (typeof value === "function") return value;
+  if (typeof value === "string") return () => value;
+  throw new TypeError("csrfToken must be a function or string");
+}
+
+function requirePinnedRelease(response, releaseId) {
+  const proof = inspectWebReleaseResponse(response, releaseId);
+  if (proof.kind === "unpinned" || proof.kind === "match") return;
+  if (proof.kind === "mismatch") {
+    throw new DirectChatTransportError("Direct Chat requires the current browser app release.", {
+      code: "client_release_mismatch",
+      status: 409,
+      retryable: false,
+      serverRelease: proof.releaseId,
+    });
+  }
+  throw new DirectChatProtocolError("Direct Chat response is missing its release identity");
 }
 
 function parseSseBlock(block) {
@@ -945,7 +972,7 @@ function eventRequest(value) {
 export class DirectChatBrowserClient {
   constructor(options = {}) {
     const config = exactObject(options, [
-      "baseUrl", "fetchImpl", "cookieSource", "makeOpaqueId", "timeoutMs", "streamTimeoutMs", "wait",
+      "baseUrl", "fetchImpl", "cookieSource", "csrfToken", "releaseId", "makeOpaqueId", "timeoutMs", "streamTimeoutMs", "wait",
     ], [], "Direct Chat client options", { input: true });
     const baseUrl = config.baseUrl;
     const fetchImpl = config.fetchImpl ?? globalThis.fetch;
@@ -969,6 +996,8 @@ export class DirectChatBrowserClient {
     this.baseOrigin = normalizedBaseOrigin(baseUrl);
     this.fetch = fetchImpl === globalThis.fetch ? fetchImpl.bind(globalThis) : fetchImpl;
     this.readCookie = cookieReader(cookieSource);
+    this.readRetainedCsrf = csrfProvider(config.csrfToken);
+    this.releaseId = optionalWebRelease(config.releaseId);
     this.makeOpaqueId = makeOpaqueId;
     this.timeoutMs = timeoutMs;
     this.streamTimeoutMs = streamTimeoutMs;
@@ -976,7 +1005,19 @@ export class DirectChatBrowserClient {
   }
 
   #csrf() {
-    const token = readCloudCsrfCookie(this.readCookie);
+    const cookie = readCloudCsrfCookie(this.readCookie);
+    const retained = this.readRetainedCsrf();
+    if (retained !== undefined && (typeof retained !== "string" || !CSRF_TOKEN.test(retained))) {
+      throw new TypeError("CSRF token is invalid");
+    }
+    if (cookie !== undefined && retained !== undefined && cookie !== retained) {
+      throw new DirectChatTransportError("Direct Chat request was not accepted.", {
+        code: "authentication_required",
+        status: 401,
+        retryable: false,
+      });
+    }
+    const token = cookie ?? retained;
     if (token === undefined) {
       throw new DirectChatTransportError("Direct Chat request was not accepted.", {
         code: "authentication_required",
@@ -1003,11 +1044,12 @@ export class DirectChatBrowserClient {
         cache: "no-store",
         redirect: "error",
         referrerPolicy: "same-origin",
-        headers: requestHeaders(this.#csrf(), idempotency),
+        headers: requestHeaders(this.#csrf(), idempotency, this.releaseId),
         body: requestBody,
         signal: deadline.signal,
       }));
       if (!responseMatchesRoute(response, endpoint)) throw new DirectChatProtocolError("Direct Chat response came from an unexpected URL");
+      requirePinnedRelease(response, this.releaseId);
       requireNoStore(response);
       if (response.status !== expectedStatus) throw await responseFailure(response);
       if (mediaType(response) !== "application/json") throw new DirectChatProtocolError("Direct Chat response content type is invalid");
@@ -1035,11 +1077,12 @@ export class DirectChatBrowserClient {
         cache: "no-store",
         redirect: "error",
         referrerPolicy: "same-origin",
-        headers: requestHeaders(this.#csrf()),
+        headers: requestHeaders(this.#csrf(), undefined, this.releaseId),
         body: JSON.stringify(body),
         signal: deadline.signal,
       }));
       if (!responseMatchesRoute(response, endpoint)) throw new DirectChatProtocolError("Direct Chat attachment came from an unexpected URL");
+      requirePinnedRelease(response, this.releaseId);
       requireNoStore(response);
       if (response.status !== 200) throw await responseFailure(response);
       if (mediaType(response) !== expected.mediaType) throw new DirectChatProtocolError("Direct Chat attachment content type is invalid");
@@ -1347,11 +1390,11 @@ export class DirectChatBrowserClient {
           cache: "no-store",
           redirect: "error",
           referrerPolicy: "same-origin",
-          headers: new Headers({
+          headers: addWebReleaseHeader(new Headers({
             accept: "text/event-stream",
             "content-type": JSON_CONTENT_TYPE,
             [CLOUD_CSRF_HEADER_NAME]: this.#csrf(),
-          }),
+          }), this.releaseId),
           body: JSON.stringify({
             threadId: request.threadId,
             generationId: request.generationId,
@@ -1360,6 +1403,7 @@ export class DirectChatBrowserClient {
           signal: deadline.signal,
         }));
         if (!responseMatchesRoute(response, endpoint)) throw new DirectChatProtocolError("Direct Chat stream came from an unexpected URL");
+        requirePinnedRelease(response, this.releaseId);
         requireNoStore(response);
         if (response.status !== 200) throw await responseFailure(response);
         if (mediaType(response) !== "text/event-stream") throw new DirectChatProtocolError("Direct Chat stream content type is invalid");

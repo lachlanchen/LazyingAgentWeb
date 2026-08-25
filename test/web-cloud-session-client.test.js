@@ -10,11 +10,22 @@ import {
 } from "../src/web/cloud-session-client.js";
 
 const CSRF = "csrf_token_abcdefghijklmnopqrstuvwxyz0123456789";
+const RELEASE = `release-${"a".repeat(64)}`;
+const NEXT_RELEASE = `release-${"b".repeat(64)}`;
 
-function jsonResponse(value, { status = 200, contentType = "application/json; charset=utf-8", cacheControl = "no-store" } = {}) {
+function jsonResponse(value, {
+  status = 200,
+  contentType = "application/json; charset=utf-8",
+  cacheControl = "no-store",
+  releaseId,
+} = {}) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": contentType, "cache-control": cacheControl },
+    headers: {
+      "content-type": contentType,
+      "cache-control": cacheControl,
+      ...(releaseId === undefined ? {} : { "x-lazying-agent-release": releaseId }),
+    },
   });
 }
 
@@ -102,6 +113,39 @@ test("signed-out restore works without a readable CSRF cookie but authenticated 
   assert.deepEqual(await client.restore(), { authenticated: false });
   value = { authenticated: true, username: "lachlanchen", csrfToken: CSRF };
   await assert.rejects(() => client.restore(), /not bound to the browser CSRF cookie/u);
+});
+
+test("a pinned mobile session retains validated CSRF across hidden cookie reads and detects a newer release", async () => {
+  const calls = [];
+  let responseRelease = RELEASE;
+  const client = new CloudSessionClient({
+    baseUrl: "https://llm.lazying.art/",
+    cookieSource: "",
+    releaseId: RELEASE,
+    fetchImpl: async (_url, options) => {
+      calls.push(options.headers);
+      return jsonResponse({ authenticated: true, username: "lachlanchen", csrfToken: CSRF }, {
+        releaseId: responseRelease,
+      });
+    },
+  });
+
+  assert.equal((await client.login({ username: "lachlanchen", password: "secret", remember: true })).csrfToken, CSRF);
+  assert.equal(client.csrfToken(), CSRF, "the authenticated response is retained when WebKit hides document.cookie");
+  assert.equal((await client.restore()).authenticated, true);
+  assert.equal(calls[0].get("x-lazying-agent-release"), RELEASE);
+  assert.equal(calls[0].get("x-csrf-token"), null);
+  assert.equal(calls[1].get("x-lazying-agent-release"), RELEASE);
+  assert.equal(calls[1].get("x-csrf-token"), CSRF);
+
+  responseRelease = NEXT_RELEASE;
+  await assert.rejects(
+    () => client.restore(),
+    (error) => error instanceof CloudBrowserTransportError
+      && error.code === "client_release_mismatch"
+      && error.serverRelease === NEXT_RELEASE
+      && error.retryable === false,
+  );
 });
 
 test("the default browser fetch keeps the global receiver instead of the client instance", async () => {

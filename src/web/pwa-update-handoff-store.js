@@ -3,14 +3,15 @@ const RELEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,23}-[a-f0-9]{64}$/u;
 const DEFAULT_TIMEOUT_MS = 2_000;
 const MAX_AGE_MS = 5 * 60 * 1_000;
 const MAX_RECORDS = 4;
-const MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024 + 160 * 1024 + 20;
+const MAX_CIPHERTEXT_BYTES = 16 * 1024 * 1024 + 160 * 1024 + 20;
 
 function storedEnvelope(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)
       || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return null;
   const keys = Object.keys(value).sort().join(",");
   if (keys !== "ciphertext,createdAt,expiresAt,handoffId,iv,schemaVersion,scope,sourceRelease,targetRelease"
-      || value.schemaVersion !== "1" || typeof value.scope !== "string" || value.scope.length < 1 || value.scope.length > 160
+      || !["1", "2"].includes(value.schemaVersion)
+      || typeof value.scope !== "string" || value.scope.length < 1 || value.scope.length > 160
       || !HANDOFF_ID.test(value.handoffId) || !RELEASE_ID.test(value.sourceRelease) || !RELEASE_ID.test(value.targetRelease)
       || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0
       || value.expiresAt !== value.createdAt + MAX_AGE_MS

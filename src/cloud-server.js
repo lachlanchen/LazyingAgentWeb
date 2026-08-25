@@ -6,6 +6,7 @@ import {
   AGENT_ROUTE_MAP,
   CLOUD_HTTP_LIMITS,
   CLOUD_ROUTES,
+  CLIENT_RELEASE_HEADER_NAME,
   CSRF_COOKIE_NAME,
   CSRF_HEADER_NAME,
   IDEMPOTENCY_HEADER_NAME,
@@ -42,6 +43,7 @@ const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
 const REMEMBERED_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const GLOBAL_DISPATCH_RETRY_MS = 250;
 const REQUEST_BODY_TIMEOUT_MARGIN_MS = 30_000;
+const RESPONSE_RELEASE_ID = Symbol('responseReleaseId');
 const SAFE_FAILURE_CODES = new Set([
   'provider_unavailable',
   'timeout',
@@ -165,12 +167,13 @@ function commonSecurityHeaders() {
   };
 }
 
-function dynamicHeaders(extra = {}) {
+function dynamicHeaders(extra = {}, releaseId) {
   return {
     ...commonSecurityHeaders(),
     'cache-control': DYNAMIC_CACHE_CONTROL,
     pragma: 'no-cache',
     expires: '0',
+    ...(releaseId === undefined ? {} : { [CLIENT_RELEASE_HEADER_NAME]: releaseId }),
     ...extra
   };
 }
@@ -196,7 +199,7 @@ function sendJson(req, res, status, value, extraHeaders = {}) {
   sendBuffer(req, res, status, encodeJson(value), dynamicHeaders({
     'content-type': JSON_CONTENT_TYPE,
     ...extraHeaders
-  }));
+  }, res[RESPONSE_RELEASE_ID]));
 }
 
 function publicError(error) {
@@ -552,17 +555,35 @@ function readJsonBody(req, maximum, timeoutMs) {
   });
 }
 
-function requireOriginAndFetchMetadata(req, publicOrigin) {
+function requireOrigin(req, publicOrigin) {
   if (req.headers.origin !== publicOrigin) {
     throw new CloudHttpError(403, 'origin_rejected', 'The request origin is not allowed.');
   }
-  if (req.headers['sec-fetch-site'] !== 'same-origin') {
-    throw new CloudHttpError(403, 'fetch_metadata_rejected', 'Cross-site requests are not allowed.');
-  }
+}
+
+function fetchMetadataState(req) {
+  const site = req.headers['sec-fetch-site'];
   const mode = req.headers['sec-fetch-mode'];
-  if (!['cors', 'same-origin'].includes(mode) || req.headers['sec-fetch-dest'] !== 'empty') {
-    throw new CloudHttpError(403, 'fetch_metadata_rejected', 'The request fetch metadata is not allowed.');
-  }
+  const destination = req.headers['sec-fetch-dest'];
+  const present = [site, mode, destination].filter((value) => value !== undefined).length;
+  if (present === 0) return 'missing';
+  if (present !== 3 || site !== 'same-origin'
+      || !['cors', 'same-origin'].includes(mode) || destination !== 'empty') return 'invalid';
+  return 'complete';
+}
+
+function rejectFetchMetadata() {
+  throw new CloudHttpError(403, 'fetch_metadata_rejected', 'The request fetch metadata is not allowed.');
+}
+
+function clientReleaseState(req, currentRelease) {
+  const value = req.headers[CLIENT_RELEASE_HEADER_NAME];
+  if (value === undefined) return 'missing';
+  return typeof value === 'string' && value === currentRelease ? 'match' : 'mismatch';
+}
+
+function rejectClientRelease() {
+  throw new CloudHttpError(409, 'client_release_mismatch', 'The browser app must load the current release before retrying.');
 }
 
 function parseCookie(req, name) {
@@ -839,6 +860,7 @@ export function createCloudRequestHandler({
   visionModelAlias = VISION_MODEL_ALIAS,
   agintiAdapter,
   clock = () => new Date(),
+  requestOutcomeObserver,
   limits: limitOverrides = {}
 } = {}) {
   const assets = snapshotAndValidateAssetMap(assetMap, releaseId);
@@ -876,6 +898,9 @@ export function createCloudRequestHandler({
     throw new TypeError('agintiAdapter must provide the frozen rpc() and capabilities() interface');
   }
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+  if (requestOutcomeObserver !== undefined && typeof requestOutcomeObserver !== 'function') {
+    throw new TypeError('requestOutcomeObserver must be a function');
+  }
   const limits = exactLimitOverrides(limitOverrides);
   const bodyGate = new ConcurrencyGate(limits.concurrentBodies, limits.concurrentBodiesPerSource);
   const loginAdmission = new LoginAdmission({
@@ -1278,7 +1303,7 @@ export function createCloudRequestHandler({
         'content-type': attachment.mediaType,
         'content-disposition': 'inline',
         'x-content-type-options': 'nosniff'
-      }));
+      }, res[RESPONSE_RELEASE_ID]));
       return;
     }
     if (route.pathname === CLOUD_ROUTES.chatRunsStart) {
@@ -1368,7 +1393,7 @@ export function createCloudRequestHandler({
       'content-type': 'text/event-stream; charset=utf-8',
       connection: 'keep-alive',
       'x-accel-buffering': 'no'
-    }));
+    }, res[RESPONSE_RELEASE_ID]));
     res.flushHeaders?.();
     let afterSequence = input.afterSequence;
     const streamDeadline = deadlineSignal(
@@ -1476,7 +1501,7 @@ export function createCloudRequestHandler({
           'content-type': 'text/event-stream; charset=utf-8',
           connection: 'keep-alive',
           'x-accel-buffering': 'no'
-        }));
+        }, res[RESPONSE_RELEASE_ID]));
         res.flushHeaders?.();
         for await (const rawEvent of abortableAsyncIterable(events, streamDeadline.signal)) {
           let event;
@@ -1518,13 +1543,24 @@ export function createCloudRequestHandler({
 
   const handler = async (req, res) => {
     const disconnect = requestAbortController(req, res);
+    res[RESPONSE_RELEASE_ID] = assets.releaseId;
     let releaseBody = null;
     let releaseStream = null;
+    let outcomeRoute = 'unknown';
+    let outcomeFetchMetadata = 'unchecked';
+    let outcomeRelease = 'unchecked';
+    let outcomeErrorCode = null;
     try {
       requirePublicAuthority(req, publicHost);
       const clientAddress = resolveTrustedClientAddress(req);
       if (req.method !== 'POST') rejectRequestBodyFraming(req);
       const route = classifyRequestTarget(req.url, assets);
+      outcomeRoute = route.kind === 'chat' ? 'chat'
+        : (route.kind === 'agent' ? 'agent'
+          : (route.pathname === CLOUD_ROUTES.login ? 'login'
+            : (route.pathname === CLOUD_ROUTES.session ? 'session'
+              : (route.pathname === CLOUD_ROUTES.logout ? 'logout'
+                : (route.kind === 'asset' ? 'asset' : 'unknown')))));
       if (route.kind === 'invalid' || route.kind === 'not_found') {
         if (req.method === 'POST' && hasRequestBodyFraming(req)) req.shouldKeepAlive = false;
         if (route.kind === 'invalid') throw new CloudHttpError(400, 'invalid_target', 'The request target is not normalized.');
@@ -1556,9 +1592,23 @@ export function createCloudRequestHandler({
         methodNotAllowed(req, res, 'POST');
         return;
       }
-      requireOriginAndFetchMetadata(req, origin);
+      requireOrigin(req, origin);
+      outcomeFetchMetadata = fetchMetadataState(req);
+      if (outcomeFetchMetadata === 'invalid') rejectFetchMetadata();
+      let metadataAuthenticated = null;
+      if (outcomeFetchMetadata === 'missing' && (route.kind === 'chat' || route.kind === 'agent')) {
+        try {
+          metadataAuthenticated = await authenticate(req);
+        } catch (error) {
+          if (error instanceof CloudHttpError && error.code === 'csrf_rejected') rejectFetchMetadata();
+          throw error;
+        }
+        if (!metadataAuthenticated) rejectFetchMetadata();
+      }
+      outcomeRelease = clientReleaseState(req, assets.releaseId);
+      if (outcomeRelease === 'mismatch') rejectClientRelease();
       const preauthenticated = route.kind === 'chat' || route.kind === 'agent'
-        ? requireAuthentication(await authenticate(req))
+        ? requireAuthentication(metadataAuthenticated ?? await authenticate(req))
         : null;
       const admissionKey = preauthenticated
         ? `${clientAddress}\u0000${configuredAccount.principalId}`
@@ -1606,11 +1656,30 @@ export function createCloudRequestHandler({
       }
       throw new CloudHttpError(404, 'not_found', 'The requested route does not exist.');
     } catch (error) {
-      sendError(req, res, error);
+      const safe = publicError(error);
+      outcomeErrorCode = safe.code;
+      sendError(req, res, safe);
     } finally {
       releaseBody?.();
       releaseStream?.();
       disconnect.cleanup();
+      if (requestOutcomeObserver !== undefined && req.method === 'POST') {
+        try {
+          const status = Number.isSafeInteger(res.statusCode) && res.statusCode >= 100 && res.statusCode <= 599
+            ? res.statusCode
+            : 500;
+          requestOutcomeObserver(Object.freeze({
+            schemaVersion: 1,
+            timestamp: new Date(epochMilliseconds(clock)).toISOString(),
+            route: outcomeRoute,
+            status,
+            result: status < 400 ? 'accepted' : 'rejected',
+            errorCode: outcomeErrorCode,
+            fetchMetadata: outcomeFetchMetadata,
+            release: outcomeRelease
+          }));
+        } catch { /* Telemetry is bounded, best-effort, and never affects a request. */ }
+      }
     }
   };
   Object.defineProperties(handler, {

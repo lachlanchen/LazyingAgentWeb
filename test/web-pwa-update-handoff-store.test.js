@@ -35,6 +35,7 @@ test("encrypted update handoff cleanup rejects malformed and expired rows and ca
     { key: "/\u0000foreign", value: { draft: "plaintext must fail closed" } },
   ];
   entries[0].value.expiresAt = 1_001;
+  entries[5].value.schemaVersion = "2";
   assert.deepEqual(
     new Set(updateHandoffStorageKeysToDelete(entries, { instant: 7_000 })),
     new Set([entries[0].key, entries[1].key, entries[6].key]),
@@ -43,7 +44,7 @@ test("encrypted update handoff cleanup rejects malformed and expired rows and ca
 
 test("encrypted update handoff cleanup never deletes the in-flight protected row", () => {
   const entries = [storedRecord(1, 1_000), storedRecord(2, 2_000)];
-  entries[1].value.ciphertext = new Uint8Array(4 * 1024 * 1024 + 160 * 1024 + 21);
+  entries[1].value.ciphertext = new Uint8Array(16 * 1024 * 1024 + 160 * 1024 + 21);
   assert.deepEqual(
     updateHandoffStorageKeysToDelete(entries, { instant: 2_000, protectedKey: entries[1].key }),
     [],

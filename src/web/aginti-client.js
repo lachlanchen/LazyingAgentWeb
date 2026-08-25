@@ -11,6 +11,11 @@ import {
   validateRunId,
   verifyAgentEvent,
 } from "./aginti-protocol.js";
+import {
+  addWebReleaseHeader,
+  inspectWebReleaseResponse,
+  optionalWebRelease,
+} from "./web-release.js";
 
 const JSON_LIMIT = 2 * 1024 * 1024;
 const STREAM_LIMIT = 8 * 1024 * 1024;
@@ -31,12 +36,13 @@ const FORBIDDEN_BROWSER_HEADERS = new Set([
 ]);
 
 export class AgintiTransportError extends Error {
-  constructor(message, { code = "AGINTI_UNAVAILABLE", status = 503, retryable = true } = {}) {
+  constructor(message, { code = "AGINTI_UNAVAILABLE", status = 503, retryable = true, serverRelease } = {}) {
     super(message);
     this.name = "AgintiTransportError";
     this.code = code;
     this.status = status;
     this.retryable = retryable;
+    if (serverRelease !== undefined) this.serverRelease = optionalWebRelease(serverRelease);
   }
 }
 
@@ -124,11 +130,11 @@ function normalizedCsrf({ csrfToken, csrfHeader }) {
   return { token, header: csrfHeader.toLowerCase() };
 }
 
-function requestHeaders({ accept, csrf, mutationKey }) {
-  const headers = new Headers({
+function requestHeaders({ accept, csrf, mutationKey, releaseId }) {
+  const headers = addWebReleaseHeader(new Headers({
     accept,
     "content-type": "application/json; charset=utf-8",
-  });
+  }), releaseId);
   const csrfValue = csrf.token();
   if (csrfValue !== undefined) {
     if (typeof csrfValue !== "string" || csrfValue.length < 16 || csrfValue.length > 1024 || /[\u0000-\u001f\u007f]/u.test(csrfValue)) {
@@ -141,6 +147,20 @@ function requestHeaders({ accept, csrf, mutationKey }) {
     if (FORBIDDEN_BROWSER_HEADERS.has(name)) throw new TypeError(`browser request may not set ${name}`);
   }
   return headers;
+}
+
+function requirePinnedRelease(response, releaseId) {
+  const proof = inspectWebReleaseResponse(response, releaseId);
+  if (proof.kind === "unpinned" || proof.kind === "match") return;
+  if (proof.kind === "mismatch") {
+    throw new AgintiTransportError("AgInTi requires the current browser app release", {
+      code: "client_release_mismatch",
+      status: 409,
+      retryable: false,
+      serverRelease: proof.releaseId,
+    });
+  }
+  throw new AgintiProtocolError("AgInTi response is missing its release identity");
 }
 
 function deadlineSignal(signal, timeoutMs) {
@@ -342,12 +362,14 @@ export class AgintiBrowserClient {
       }, { once: true });
     }),
     digest,
+    releaseId,
   } = {}) {
     this.baseUrl = normalizedBaseUrl(baseUrl);
     this.resolveEndpoint = endpointResolver(transportEndpoint, this.baseUrl);
     this.fetch = requireFunction(fetchImpl, "fetchImpl");
     if (fetchImpl === globalThis.fetch) this.fetch = this.fetch.bind(globalThis);
     this.csrf = normalizedCsrf({ csrfToken, csrfHeader });
+    this.releaseId = optionalWebRelease(releaseId);
     this.makeIdempotencyKey = requireFunction(makeIdempotencyKey, "makeIdempotencyKey");
     this.timeoutMs = timeoutMs;
     if (!Number.isSafeInteger(streamWallMs) || streamWallMs < 1_000 || streamWallMs > 120_000) {
@@ -378,7 +400,7 @@ export class AgintiBrowserClient {
         cache: "no-store",
         redirect: "error",
         referrerPolicy: "same-origin",
-        headers: requestHeaders({ accept: "application/json", csrf: this.csrf, mutationKey }),
+        headers: requestHeaders({ accept: "application/json", csrf: this.csrf, mutationKey, releaseId: this.releaseId }),
         body: JSON.stringify(request),
         signal: deadline.signal,
       });
@@ -387,6 +409,7 @@ export class AgintiBrowserClient {
       throw transportFailure(deadline.signal.aborted ? (deadline.signal.reason ?? error) : error);
     }
     try {
+      requirePinnedRelease(response, this.releaseId);
       if (!response.ok) throw await responseError(response);
       if (mediaType(response) !== "application/json") throw new AgintiProtocolError("AgInTi response content type is invalid");
       let value;
@@ -406,7 +429,8 @@ export class AgintiBrowserClient {
   async capabilities({ signal } = {}) {
     try {
       return await this.call(AGINTI_RPC_PATHS.capabilities, {}, { signal });
-    } catch {
+    } catch (error) {
+      if (error?.code === "client_release_mismatch") throw error;
       return FAIL_CLOSED_AGENT_CAPABILITIES;
     }
   }
@@ -465,10 +489,11 @@ export class AgintiBrowserClient {
           cache: "no-store",
           redirect: "error",
           referrerPolicy: "same-origin",
-          headers: requestHeaders({ accept: "text/event-stream", csrf: this.csrf }),
+          headers: requestHeaders({ accept: "text/event-stream", csrf: this.csrf, releaseId: this.releaseId }),
           body: JSON.stringify(request),
           signal: deadline.signal,
         });
+        requirePinnedRelease(response, this.releaseId);
         if (!response.ok) throw await responseError(response);
         if (mediaType(response) !== "text/event-stream") throw new AgintiProtocolError("AgInTi event stream content type is invalid");
         for await (const block of agentSseBlocks(response)) {

@@ -17,6 +17,7 @@ export const AGENT_WEB_EMERGENCY_PREDECESSOR_DIGESTS = Object.freeze([
   "966eaa758b0a2df838579746c0ea8f683f582f31502b4dffbfd9b9c8e379ce9f",
   "b491a975961abf6357bd7e6c091a80da5044608b013834d6eeafceaa9ad6bf87",
   "b998bac4dbf27545d98ebfe44cc768a0d4da83efd15b0c03ee1f23bd4491eb19",
+  "d790c404c1afcbb3c2e9ff753cdeac55c463584f3efbf2c6421d9f5637f4a741",
   "d8dd3d04190973610c7a8fcfc3bed1a7c3b514ac3e6bc6bf18f101ff013661cc",
 ]);
 export const AGENT_WEB_MODULE_ROUTES = Object.freeze([
@@ -24,6 +25,7 @@ export const AGENT_WEB_MODULE_ROUTES = Object.freeze([
   "/assets/browser-app.js",
   "/assets/pwa-update-handoff-store.js",
   "/assets/cloud-session-client.js",
+  "/assets/web-release.js",
   "/assets/direct-chat-client.js",
   "/assets/vision-image-client.js",
   "/assets/vision-image-sanitizer.js",

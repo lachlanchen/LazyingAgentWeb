@@ -1,3 +1,9 @@
+import {
+  addWebReleaseHeader,
+  inspectWebReleaseResponse,
+  optionalWebRelease,
+} from "./web-release.js";
+
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const JSON_RESPONSE_LIMIT = 32 * 1024;
 const ERROR_RESPONSE_LIMIT = 16 * 1024;
@@ -33,12 +39,14 @@ export class CloudBrowserTransportError extends Error {
     code = "cloud_unavailable",
     status = 503,
     retryable = true,
+    serverRelease,
   } = {}) {
     super(message);
     this.name = "CloudBrowserTransportError";
     this.code = code;
     this.status = status;
     this.retryable = retryable;
+    if (serverRelease !== undefined) this.serverRelease = optionalWebRelease(serverRelease);
   }
 }
 
@@ -228,6 +236,20 @@ async function responseFailure(response, action) {
   });
 }
 
+function requirePinnedRelease(response, releaseId, action) {
+  const proof = inspectWebReleaseResponse(response, releaseId);
+  if (proof.kind === "unpinned" || proof.kind === "match") return;
+  if (proof.kind === "mismatch") {
+    throw new CloudBrowserTransportError(`${action} request requires the current browser app release.`, {
+      code: "client_release_mismatch",
+      status: 409,
+      retryable: false,
+      serverRelease: proof.releaseId,
+    });
+  }
+  throw new CloudBrowserProtocolError("cloud response is missing its release identity");
+}
+
 function networkFailure(error, action, signal) {
   if (error instanceof CloudBrowserProtocolError || error instanceof CloudBrowserTransportError) return error;
   const reason = signal?.aborted ? signal.reason : error;
@@ -282,7 +304,7 @@ export class CloudSessionClient {
   constructor(options = {}) {
     const config = exactObject(
       options,
-      ["baseUrl", "fetchImpl", "cookieSource", "timeoutMs"],
+      ["baseUrl", "fetchImpl", "cookieSource", "timeoutMs", "releaseId"],
       [],
       "session client options",
     );
@@ -298,19 +320,22 @@ export class CloudSessionClient {
     this.fetch = fetchImpl === globalThis.fetch ? fetchImpl.bind(globalThis) : fetchImpl;
     this.readCookie = cookieReader(cookieSource);
     this.timeoutMs = timeoutMs;
+    this.releaseId = optionalWebRelease(config.releaseId);
+    this.validatedCsrf = undefined;
   }
 
   csrfToken() {
-    return readCloudCsrfCookie(this.readCookie);
+    const cookie = readCloudCsrfCookie(this.readCookie);
+    return cookie ?? this.validatedCsrf;
   }
 
   async #post(route, body, { signal, csrf, expectedStatus, action }) {
     const endpoint = `${this.baseOrigin}${route}`;
     const deadline = timeoutSignal(signal, this.timeoutMs);
-    const headers = new Headers({
+    const headers = addWebReleaseHeader(new Headers({
       accept: "application/json",
       "content-type": JSON_CONTENT_TYPE,
-    });
+    }), this.releaseId);
     if (csrf !== undefined) headers.set(CLOUD_CSRF_HEADER_NAME, csrf);
     let response;
     try {
@@ -327,6 +352,7 @@ export class CloudSessionClient {
       if (!responseMatchesRoute(response, endpoint)) {
         throw new CloudBrowserProtocolError("cloud response came from an unexpected URL");
       }
+      requirePinnedRelease(response, this.releaseId, action);
       requireNoStore(response);
       if (response.status !== expectedStatus) throw await responseFailure(response, action);
       if (mediaType(response) !== "application/json") {
@@ -358,6 +384,7 @@ export class CloudSessionClient {
     if (session.authenticated && (csrf === undefined || session.csrfToken !== csrf)) {
       throw new CloudBrowserProtocolError("restored session is not bound to the browser CSRF cookie");
     }
+    this.validatedCsrf = session.authenticated ? session.csrfToken : undefined;
     return session;
   }
 
@@ -370,10 +397,11 @@ export class CloudSessionClient {
       action: "Sign-in",
     }));
     if (!session.authenticated) throw new CloudBrowserProtocolError("sign-in returned a signed-out session");
-    const csrf = this.csrfToken();
-    if (csrf === undefined || csrf !== session.csrfToken) {
+    const csrf = readCloudCsrfCookie(this.readCookie);
+    if (csrf !== undefined && csrf !== session.csrfToken) {
       throw new CloudBrowserProtocolError("signed-in session is not bound to the browser CSRF cookie");
     }
+    this.validatedCsrf = session.csrfToken;
     return session;
   }
 
@@ -387,11 +415,13 @@ export class CloudSessionClient {
         retryable: false,
       });
     }
-    return logoutEnvelope(await this.#post(CLOUD_SESSION_ROUTES.logout, {}, {
+    const result = logoutEnvelope(await this.#post(CLOUD_SESSION_ROUTES.logout, {}, {
       signal,
       csrf,
       expectedStatus: 200,
       action: "Sign-out",
     }));
+    this.validatedCsrf = undefined;
+    return result;
   }
 }

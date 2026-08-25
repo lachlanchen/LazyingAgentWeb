@@ -11,7 +11,7 @@ import { DirectChatStore } from '../src/chat-store.js';
 import { DirectChatContextCoordinator } from '../src/chat-context.js';
 import { createAgintiAgentAdapter } from '../src/aginti-adapter.js';
 import { createCloudServer, resolveTrustedClientAddress } from '../src/cloud-server.js';
-import { CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
+import { CLIENT_RELEASE_HEADER_NAME, CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
 import { CloudIndexStore } from '../src/store.js';
 import { canonicalJson } from '../src/web/aginti-protocol.js';
 import { createStandaloneAssetMap } from '../src/web/asset-map.js';
@@ -78,7 +78,7 @@ function publicOriginFor(baseUrl) {
   return url.origin;
 }
 
-function testState(t, { connector, adapter, limits, visionEnabled = false } = {}) {
+function testState(t, { connector, adapter, limits, visionEnabled = false, requestOutcomeObserver } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-cloud-server-test-'));
   const controlStore = new CloudIndexStore({ databasePath: join(root, 'control', 'index.sqlite') });
   const directChatStore = new DirectChatStore({
@@ -117,6 +117,7 @@ function testState(t, { connector, adapter, limits, visionEnabled = false } = {}
     directChatConnector: connector,
     visionEnabled,
     agintiAdapter: adapter,
+    requestOutcomeObserver,
     limits
   };
   const servers = new Set();
@@ -183,19 +184,60 @@ function fetchMetadata(baseUrl, extra = {}, clientAddress) {
   };
 }
 
-async function post(baseUrl, pathname, body, { cookie, csrf, idempotency, headers = {}, signal, clientAddress } = {}) {
+async function post(baseUrl, pathname, body, {
+  cookie,
+  csrf,
+  idempotency,
+  headers = {},
+  signal,
+  clientAddress,
+  fetchMetadataPresent = true
+} = {}) {
+  const requestHeaders = (fetchMetadataPresent ? fetchMetadata : ((url, extra, address) => ({
+    ...publicBoundary(url, address),
+    origin: publicOriginFor(url),
+    ...extra
+  })))(baseUrl, {
+    'content-type': 'application/json',
+    ...(cookie ? { cookie } : {}),
+    ...(csrf ? { 'x-csrf-token': csrf } : {}),
+    ...(idempotency ? { 'idempotency-key': idempotency } : {}),
+    ...headers
+  }, clientAddress);
+  const serialized = JSON.stringify(body);
+  if (!fetchMetadataPresent) {
+    const target = new URL(baseUrl);
+    return await new Promise((resolve, reject) => {
+      const request = httpRequest({
+        host: target.hostname,
+        port: target.port,
+        path: pathname,
+        method: 'POST',
+        headers: { ...requestHeaders, 'content-length': String(Buffer.byteLength(serialized, 'utf8')) }
+      }, (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        response.once('end', () => {
+          const responseHeaders = new Headers();
+          for (let index = 0; index < response.rawHeaders.length; index += 2) {
+            responseHeaders.append(response.rawHeaders[index], response.rawHeaders[index + 1]);
+          }
+          resolve(new Response(Buffer.concat(chunks), {
+            status: response.statusCode,
+            headers: responseHeaders
+          }));
+        });
+      });
+      request.once('error', reject);
+      request.end(serialized);
+    });
+  }
   return fetch(`${baseUrl}${pathname}`, {
     method: 'POST',
     redirect: 'error',
     signal,
-    headers: fetchMetadata(baseUrl, {
-      'content-type': 'application/json',
-      ...(cookie ? { cookie } : {}),
-      ...(csrf ? { 'x-csrf-token': csrf } : {}),
-      ...(idempotency ? { 'idempotency-key': idempotency } : {}),
-      ...headers
-    }, clientAddress),
-    body: JSON.stringify(body)
+    headers: requestHeaders,
+    body: serialized
   });
 }
 
@@ -208,8 +250,11 @@ function cookiePair(value) {
   return value.split(';', 1)[0];
 }
 
-async function login(baseUrl, { password = PASSWORD, clientAddress } = {}) {
-  const response = await post(baseUrl, '/api/login', { username: USERNAME, password, remember: true }, { clientAddress });
+async function login(baseUrl, { password = PASSWORD, clientAddress, fetchMetadataPresent = true } = {}) {
+  const response = await post(baseUrl, '/api/login', { username: USERNAME, password, remember: true }, {
+    clientAddress,
+    fetchMetadataPresent
+  });
   const value = await response.json();
   if (!response.ok) return { response, value };
   const cookies = responseCookies(response);
@@ -561,6 +606,108 @@ test('uses secure browser cookies, session-bound CSRF, generic failures, and own
     csrf: auth.csrf
   });
   assert.equal(foreign.status, 404);
+});
+
+test('iOS/PWA requests without Fetch Metadata stay exact-origin, session-bound, release-compatible, and observable', async (t) => {
+  const outcomes = [];
+  const state = testState(t, { requestOutcomeObserver: (outcome) => outcomes.push(outcome) });
+  const { baseUrl } = await state.start();
+
+  const auth = await login(baseUrl, { fetchMetadataPresent: false });
+  assert.equal(auth.response.status, 200, 'exact-origin mobile login remains available');
+  assert.equal(auth.response.headers.get(CLIENT_RELEASE_HEADER_NAME), RELEASE_ID);
+
+  const restored = await post(baseUrl, '/api/session', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false
+  });
+  assert.equal(restored.status, 200, 'mobile session restore retains its existing session + CSRF checks');
+
+  const legacyList = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false
+  });
+  assert.equal(legacyList.status, 200, 'an already-open legacy PWA may omit the new release header');
+  assert.deepEqual(await legacyList.json(), { threads: [] });
+  assert.equal(legacyList.headers.get(CLIENT_RELEASE_HEADER_NAME), RELEASE_ID);
+
+  const wrongOrigin = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false,
+    headers: { origin: 'https://attacker.invalid' }
+  });
+  assert.equal(wrongOrigin.status, 403, 'missing Fetch Metadata never relaxes the exact-Origin boundary');
+  assert.equal((await wrongOrigin.json()).error.code, 'origin_rejected');
+
+  const missingCsrf = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    fetchMetadataPresent: false
+  });
+  assert.equal(missingCsrf.status, 403);
+  assert.equal((await missingCsrf.json()).error.code, 'fetch_metadata_rejected');
+
+  const partialMetadata = await fetch(`${baseUrl}/api/chat/threads/list`, {
+    method: 'POST',
+    redirect: 'error',
+    headers: {
+      ...publicBoundary(baseUrl),
+      origin: publicOriginFor(baseUrl),
+      'sec-fetch-site': 'same-origin',
+      'content-type': 'application/json',
+      cookie: auth.cookie,
+      'x-csrf-token': auth.csrf
+    },
+    body: '{}'
+  });
+  assert.equal(partialMetadata.status, 403);
+  assert.equal((await partialMetadata.json()).error.code, 'fetch_metadata_rejected');
+
+  const wrongMetadata = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    headers: { 'sec-fetch-site': 'cross-site' }
+  });
+  assert.equal(wrongMetadata.status, 403);
+  assert.equal((await wrongMetadata.json()).error.code, 'fetch_metadata_rejected');
+
+  const rejectedCreate = await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'ios-release-rejected-thread',
+    title: 'must not persist'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'ios-release-rejected-0001',
+    headers: { [CLIENT_RELEASE_HEADER_NAME]: `stale-${'b'.repeat(64)}` }
+  });
+  assert.equal(rejectedCreate.status, 409);
+  assert.equal(rejectedCreate.headers.get(CLIENT_RELEASE_HEADER_NAME), RELEASE_ID);
+  assert.equal((await rejectedCreate.json()).error.code, 'client_release_mismatch');
+
+  const stillEmpty = await post(baseUrl, '/api/chat/threads/list', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    fetchMetadataPresent: false
+  });
+  assert.deepEqual(await stillEmpty.json(), { threads: [] }, 'release rejection happens before mutation ingestion');
+
+  assert(outcomes.some((outcome) => outcome.fetchMetadata === 'missing'
+    && outcome.release === 'missing' && outcome.result === 'accepted'));
+  assert(outcomes.some((outcome) => outcome.errorCode === 'fetch_metadata_rejected'
+    && outcome.fetchMetadata === 'invalid'));
+  assert(outcomes.some((outcome) => outcome.errorCode === 'client_release_mismatch'
+    && outcome.release === 'mismatch'));
+  for (const outcome of outcomes) {
+    assert.deepEqual(Object.keys(outcome).sort(), [
+      'errorCode', 'fetchMetadata', 'release', 'result', 'route', 'schemaVersion', 'status', 'timestamp'
+    ]);
+    const serialized = JSON.stringify(outcome);
+    assert.doesNotMatch(serialized, /ios-release-rejected-thread|must not persist|lachlanchen|correct horse/i);
+    assert.equal(serialized.includes(auth.csrf), false);
+    for (const cookie of auth.cookie.split('; ')) assert.equal(serialized.includes(cookie), false);
+  }
 });
 
 test('deletes Direct Chat only through the exact authenticated cursor-bound mutation', async (t) => {

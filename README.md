@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.22 candidate; v0.1.21 production):** production is promoted
+> **Deployment status (v0.1.23 candidate; v0.1.22 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -14,16 +14,19 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > retain public failure reasons across reload, and follow exact idempotent Resume
 > successor runs with an optional corrected prompt. Direct Chat remembers the
 > user's non-private workspace-mode preference across a full reload, while
-> confirmed sign-out fences stale history reads. The accepted v0.1.21 release also
+> confirmed sign-out fences stale history reads. The accepted v0.1.22 release also
 > keeps failed-predecessor and corrected-success messages in chronological
 > order when their verified output and plot artifacts are restored after reload.
 > The baseline accepted artifacts remain declarative plot, table, and Markdown
-> schemas. The v0.1.22 candidate also defines a backward-compatible,
+> schemas. v0.1.23 preserves the v0.1.22 backward-compatible,
 > default-disabled grounded-search
 > extension: only an exact AgInTi capability may reveal the explicit Search
 > controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and
-> admit bounded HTTPS-only `sources` artifacts. v0.1.21 production does not
-> claim that capability, and the browser has no direct LocalLLM search route.
+> admit bounded HTTPS-only `sources` artifacts. It also adds an exact-origin,
+> session-and-CSRF-bound fallback for iOS/PWA requests that omit Fetch Metadata,
+> retained mobile CSRF state, release-pinned requests with encrypted draft/image
+> refresh handoff, resume-time session validation, and secret-free rejection telemetry.
+> The browser has no direct LocalLLM search route.
 > Voice messages and general artifact file upload/download remain unavailable.
 
 The ownership model, Chat/Agent data planes, recovery semantics, artifact

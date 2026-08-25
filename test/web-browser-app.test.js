@@ -6115,7 +6115,7 @@ test("browser integration has no legacy direct endpoint or browser-owned chat pe
   assert.match(source, /CloudSessionClient/u);
   assert.doesNotMatch(source, /DirectLocalLlmClient|\/v1\/chat\/completions/u);
   assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB|CacheStorage|caches\.open/u);
-  const releaseReload = /function reloadForActiveUpdate\(\) \{([\s\S]*?)\n  \}/u.exec(source)?.[1] ?? "";
+  const releaseReload = /function replaceWithRelease\([^)]*\) \{([\s\S]*?)\n  \}/u.exec(source)?.[1] ?? "";
   assert.match(releaseReload, /purgeAttachmentMemory\(\)/u, "release navigation purges private in-memory attachment state");
   assert.match(source, /addEventListener\?\.\("pagehide", \(event\) => \{[\s\S]*?event\?\.persisted !== true[\s\S]*?purgeAttachmentMemory\(\)/u);
 });

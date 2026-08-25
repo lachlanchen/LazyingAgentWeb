@@ -20,6 +20,7 @@ import {
 } from "../src/web/aginti-protocol.js";
 import {
   AgintiBrowserClient,
+  AgintiTransportError,
   selectDefaultMode,
 } from "../src/web/aginti-client.js";
 import { createRunPresentation } from "../src/web/presentation-state.js";
@@ -29,6 +30,8 @@ const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
 const ZERO_HASH = "0".repeat(64);
+const RELEASE = `release-${"a".repeat(64)}`;
+const NEXT_RELEASE = `release-${"b".repeat(64)}`;
 
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -138,10 +141,13 @@ function event({ seq, type, payload, previousHash, runId = RUN_ID, threadId = TH
   return { ...envelope, hash: digest(canonicalJson(envelope)), ...extra };
 }
 
-function jsonResponse(value, { status = 200 } = {}) {
+function jsonResponse(value, { status = 200, releaseId = RELEASE } = {}) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "x-lazying-agent-release": releaseId,
+    },
   });
 }
 
@@ -458,6 +464,7 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
     transportEndpoint: "/api/edge",
     baseUrl: "https://llm.lazying.art/app/",
     csrfToken: "csrf-token-value-long-enough",
+    releaseId: RELEASE,
     makeIdempotencyKey: () => "mutation-key-1234567890",
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
@@ -480,6 +487,7 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   assert.equal(calls[0].options.headers.get("idempotency-key"), null);
   assert.equal(calls[1].options.headers.get("idempotency-key"), "mutation-key-1234567890");
   assert.equal(calls[1].options.headers.get("x-csrf-token"), "csrf-token-value-long-enough");
+  assert.equal(calls[1].options.headers.get("x-lazying-agent-release"), RELEASE);
   assert.equal(calls[2].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.runsStart}`);
   assert.deepEqual(JSON.parse(calls[2].options.body), {
     threadId: THREAD_ID,
@@ -508,6 +516,23 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
     transportEndpoint: "/api/%2e%2e/private",
     baseUrl: "https://llm.lazying.art/",
   }), /normalized|absolute-path/u);
+});
+
+test("pinned Agent transport exposes an exact newer release without retrying", async () => {
+  const client = new AgintiBrowserClient({
+    transportEndpoint: "/api/edge",
+    baseUrl: "https://llm.lazying.art/",
+    csrfToken: "csrf-token-value-long-enough",
+    releaseId: RELEASE,
+    fetchImpl: async () => jsonResponse(capabilities(), { status: 409, releaseId: NEXT_RELEASE }),
+  });
+  await assert.rejects(
+    () => client.capabilities(),
+    (error) => error instanceof AgintiTransportError
+      && error.code === "client_release_mismatch"
+      && error.serverRelease === NEXT_RELEASE
+      && error.retryable === false,
+  );
 });
 
 test("the default AgInTi fetch keeps the global browser receiver", async () => {

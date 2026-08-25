@@ -3,8 +3,8 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.22 candidate remains compatible with current v0.1.21
-production, which enables Agent only through the
+is fail-closed. The v0.1.23 candidate remains compatible with current v0.1.22
+production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
 Voice messages and general artifact file upload/download remain unavailable.
@@ -85,6 +85,17 @@ headers, Fetch Metadata, CSRF, idempotency, exact request schemas, body/time
 limits, bounded per-session and global stream admission, and graceful draining
 of Direct Chat jobs.
 
+Every browser API response carries the immutable current release identity. New
+shells pin that identity on each request; an explicit mismatch is rejected
+before body ingestion, while a missing request header remains a bounded
+compatibility path for already-open predecessor tabs. Exact-origin iOS and PWA
+requests may omit all Fetch Metadata: login remains available, session/logout
+retain their normal CSRF rules, and Chat/Agent proceed only after the browser
+session and CSRF mutation proof validate. Any present partial or wrong Fetch
+Metadata still fails closed. Bounded outcome records contain only route/status
+categories and these gate results—never prompts, identifiers, cookies, tokens,
+or credentials.
+
 All owner identity is derived from the verified browser session. Public JSON
 and SSE responses are copied through allowlisted projections and never expose
 the internal `accountId`. The BFF accepts a stateless AgInTi adapter interface;
@@ -149,8 +160,7 @@ transition, or release activation. Up to four staged or just-sent composer image
 are separate transient page memory and are revoked at their send, view, and
 authentication boundaries. The encrypted, expiring, one-shot confirmed-update
 composer handoff described below is the only narrow IndexedDB exception and
-accepts at most one image. A multi-image selection keeps the current page open
-and blocks update activation instead of persisting the larger private draft.
+accepts at most four images and 16 MiB of canonical bytes.
 
 The server may reuse a completed per-thread integrity audit from a bounded
 in-process LRU. Entries are keyed by account and thread, guarded by SQLite's
@@ -228,9 +238,8 @@ Direct Chat:
   per image and 16 MiB per message. Its visible composer/message preview is
   independently bounded to 512 pixels and 512 KiB per image. No image is placed in
   Cache Storage, localStorage, or sessionStorage. A user-confirmed PWA update
-  may place one encrypted, expiring, one-shot single-image unsent-composer handoff in a
+  may place one encrypted, expiring, one-shot multi-image unsent-composer handoff in a
   dedicated IndexedDB store; it is never history, a send queue, or auto-sent.
-  Multiple staged images block activation and remain only in the current page.
 - The BFF independently validates canonical base64, MIME/signature, structure,
   dimensions, metadata absence, digest, order, unique identifiers, count, and
   aggregate bytes. It atomically commits the prompt, descriptor-bound ledger
@@ -310,14 +319,19 @@ window, is offered through **Update** or **Later**:
 - A failed or offline update leaves the current app usable and retries after
   connectivity returns.
 
-A confirmed Update can carry only a definitively unsent Direct Chat composer
+A confirmed Update or explicit API release mismatch can carry only a definitively unsent composer
 across that reload. The page encrypts a bounded record with AES-GCM, keeps the
 random key only in a URL fragment, scrubs the fragment synchronously, then
 atomically takes and deletes the record before validating its account, scope,
-source/target release, age, digest, and canonical image. Restoration never
+source/target release, age, digest, and up to four canonical images. Restoration never
 dispatches a request. Passwords, active or ambiguous sends, generations, Agent
 runs, and other browser-held workflows remain reload blockers. Malformed,
 expired, and excess orphan ciphertexts are pruned.
+
+`pageshow` and visible-state resume revalidate the server session. A revoked
+session returns to sign-in while keeping unsent composer work in page memory;
+an exact newer release uses a version-addressed navigation and the encrypted
+handoff rather than discarding that work.
 
 Before caching, the service worker requires the exact same-origin URL, status,
 MIME type, declared shell security headers, byte length, and SHA-256 for every
@@ -409,7 +423,7 @@ admission, tunnel outage and rollback. A live Docker/model acceptance run is
 additionally blocked whenever the shared-workstation resource policy fails.
 Releases are immutable and retain the current and immediately previous
 reproducible package with an executable rollback. Passing offline package tests
-alone does not authorize deployment. Current v0.1.21 production exposes Agent
+alone does not authorize deployment. Current v0.1.22 production exposes Agent
 only while AgInTi returns the accepted native capability proof; removing or
 invalidating that proof disables Agent. A live PWA or Direct Chat deployment
 alone neither authorizes nor implies Agent enablement, and Direct Chat remains a

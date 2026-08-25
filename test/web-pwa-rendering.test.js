@@ -2258,12 +2258,109 @@ test("a definitively unsent image survives a confirmed stale-PWA update exactly 
   assert.equal(store.records.size, 0, "the encrypted handoff is deleted before validation and restored only in memory");
 });
 
+test("an explicit release mismatch hard-refreshes by exact version and restores two unsent images from encrypted handoff", async () => {
+  const clients = idleAuthenticatedPwaClients();
+  const mutationCalls = { create: 0, retry: 0 };
+  const chat = {
+    ...clients.chat,
+    prepareThread({ title }) {
+      return Object.freeze({
+        threadId: "chat_release_refresh_xxxxxxxxx",
+        title,
+        idempotencyKey: "thread_release_refresh_0001",
+      });
+    },
+    prepareRun(value) {
+      return Object.freeze({
+        ...value,
+        generationId: "generation_release_refresh_xxx",
+        assistantMessageId: "assistant_release_refresh_xxxxx",
+        idempotencyKey: "run_release_refresh_0000001",
+      });
+    },
+    async createThread() {
+      mutationCalls.create += 1;
+      throw new DirectChatTransportError("stale release", {
+        code: "client_release_mismatch",
+        status: 409,
+        retryable: false,
+        serverRelease: NEXT_RELEASE,
+      });
+    },
+    async retryCreateThread() { mutationCalls.retry += 1; throw new Error("must not retry"); },
+  };
+  const bytes = canonicalPngHeader();
+  let imageSerial = 0;
+  const store = memoryUpdateHandoffStore();
+  const source = updateControllerHarness({
+    waiting: false,
+    now: () => 30_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: clients.agent,
+    chat,
+    updateHandoffStore: store,
+    async canonicalizeImage() {
+      imageSerial += 1;
+      return Object.freeze({
+        attachmentId: `image_release_refresh_0000000${imageSerial}`,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: (blob) => `blob:source-${blob.size}-${imageSerial}`,
+    revokeObjectUrl() {},
+  });
+  await source.app.initialize();
+  const imageInput = source.document.getElementById("image-input");
+  imageInput.files = [{ name: "first.png" }, { name: "second.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "Describe both unsent mobile images";
+  await source.app.submitMessage({ preventDefault() {} });
+
+  assert.deepEqual(mutationCalls, { create: 1, retry: 0 });
+  assert.equal(store.calls.save, 1);
+  assert.equal(source.replacements.length, 1);
+  assert.match(source.replacements[0], new RegExp(
+    `^https://llm\\.lazying\\.art/\\?v=${NEXT_RELEASE}#lazying-update-handoff=`,
+    "u",
+  ));
+  const encrypted = [...store.records.values()][0];
+  assert.equal(encrypted.schemaVersion, "2");
+  assert.doesNotMatch(JSON.stringify(encrypted), /Describe both unsent mobile images|image_release_refresh/u);
+
+  const restoredClients = idleAuthenticatedPwaClients();
+  let restoredUrlSerial = 0;
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 30_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: restoredClients.agent,
+    chat: restoredClients.chat,
+    updateHandoffStore: store,
+    createObjectUrl: () => { restoredUrlSerial += 1; return `blob:restored-${restoredUrlSerial}`; },
+    revokeObjectUrl() {},
+  });
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("message-input").value, "Describe both unsent mobile images");
+  assert.match(restored.document.getElementById("image-preview-label").textContent, /2 images/u);
+  assert.equal(store.records.size, 0);
+  assert.deepEqual(restoredClients.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+});
+
 test("corrupt, oversized, foreign-release, and foreign-account update handoffs are deleted and rejected", async (t) => {
   const { href, record: [storageKey, encrypted] } = await stageEncryptedTextUpdateHandoff();
   const corrupt = structuredClone(encrypted);
   corrupt.ciphertext[0] ^= 0xff;
   const oversized = structuredClone(encrypted);
-  oversized.ciphertext = new Uint8Array(4 * 1024 * 1024 + 160 * 1024 + 21);
+  oversized.ciphertext = new Uint8Array(16 * 1024 * 1024 + 160 * 1024 + 21);
   const foreignRelease = structuredClone(encrypted);
   foreignRelease.targetRelease = OLD_RELEASE;
   for (const scenario of [
@@ -2410,6 +2507,58 @@ test("foreground and periodic update checks are online-only and throttled", asyn
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(harness.registration.updateCalls, 3, "a visible online tab checks periodically without requiring focus churn");
+});
+
+test("pageshow and visible PWA resume revalidate the retained browser session without duplicate hidden checks", async () => {
+  const clients = idleAuthenticatedPwaClients();
+  const session = Object.freeze({
+    authenticated: true,
+    username: "account-user",
+    csrfToken: "csrf-token-value-long-enough",
+  });
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => session,
+    agent: clients.agent,
+    chat: clients.chat,
+  });
+  await harness.app.initialize();
+  assert.equal(harness.restoreCalls, 1);
+
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.restoreCalls, 2, "BFCache/PWA resume verifies the server session");
+
+  harness.document.visibilityState = "hidden";
+  harness.document.dispatch("visibilitychange");
+  await Promise.resolve();
+  assert.equal(harness.restoreCalls, 2);
+
+  harness.document.visibilityState = "visible";
+  harness.document.dispatch("visibilitychange");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.restoreCalls, 3, "foreground resume revalidates exactly once");
+});
+
+test("a PWA resume with a revoked session preserves the unsent draft and returns to sign-in", async () => {
+  const clients = idleAuthenticatedPwaClients();
+  let valid = true;
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => valid
+      ? { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }
+      : { authenticated: false },
+    agent: clients.agent,
+    chat: clients.chat,
+  });
+  await harness.app.initialize();
+  harness.document.getElementById("message-input").value = "keep this unsent mobile draft";
+  valid = false;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("login-view").hidden, false);
+  assert.equal(harness.document.getElementById("message-input").value, "keep this unsent mobile draft");
+  assert.match(harness.document.getElementById("login-error").textContent, /session expired/u);
 });
 
 test("one stable worker registration discovers v1, v2, and v3 without a second version authority", async () => {

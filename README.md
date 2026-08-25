@@ -93,10 +93,12 @@ boundary, and replaceable-node contract are specified in
   `Idempotency-Key` authority to AgInTi. LazyEdge remains an opaque transport;
   Agent state and decisions never move into this package. Search-bearing run
   inputs receive a fresh server-side capability preflight, so a disabled or
-  legacy AgInTi never receives the extension field. File bytes use a separate
-  authenticated GET/HEAD BFF route that converts one validated browser range
-  into structured AgInTi input, streams with backpressure, and never forwards
-  browser credentials or headers to the local service.
+  legacy AgInTi never receives the extension field. The exact `file` capability
+  negotiates creation only; a verified file event and receipt remain durable
+  read authority across a read-compatible rollback. File bytes use a separate
+  authenticated release-bound GET/HEAD BFF route that converts one validated
+  browser range into structured AgInTi input, streams with backpressure, and
+  never forwards browser credentials or headers to the local service.
 
 ## Component boundaries
 

@@ -246,10 +246,13 @@ async function artifactRequest(baseUrl, artifactId, {
   cookie,
   range,
   release,
+  urlRelease = RELEASE_ID,
   headers = {},
   fetchMetadataPresent = true
 } = {}) {
-  return fetch(`${baseUrl}/api/agent/artifacts/${artifactId}/content`, {
+  const target = new URL(`/api/agent/artifacts/${artifactId}/content`, baseUrl);
+  if (urlRelease !== null) target.search = `?v=${encodeURIComponent(urlRelease)}`;
+  return fetch(target, {
     method,
     redirect: 'error',
     headers: {
@@ -1141,7 +1144,7 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
   let ownerSession = null;
   const adapter = {
     async rpc() { throw new Error('unexpected Agent RPC'); },
-    async capabilities() { throw new Error('unexpected capability RPC'); },
+    async capabilities() { throw new Error('historical artifact reads must not renegotiate creation'); },
     async artifactContent(input, context) {
       calls.push({ input, context });
       if (ownerSession === null) ownerSession = context.browserSession;
@@ -1243,12 +1246,97 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
   assert.notEqual(calls.at(-1).context.browserSession, ownerSession);
 });
 
+test('an aborted artifact stream releases admission even when a hostile upstream cancel never settles', async (t) => {
+  const artifactId = `art_${'d'.repeat(64)}`;
+  const content = Buffer.from('ab', 'utf8');
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  let contentCalls = 0;
+  let cancelCalls = 0;
+  const adapter = {
+    async rpc() { throw new Error('unexpected Agent RPC'); },
+    async capabilities() { throw new Error('historical artifact reads must not renegotiate creation'); },
+    async artifactContent() {
+      contentCalls += 1;
+      if (contentCalls > 1) return Object.freeze({ status: 404 });
+      let reads = 0;
+      const reader = {
+        read() {
+          reads += 1;
+          return reads === 1
+            ? Promise.resolve({ done: false, value: new Uint8Array([content[0]]) })
+            : new Promise(() => {});
+        },
+        cancel() {
+          cancelCalls += 1;
+          return new Promise(() => {});
+        },
+        releaseLock() { throw new Error('hostile reader retains a pending read'); }
+      };
+      return Object.freeze({
+        status: 200,
+        filename: 'abort.pdf',
+        mime: 'application/pdf',
+        totalBytes: content.byteLength,
+        selectedBytes: content.byteLength,
+        sha256,
+        range: null,
+        body: { getReader: () => reader }
+      });
+    }
+  };
+  const state = testState(t, {
+    adapter,
+    limits: { concurrentStreams: 1, concurrentStreamsPerSession: 1 }
+  });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const target = new URL(`/api/agent/artifacts/${artifactId}/content`, baseUrl);
+  target.search = `?v=${RELEASE_ID}`;
+
+  await new Promise((resolve, reject) => {
+    const request = httpRequest(target, {
+      method: 'GET',
+      headers: {
+        ...publicBoundary(baseUrl),
+        cookie: auth.cookie,
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty'
+      }
+    }, (response) => {
+      response.once('error', () => {});
+      response.once('data', () => {
+        response.destroy();
+        request.destroy();
+        resolve();
+      });
+    });
+    request.once('error', (error) => {
+      if (error.code === 'ECONNRESET') resolve();
+      else reject(error);
+    });
+    request.end();
+  });
+  for (let attempt = 0; attempt < 50 && cancelCalls === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(cancelCalls, 1);
+
+  const admitted = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie });
+  assert.equal(admitted.status, 404, 'the disconnected stream cannot retain the sole session admission slot');
+  assert.equal(contentCalls, 2);
+});
+
 test('file artifact ingress rejects auth, release, method, path, and range confusion before streaming', async (t) => {
   const artifactId = `art_${'c'.repeat(64)}`;
   let calls = 0;
+  let capabilityCalls = 0;
   const adapter = {
     async rpc() { throw new Error('unexpected Agent RPC'); },
-    async capabilities() { throw new Error('unexpected capability RPC'); },
+    async capabilities() {
+      capabilityCalls += 1;
+      throw new Error('historical artifact reads must not renegotiate creation');
+    },
     async artifactContent() { calls += 1; return Object.freeze({ status: 404 }); }
   };
   const state = testState(t, { adapter });
@@ -1267,6 +1355,14 @@ test('file artifact ingress rejects auth, release, method, path, and range confu
   assert.equal((await stale.json()).error.code, 'client_release_mismatch');
   assert.equal(calls, 0);
 
+  const staleUrl = await artifactRequest(baseUrl, artifactId, {
+    cookie: auth.cookie,
+    urlRelease: `release-${'f'.repeat(64)}`
+  });
+  assert.equal(staleUrl.status, 409);
+  assert.equal((await staleUrl.json()).error.code, 'client_release_mismatch');
+  assert.equal(calls, 0);
+
   for (const range of ['bytes=-4', 'bytes=0-1,4-5', 'items=0-1', 'bytes=8-2']) {
     const invalidRange = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie, range });
     assert.equal(invalidRange.status, 400, range);
@@ -1279,6 +1375,11 @@ test('file artifact ingress rejects auth, release, method, path, and range confu
     headers: { ...publicBoundary(baseUrl), cookie: auth.cookie }
   });
   assert.equal(encoded.status, 400);
+  const queryConfusion = await fetch(
+    `${baseUrl}/api/agent/artifacts/${artifactId}/content?v=${RELEASE_ID}&v=${RELEASE_ID}`,
+    { headers: { ...publicBoundary(baseUrl), cookie: auth.cookie } }
+  );
+  assert.equal(queryConfusion.status, 400);
   assert.equal(calls, 0);
 
   const wrongMethod = await post(baseUrl, `/api/agent/artifacts/${artifactId}/content`, {}, {
@@ -1295,6 +1396,20 @@ test('file artifact ingress rejects auth, release, method, path, and range confu
   });
   assert.equal(crossSite.status, 403);
   assert.equal(calls, 0);
+
+  const missingRelease = await artifactRequest(baseUrl, artifactId, {
+    cookie: auth.cookie,
+    urlRelease: null
+  });
+  assert.equal(missingRelease.status, 409);
+  assert.equal((await missingRelease.json()).error.code, 'client_release_mismatch');
+  assert.equal(capabilityCalls, 0, 'an unpinned Safari navigation fails before byte transport');
+
+  const historical = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie });
+  assert.equal(historical.status, 404);
+  assert.equal((await historical.json()).error.code, 'not_found');
+  assert.equal(capabilityCalls, 0, 'historical reads do not renegotiate the current creation capability');
+  assert.equal(calls, 1, 'a release-pinned authenticated historical read reaches AgInTi ownership enforcement');
 });
 
 test('logout revokes only its browser session and reports native Agent cancellation as a release gate', async (t) => {

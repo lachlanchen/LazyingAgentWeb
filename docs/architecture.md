@@ -433,10 +433,13 @@ not issue fetches, previews, preloads, or image requests. Plot data is finite,
 URL-free and expression-free; the browser builds DOM/SVG with text nodes.
 File artifacts accept only a safe basename, `application/pdf`,
 `application/x-tex`, or `text/x-tex`, a 1-16 MiB byte count, and a lowercase
-SHA-256 digest. `GET`/`HEAD /api/agent/artifacts/<opaque-id>/content` derives
+SHA-256 digest. `GET`/`HEAD /api/agent/artifacts/<opaque-id>/content?v=<release>` derives
 AgInTi principal and browser-session authority from the authenticated cookie,
 converts at most one validated start-based Range into structured internal JSON,
 and streams the raw response with backpressure and a hard delivery deadline.
+The exact `file` capability gates creation, not historical reads: after a
+verified file event and receipt, read-compatible rollback releases may omit the
+creation capability while authenticated content access remains available.
 The BFF reconstructs attachment disposition and security headers; it never
 forwards browser cookies, tokens, or Range, buffers the complete file, writes
 artifact bytes to cloud storage, or permits the service worker to cache them.

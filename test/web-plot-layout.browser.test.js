@@ -177,6 +177,7 @@ async function closeServer(server) {
 
 const BROWSER_FIXTURE = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="lazying-agent-release" content="release-${"f".repeat(64)}">
 <style>${BRIGHT_APP_CSS}</style></head><body>
 <div class="app-view">
   <aside id="sidebar" class="sidebar">Private conversations</aside><button class="sidebar-scrim" hidden></button>
@@ -188,6 +189,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Large scientific ticks</h3><div id="large-scientific"></div></article>
         <article class="artifact"><h3>Small scientific ticks</h3><div id="small-scientific"></div></article>
         <article class="artifact"><h3>Narrow scientific ticks</h3><div id="narrow-scientific"></div></article>
+        <article class="artifact"><h3>Compiled paper</h3><div id="file-artifact"></div></article>
       </section>
     </article></section></div>
     <aside class="activity-panel"><header><strong>Agent activity</strong><span>Completed</span></header><ol><li>Plan response — Completed</li><li>Run bounded analysis — Completed</li><li>Prepare answer — Completed</li></ol></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><button id="run-agent">Run</button></form><p id="footer-note" class="footer-note">Agent footer</p>
@@ -222,6 +224,11 @@ renderer.renderArtifact(document.querySelector("#narrow-scientific"), {
     series: [{ name: "Adjacent safe integers", points: [
       { x: maximum - 4, y: 0 }, { x: maximum - 2, y: 1 }, { x: maximum, y: 2 },
     ] }] },
+});
+renderer.renderArtifact(document.querySelector("#file-artifact"), {
+  id: "art_${"e".repeat(64)}", title: "Compiled paper", kind: "file",
+  spec: { schemaVersion: "1", filename: "QAOA 结果与补充材料.pdf", mime: "application/pdf",
+    bytes: 16777216, sha256: "f".repeat(64) },
 });
 </script></body></html>`;
 
@@ -271,6 +278,11 @@ const GEOMETRY_EXPRESSION = `(() => {
   const messageInput = rectangle(document.querySelector('#message-input'));
   const runAgent = rectangle(document.querySelector('#run-agent'));
   const footer = rectangle(document.querySelector('#footer-note'));
+  const fileTarget = document.querySelector('#file-artifact');
+  const fileControls = fileTarget.querySelector('.artifact-file-controls');
+  const fileActions = [...fileTarget.querySelectorAll('.artifact-file-action')];
+  const fileTargetRect = rectangle(fileTarget);
+  const fileControlsRect = rectangle(fileControls);
   const sidebar = document.querySelector('#sidebar');
   sidebar.hidden = true;
   const maskedWorkspace = rectangle(document.querySelector('#workspace'));
@@ -291,6 +303,17 @@ const GEOMETRY_EXPRESSION = `(() => {
       footerInsideWorkspace: contains(workspace, footer),
       chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
       composerAboveFooter: composer.bottom <= footer.top + .5,
+    },
+    file: {
+      target: fileTargetRect,
+      controls: fileControlsRect,
+      actions: fileActions.map(rectangle),
+      actionsCount: fileActions.length,
+      controlsInsideTarget: contains(fileTargetRect, fileControlsRect),
+      actionsInsideControls: fileActions.every((node) => contains(fileControlsRect, rectangle(node))),
+      actionsOverlap: overlaps(fileActions),
+      minimumActionHeight: Math.min(...fileActions.map((node) => node.getBoundingClientRect().height)),
+      hrefs: fileActions.map((node) => node.href),
     },
     maskPreserved: workspace.left === maskedWorkspace.left && workspace.width === maskedWorkspace.width,
     pageOverflow: document.documentElement.scrollWidth > innerWidth,
@@ -318,9 +341,10 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
   skip: CHROME === null ? "Chrome is unavailable" : false,
   timeout: 45_000,
 }, async () => {
-  const [safeRendering, protocol] = await Promise.all([
+  const [safeRendering, protocol, webRelease] = await Promise.all([
     readFile(new URL("../src/web/safe-rendering.js", import.meta.url)),
     readFile(new URL("../src/web/aginti-protocol.js", import.meta.url)),
+    readFile(new URL("../src/web/web-release.js", import.meta.url)),
   ]);
   const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
@@ -333,6 +357,9 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     } else if (pathname === "/aginti-protocol.js") {
       response.setHeader("content-type", "text/javascript; charset=utf-8");
       response.end(protocol);
+    } else if (pathname === "/web-release.js") {
+      response.setHeader("content-type", "text/javascript; charset=utf-8");
+      response.end(webRelease);
     } else {
       response.statusCode = 404;
       response.end();
@@ -374,7 +401,7 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       await page.send("Page.navigate", { url: origin });
       await retry(async () => {
         const ready = await page.send("Runtime.evaluate", {
-          expression: "document.readyState === 'complete' && document.querySelectorAll('svg.artifact-plot').length === 4",
+          expression: "document.readyState === 'complete' && document.querySelectorAll('svg.artifact-plot').length === 4 && document.querySelectorAll('#file-artifact a').length === 2",
           returnByValue: true,
         });
         if (ready.result.value !== true) throw new Error("plot fixture is not ready");
@@ -395,6 +422,15 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     for (const [label, result] of [["desktop", desktop], ["iphone", iphone]]) {
       assert.equal(result.pageOverflow, false);
       assert.equal(result.maskPreserved, true);
+      assert.equal(result.file.actionsCount, 2);
+      assert.equal(result.file.controlsInsideTarget, true);
+      assert.equal(result.file.actionsInsideControls, true);
+      assert.equal(result.file.actionsOverlap, false);
+      assert.ok(result.file.minimumActionHeight >= 44);
+      assert.deepEqual(result.file.hrefs, [
+        `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
+        `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
+      ]);
       for (const [check, accepted] of Object.entries({
         chatScrollInsideWorkspace: result.shell.chatScrollInsideWorkspace,
         composerInsideWorkspace: result.shell.composerInsideWorkspace,

@@ -1,4 +1,5 @@
 import { validateArtifact } from "./aginti-protocol.js";
+import { optionalWebRelease } from "./web-release.js";
 
 const MAX_MARKDOWN = 32_000;
 const MAX_TEX_TOTAL = 8_192;
@@ -726,11 +727,13 @@ function formatFileBytes(value) {
 }
 
 function renderFile(runtime, target, artifact) {
-  const { document, locationHref } = runtime;
+  const { document, locationHref, releaseId } = runtime;
+  if (releaseId === null) throw new TypeError('file artifact URL requires an immutable web release');
   const base = new URL(locationHref);
   const href = new URL(`/api/agent/artifacts/${artifact.id}/content`, base);
+  href.search = `?v=${encodeURIComponent(releaseId)}`;
   if (!['http:', 'https:'].includes(base.protocol) || href.origin !== base.origin
-      || href.username || href.password || href.search || href.hash) {
+      || href.username || href.password || href.search !== `?v=${releaseId}` || href.hash) {
     throw new TypeError('file artifact URL is not same-origin');
   }
   const metadata = createNode(document, 'p', 'artifact-file-metadata');
@@ -761,8 +764,17 @@ export function createSafeRenderer({
   document = globalThis.document,
   katex,
   locationHref = globalThis.location?.href ?? "https://invalid.local/",
+  releaseId,
 } = {}) {
-  const runtime = Object.freeze({ document: browserDocument(document), katex, locationHref: String(locationHref) });
+  const declaredRelease = releaseId === undefined
+    ? document?.querySelector?.('meta[name="lazying-agent-release"]')?.getAttribute?.('content')
+    : releaseId;
+  const runtime = Object.freeze({
+    document: browserDocument(document),
+    katex,
+    locationHref: String(locationHref),
+    releaseId: optionalWebRelease(declaredRelease),
+  });
   const renderMarkdown = (target, source) => {
     targetNode(target);
     const normalized = typeof source === "string"

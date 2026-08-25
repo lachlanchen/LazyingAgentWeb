@@ -26,6 +26,7 @@ const CONTENT_DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
 const UNSAFE_MESSAGE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ENCODED_PATH_PATTERN = /%(?:2e|2f|5c)/iu;
+const ARTIFACT_CONTENT_TARGET_PATTERN = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content(?:\?v=([A-Za-z0-9][A-Za-z0-9._~-]{0,95}))?$/u;
 
 export const CLOUD_HTTP_LIMITS = Object.freeze({
   requestTargetBytes: 2_048,
@@ -385,20 +386,21 @@ export function classifyRequestTarget(rawTarget, assets) {
     return Object.freeze({ kind: 'invalid' });
   }
   if (assets.has(rawTarget)) return Object.freeze({ kind: 'asset', target: rawTarget });
+  const artifactContent = ARTIFACT_CONTENT_TARGET_PATTERN.exec(rawTarget);
+  if (artifactContent) {
+    return Object.freeze({
+      kind: 'agent_artifact',
+      pathname: rawTarget,
+      artifactId: artifactContent[1],
+      releaseId: artifactContent[2] ?? null
+    });
+  }
+  if (rawTarget.startsWith(AGENT_ARTIFACT_CONTENT_PREFIX)) return Object.freeze({ kind: 'invalid' });
   if (rawTarget.includes('?')) return Object.freeze({ kind: 'invalid' });
   if (rawTarget.includes('//') || (rawTarget !== '/' && rawTarget.endsWith('/'))
       || rawTarget.split('/').some((part) => part === '.' || part === '..') || rawTarget.includes('%')) {
     return Object.freeze({ kind: 'invalid' });
   }
-  const artifactContent = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content$/u.exec(rawTarget);
-  if (artifactContent) {
-    return Object.freeze({
-      kind: 'agent_artifact',
-      pathname: rawTarget,
-      artifactId: artifactContent[1]
-    });
-  }
-  if (rawTarget.startsWith(AGENT_ARTIFACT_CONTENT_PREFIX)) return Object.freeze({ kind: 'invalid' });
   if (DYNAMIC_POST_ROUTES.has(rawTarget)) {
     return Object.freeze({
       kind: Object.hasOwn(AGENT_ROUTE_MAP, rawTarget) ? 'agent' : (rawTarget.startsWith('/api/chat/') ? 'chat' : 'session'),

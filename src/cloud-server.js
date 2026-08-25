@@ -597,6 +597,12 @@ function clientReleaseState(req, currentRelease) {
   return typeof value === 'string' && value === currentRelease ? 'match' : 'mismatch';
 }
 
+function artifactClientReleaseState(req, routeRelease, currentRelease) {
+  const header = clientReleaseState(req, currentRelease);
+  if (routeRelease !== currentRelease || header === 'mismatch') return 'mismatch';
+  return 'match';
+}
+
 function rejectClientRelease() {
   throw new CloudHttpError(409, 'client_release_mismatch', 'The browser app must load the current release before retrying.');
 }
@@ -902,8 +908,12 @@ async function streamArtifactBytes(res, body, expectedBytes, signal) {
     }
     res.end();
   } finally {
-    if (!ended) await reader.cancel().catch(() => {});
-    reader.releaseLock?.();
+    if (!ended) {
+      try { void Promise.resolve(reader.cancel()).catch(() => {}); }
+      catch { /* The interrupted upstream reader is already unusable. */ }
+    }
+    try { reader.releaseLock?.(); }
+    catch { /* A hostile pending read must not retain the public stream admission slot. */ }
   }
 }
 
@@ -1819,8 +1829,8 @@ export function createCloudRequestHandler({
         }
         outcomeFetchMetadata = artifactFetchMetadataState(req);
         if (outcomeFetchMetadata === 'invalid') rejectFetchMetadata();
-        outcomeRelease = clientReleaseState(req, assets.releaseId);
-        if (outcomeRelease === 'mismatch') rejectClientRelease();
+        outcomeRelease = artifactClientReleaseState(req, route.releaseId, assets.releaseId);
+        if (outcomeRelease !== 'match') rejectClientRelease();
         const authenticated = requireAuthentication(await authenticate(req, { csrf: false }));
         releaseStream = streamGate.enter(authenticated.browserSession);
         if (!releaseStream) {

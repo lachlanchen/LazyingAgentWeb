@@ -483,6 +483,7 @@ function updateControllerHarness({
   locationHref,
   agent,
   chat,
+  renderer,
   canonicalizeImage,
   createObjectUrl,
   revokeObjectUrl,
@@ -540,7 +541,7 @@ function updateControllerHarness({
         ...chat,
       };
     },
-    renderer: {
+    renderer: renderer ?? {
       renderMarkdown(target, value) { target.textContent = value; },
       renderArtifact() { return false; },
     },
@@ -2254,6 +2255,104 @@ test("authoritative terminal Agent states remain update-safe while retaining the
     harness.document.getElementById("apply-update").dispatch("click");
     assert.deepEqual(harness.workerMessages, [{ type: "SKIP_WAITING" }], `${status} is terminal and safe to reload`);
   }
+});
+
+test("a verified historical Agent file remains renderable after the current creation capability omits file", async () => {
+  const threadId = "thr_abcdefab-cdef-4abc-8def-abcdefabcdef";
+  const runId = "run_abcdefab-cdef-4abc-8def-abcdefabcdef";
+  const createdAt = "2026-08-25T16:00:00.000Z";
+  const createdEnvelope = {
+    schemaVersion: "1",
+    id: `${runId}.1`,
+    seq: 1,
+    type: "artifact.created",
+    threadId,
+    runId,
+    createdAt,
+    payload: {
+      artifact: artifact("file", {
+        schemaVersion: "1",
+        filename: "paper.pdf",
+        mime: "application/pdf",
+        bytes: 4_096,
+        sha256: "c".repeat(64),
+      }),
+      receiptDigest: "d".repeat(64),
+    },
+    previousHash: "0".repeat(64),
+  };
+  const createdEvent = await verifyAgentEvent({
+    ...createdEnvelope,
+    hash: createHash("sha256").update(canonicalJson(createdEnvelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId,
+    expectedThreadId: threadId,
+    afterSeq: 0,
+    previousHash: "0".repeat(64),
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+  const terminalEnvelope = {
+    schemaVersion: "1",
+    id: `${runId}.2`,
+    seq: 2,
+    type: "run.completed",
+    threadId,
+    runId,
+    createdAt,
+    payload: {},
+    previousHash: createdEvent.hash,
+  };
+  const terminalEvent = await verifyAgentEvent({
+    ...terminalEnvelope,
+    hash: createHash("sha256").update(canonicalJson(terminalEnvelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId,
+    expectedThreadId: threadId,
+    afterSeq: 1,
+    previousHash: createdEvent.hash,
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+
+  let artifactRenders = 0;
+  const agent = {
+    async capabilities() {
+      return {
+        schemaVersion: "1",
+        enabled: true,
+        agent: { kind: "aginti", label: "AgInTi Agent" },
+        model: { label: "LocalLLM" },
+        actions: { cancel: true, resume: true, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+      };
+    },
+    async listThreads() { return { threads: [] }; },
+    async createThread() { return { thread: { id: threadId, title: "Rollback-readable file" } }; },
+    async startRun() { return { run: { id: runId, threadId, status: "starting" } }; },
+    async *streamRunEvents() {
+      yield { event: createdEvent, cursor: { seq: 1, hash: createdEvent.hash } };
+      yield { event: terminalEvent, cursor: { seq: 2, hash: terminalEvent.hash } };
+    },
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    renderer: {
+      renderMarkdown(target, value) { target.textContent = value; },
+      renderArtifact(target) {
+        artifactRenders += 1;
+        target.textContent = "rendered historical file controls";
+        return true;
+      },
+    },
+  });
+  await harness.app.initialize();
+  harness.document.getElementById("message-input").value = "Compile the exact PDF";
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.ok(artifactRenders > 0);
+  assert.match(harness.document.getElementById("messages").textContent, /rendered historical file controls/u);
 });
 
 test("Update refuses to activate while a password or draft is only browser-held", async () => {
@@ -5967,7 +6066,11 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(sourceNodes.some((node) => ["img", "iframe", "script", "link"].includes(node.tagName)), false);
 
   const fileTarget = document.createElement("section");
-  const fileRenderer = createSafeRenderer({ document, locationHref: "https://llm.lazying.art/conversation" });
+  const fileRenderer = createSafeRenderer({
+    document,
+    locationHref: "https://llm.lazying.art/conversation",
+    releaseId: CURRENT_RELEASE,
+  });
   assert.equal(fileRenderer.renderArtifact(fileTarget, artifact("file", {
     schemaVersion: "1",
     filename: "paper.pdf",
@@ -5979,8 +6082,8 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   const fileLinks = fileNodes.filter((node) => node.tagName === "a");
   assert.equal(fileLinks.length, 2);
   assert.deepEqual(fileLinks.map((node) => node.getAttribute("href")), [
-    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content`,
-    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content`,
+    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}`,
+    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}`,
   ]);
   assert.equal(fileLinks[0].textContent, "Open");
   assert.equal(fileLinks[0].getAttribute("target"), "_blank");
@@ -5990,6 +6093,20 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.match(fileTarget.textContent, /paper\.pdf · 2\.4 MB/u);
   assert.match(fileTarget.textContent, /Not stored or cached by the web edge/u);
   assert.equal(fileNodes.some((node) => ["img", "iframe", "script", "object", "embed"].includes(node.tagName)), false);
+
+  const unpinnedFileTarget = document.createElement("section");
+  assert.equal(createSafeRenderer({
+    document,
+    locationHref: "https://llm.lazying.art/conversation",
+    releaseId: null,
+  }).renderArtifact(unpinnedFileTarget, artifact("file", {
+    schemaVersion: "1",
+    filename: "paper.pdf",
+    mime: "application/pdf",
+    bytes: 2_500_000,
+    sha256: "a".repeat(64),
+  })), false);
+  assert.equal(unpinnedFileTarget.walk().some((node) => node.tagName === "a"), false);
 
   assert.equal(renderer.renderArtifact(target, {
     ...artifact("markdown", { schemaVersion: "1", markdown: "safe" }),

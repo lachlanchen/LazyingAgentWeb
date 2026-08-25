@@ -2793,6 +2793,12 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(plotSvg.getAttribute("width"), "720");
   assert.equal(plotSvg.getAttribute("height"), "390");
   assert.equal(plotSvg.getAttribute("preserveAspectRatio"), "xMidYMid meet");
+  const plotDescription = plotNodes.find((node) => node.tagName === "desc");
+  assert.ok(plotDescription);
+  assert.equal(plotSvg.getAttribute("aria-describedby"), plotDescription.getAttribute("id"));
+  assert.match(plotDescription.textContent, /Displayed category ticks: A; B/u);
+  assert.match(plotDescription.textContent, /Y-axis ticks:/u);
+  assert.match(plotDescription.textContent, /Series: Value/u);
   const yTicks = plotNodes.filter((node) => node.getAttribute("class")?.split(/\s+/u).includes("plot-y-tick"));
   assert.equal(yTicks.length, 5);
   assert.deepEqual(yTicks.map((node) => node.textContent), ["0", "-37.1", "-74.2", "-111", "-148"]);

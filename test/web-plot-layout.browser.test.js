@@ -219,16 +219,23 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       response.end();
     }
   });
-  const origin = await listen(server);
-  const profile = await mkdtemp(join(tmpdir(), "lazying-agent-web-plot-"));
-  const chrome = spawn(CHROME, [
-    "--headless=new", "--no-sandbox", "--disable-gpu",
-    "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
-    `--user-data-dir=${profile}`, "about:blank",
-  ], { stdio: "ignore" });
-  const exited = new Promise((resolve) => chrome.once("exit", resolve));
+  let origin;
+  let profile;
+  let chrome;
+  let exited;
   let page;
   try {
+    origin = await listen(server);
+    profile = await mkdtemp(join(tmpdir(), "lazying-agent-web-plot-"));
+    chrome = spawn(CHROME, [
+      "--headless=new", "--no-sandbox", "--disable-gpu",
+      "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`, "about:blank",
+    ], { stdio: "ignore" });
+    exited = new Promise((resolve) => {
+      chrome.once("exit", resolve);
+      chrome.once("error", resolve);
+    });
     const { port } = await retry(async () => {
       const value = await readFile(join(profile, "DevToolsActivePort"), "utf8");
       const [candidate] = value.trim().split("\n");
@@ -241,6 +248,7 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     page = cdpConnection(target.webSocketDebuggerUrl);
     await page.send("Page.enable");
     await page.send("Runtime.enable");
+    await page.send("Accessibility.enable");
 
     const results = new Map();
     for (const metrics of [
@@ -257,6 +265,10 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
         if (ready.result.value !== true) throw new Error("plot fixture is not ready");
       });
       const evaluated = await page.send("Runtime.evaluate", { expression: GEOMETRY_EXPRESSION, returnByValue: true });
+      const accessibility = await page.send("Accessibility.getFullAXTree");
+      evaluated.result.value.accessiblePlots = Object.fromEntries(accessibility.nodes
+        .filter((node) => node.role?.value === "image" && typeof node.name?.value === "string")
+        .map((node) => [node.name.value, node.description?.value ?? ""]));
       results.set(metrics.label, evaluated.result.value);
     }
 
@@ -285,6 +297,10 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.equal(result.narrowOffsetOverlapsLabel, false, `${label} narrow offset overlaps the x-axis label`);
       assert.equal(new Set(result.narrowScientific.xTickTexts).size, 5, `${label} narrow ticks are not distinct`);
       assert.equal(result.narrowOffset, "offset +9007199254740987");
+      assert.match(result.accessiblePlots["Categorical extremes"], /界界界界界界界界界界界界界界界界/u);
+      assert.match(result.accessiblePlots["Categorical extremes"], /WWWWWWWWWWWWWWWW/u);
+      assert.match(result.accessiblePlots["Narrow numeric range"], /X-axis absolute ticks: 9007199254740987/u);
+      assert.match(result.accessiblePlots["Narrow numeric range"], /visual labels use offset \+9007199254740987/u);
     }
     assert.equal(desktop.wideLabelsVisible.length, 4);
     assert.equal(desktop.compactLabelsVisible.length, 0);
@@ -299,13 +315,13 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     assert.ok(iphone.smallScientific.xTickTexts.every((value) => value.length <= 8 && !value.includes("e+")));
   } finally {
     page?.close();
-    if (chrome.exitCode === null) chrome.kill("SIGTERM");
-    await Promise.race([exited, delay(2_000)]);
-    if (chrome.exitCode === null) {
+    if (chrome?.exitCode === null) chrome.kill("SIGTERM");
+    if (exited) await Promise.race([exited, delay(2_000)]);
+    if (chrome?.exitCode === null) {
       chrome.kill("SIGKILL");
       await exited;
     }
-    await closeServer(server);
-    await rm(profile, { recursive: true, force: true });
+    if (server.listening) await closeServer(server);
+    if (profile) await rm(profile, { recursive: true, force: true });
   }
 });

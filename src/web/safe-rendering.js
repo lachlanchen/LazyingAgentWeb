@@ -494,22 +494,42 @@ function renderPlot(document, target, artifact) {
   const innerHeight = dimensions.height - dimensions.top - dimensions.bottom;
   const xAt = (value) => dimensions.left + (value - bounds.minX) / (bounds.maxX - bounds.minX) * innerWidth;
   const yAt = (value) => dimensions.top + (bounds.maxY - value) / (bounds.maxY - bounds.minY) * innerHeight;
+  const yTickValues = Array.from({ length: 5 }, (unused, tick) => (
+    bounds.maxY - (bounds.maxY - bounds.minY) * tick / 4
+  ));
+  const yTickLabels = formatPlotTicks(yTickValues).labels;
+  const categoricalIndices = plot.labels ? categoricalTickIndices(plot.labels.length, 4) : null;
+  const xTickValues = plot.labels ? null : Array.from({ length: 5 }, (unused, index) => (
+    bounds.minX + (bounds.maxX - bounds.minX) * index / 4
+  ));
+  const xTickPlan = xTickValues === null ? null : formatPlotTicks(xTickValues, { allowOffset: true });
+  const descriptionId = `plot-description-${artifact.id.slice(4)}`;
   const svg = createSvg(document, "svg", {
     viewBox: `0 0 ${dimensions.width} ${dimensions.height}`,
     width: dimensions.width,
     height: dimensions.height,
     role: "img",
     "aria-label": artifact.title,
+    "aria-describedby": descriptionId,
     preserveAspectRatio: "xMidYMid meet",
   });
   svg.classList.add("artifact-plot");
   const title = createSvg(document, "title");
   title.textContent = artifact.title;
   svg.appendChild(title);
-  const yTickValues = Array.from({ length: 5 }, (unused, tick) => (
-    bounds.maxY - (bounds.maxY - bounds.minY) * tick / 4
-  ));
-  const yTickLabels = formatPlotTicks(yTickValues).labels;
+  const description = createSvg(document, "desc", { id: descriptionId });
+  description.textContent = [
+    plot.xLabel ? `X axis: ${plot.xLabel}` : "",
+    plot.yLabel ? `Y axis: ${plot.yLabel}` : "",
+    categoricalIndices === null
+      ? `X-axis absolute ticks: ${xTickValues.map(String).join(", ")}${xTickPlan.offset === null
+        ? ""
+        : `; visual labels use offset ${xTickPlan.offset > 0 ? "+" : ""}${formatPlotOffset(xTickPlan.offset)}`}`
+      : `Displayed category ticks: ${categoricalIndices.map((index) => plot.labels[index]).join("; ")}`,
+    `Y-axis ticks: ${yTickValues.map(String).join(", ")}`,
+    `Series: ${plot.series.map((series) => series.name).join("; ")}`,
+  ].filter(Boolean).join(". ");
+  svg.appendChild(description);
   for (let tick = 0; tick <= 4; tick += 1) {
     const y = dimensions.top + innerHeight * tick / 4;
     svg.appendChild(createSvg(document, "line", { class: "plot-grid", x1: dimensions.left, y1: y, x2: dimensions.width - dimensions.right, y2: y }));
@@ -555,8 +575,7 @@ function renderPlot(document, target, artifact) {
   svg.appendChild(createSvg(document, "line", { class: "plot-axis", x1: dimensions.left, y1: zeroY, x2: dimensions.width - dimensions.right, y2: zeroY }));
   svg.appendChild(createSvg(document, "line", { class: "plot-axis", x1: dimensions.left, y1: dimensions.top, x2: dimensions.left, y2: dimensions.height - dimensions.bottom }));
   if (plot.labels) {
-    const indices = categoricalTickIndices(plot.labels.length, 4);
-    indices.forEach((index, position) => {
+    categoricalIndices.forEach((index, position) => {
       const value = plot.labels[index];
       const tick = createSvg(document, "text", {
         class: "plot-tick plot-x-tick",
@@ -566,9 +585,9 @@ function renderPlot(document, target, artifact) {
           ? dimensions.left + (index + 0.5) / plot.labels.length * innerWidth
           : xAt(index),
         y: dimensions.height - dimensions.bottom + 19,
-        "text-anchor": indices.length === 1
+        "text-anchor": categoricalIndices.length === 1
           ? "middle"
-          : (position === 0 ? "start" : (position === indices.length - 1 ? "end" : "middle")),
+          : (position === 0 ? "start" : (position === categoricalIndices.length - 1 ? "end" : "middle")),
       });
       const wide = createSvg(document, "tspan", { class: "plot-label-wide" });
       wide.textContent = compactPlotLabel(value, 7);
@@ -579,10 +598,6 @@ function renderPlot(document, target, artifact) {
       svg.appendChild(tick);
     });
   } else {
-    const xTickValues = Array.from({ length: 5 }, (unused, index) => (
-      bounds.minX + (bounds.maxX - bounds.minX) * index / 4
-    ));
-    const formatted = formatPlotTicks(xTickValues, { allowOffset: true });
     for (let index = 0; index <= 4; index += 1) {
       const tick = createSvg(document, "text", {
         class: "plot-tick plot-x-tick",
@@ -591,17 +606,17 @@ function renderPlot(document, target, artifact) {
         "text-anchor": index === 0 ? "start" : (index === 4 ? "end" : "middle"),
         "aria-label": xTickValues[index].toString(),
       });
-      tick.textContent = formatted.labels[index];
+      tick.textContent = xTickPlan.labels[index];
       svg.appendChild(tick);
     }
-    if (formatted.offset !== null) {
+    if (xTickPlan.offset !== null) {
       const offset = createSvg(document, "text", {
         class: "plot-tick plot-axis-offset plot-x-offset",
         x: dimensions.width - dimensions.right,
         y: 26,
         "text-anchor": "end",
       });
-      offset.textContent = `offset ${formatted.offset > 0 ? "+" : ""}${formatPlotOffset(formatted.offset)}`;
+      offset.textContent = `offset ${xTickPlan.offset > 0 ? "+" : ""}${formatPlotOffset(xTickPlan.offset)}`;
       svg.appendChild(offset);
     }
   }

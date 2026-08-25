@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.21 production):** production is promoted
+> **Deployment status (v0.1.22 candidate; v0.1.21 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -18,10 +18,11 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > keeps failed-predecessor and corrected-success messages in chronological
 > order when their verified output and plot artifacts are restored after reload.
 > The baseline accepted artifacts remain declarative plot, table, and Markdown
-> schemas. This source tree also defines a default-disabled grounded-search
+> schemas. The v0.1.22 candidate also defines a backward-compatible,
+> default-disabled grounded-search
 > extension: only an exact AgInTi capability may reveal the explicit Search
 > controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and
-> admit bounded HTTPS-only `sources` artifacts. Current production does not
+> admit bounded HTTPS-only `sources` artifacts. v0.1.21 production does not
 > claim that capability, and the browser has no direct LocalLLM search route.
 > Voice messages and general artifact file upload/download remain unavailable.
 

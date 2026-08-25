@@ -3,11 +3,13 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. Current v0.1.21 production enables Agent only through the
+is fail-closed. The v0.1.22 candidate remains compatible with current v0.1.21
+production, which enables Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
 Voice messages and general artifact file upload/download remain unavailable.
-Grounded search is a default-disabled protocol extension: the UI remains absent
+Grounded search is a backward-compatible, default-disabled protocol extension:
+the UI remains absent
 unless AgInTi proves the exact Search capability, and current production makes
 no claim that it does. The baseline Agent artifact surface is declarative plot,
 table, and Markdown; the negotiated extension adds only bounded text/HTTPS

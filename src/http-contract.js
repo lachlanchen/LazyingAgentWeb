@@ -433,11 +433,19 @@ export function validateRequestIdempotencyKey(value) {
 }
 
 export function validateLoginBody(value) {
-  const body = exactObject(value, ['username', 'password', 'remember'], [], 'login request');
+  const body = exactObject(value, ['username', 'password', 'remember'], ['sessionMode'], 'login request');
   const username = text(body.username, 'username', { maximum: 128 });
   const password = text(body.password, 'password', { maximum: 1_024, allowControl: true });
   if (typeof body.remember !== 'boolean') invalid('remember is invalid.');
-  return Object.freeze({ username, password, remember: body.remember });
+  if (body.sessionMode !== undefined && body.sessionMode !== 'ephemeral-memory') {
+    invalid('sessionMode is invalid.');
+  }
+  return Object.freeze({
+    username,
+    password,
+    remember: body.remember,
+    ...(body.sessionMode === undefined ? {} : { sessionMode: body.sessionMode })
+  });
 }
 
 export function validateEmptyBody(value, name = 'request') {

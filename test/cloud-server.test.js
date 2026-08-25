@@ -282,8 +282,13 @@ function cookiePair(value) {
   return value.split(';', 1)[0];
 }
 
-async function login(baseUrl, { password = PASSWORD, clientAddress, fetchMetadataPresent = true } = {}) {
-  const response = await post(baseUrl, '/api/login', { username: USERNAME, password, remember: true }, {
+async function login(baseUrl, { password = PASSWORD, clientAddress, fetchMetadataPresent = true, sessionMode } = {}) {
+  const response = await post(baseUrl, '/api/login', {
+    username: USERNAME,
+    password,
+    remember: sessionMode === undefined,
+    ...(sessionMode === undefined ? {} : { sessionMode })
+  }, {
     clientAddress,
     fetchMetadataPresent
   });
@@ -752,6 +757,73 @@ test('iOS/PWA requests with missing or partial Fetch Metadata stay exact-origin,
     assert.equal(serialized.includes(auth.csrf), false);
     for (const cookie of auth.cookie.split('; ')) assert.equal(serialized.includes(cookie), false);
   }
+});
+
+test('uses bounded memory-only acceptance sessions without durable rows or crash accumulation', async (t) => {
+  const artifactId = `art_${'e'.repeat(64)}`;
+  let artifactCalls = 0;
+  const adapter = {
+    async rpc() { throw new Error('unexpected Agent RPC'); },
+    async capabilities() { throw new Error('unexpected capability request'); },
+    async artifactContent() {
+      artifactCalls += 1;
+      return Object.freeze({ status: 404 });
+    }
+  };
+  const state = testState(t, { adapter });
+  let started = await state.start();
+  const first = await login(started.baseUrl, { sessionMode: 'ephemeral-memory' });
+  assert.equal(first.response.status, 200);
+  assert.deepEqual(Object.keys(first.value).sort(), [
+    'authenticated', 'csrfToken', 'sessionDisposition', 'username'
+  ]);
+  assert.equal(first.value.sessionDisposition, 'ephemeral-memory');
+  assert.equal(first.setCookies.length, 2);
+  assert.ok(first.setCookies.every((value) => value.includes('Max-Age=60')));
+  const firstToken = first.cookie.match(/__Host-lazying_session=([^; ]+)/u)?.[1];
+  assert.ok(firstToken);
+  assert.equal(state.controlStore.authenticateBrowserSession({ sessionToken: firstToken }), null,
+    'the acceptance session never reaches browser_sessions');
+  const missing = await artifactRequest(started.baseUrl, artifactId, {
+    cookie: first.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await missing.json(), {
+    error: { code: 'not_found', message: 'The requested artifact does not exist.' }
+  });
+  assert.equal(artifactCalls, 1);
+
+  const replacement = await login(started.baseUrl, { sessionMode: 'ephemeral-memory' });
+  const replaced = await artifactRequest(started.baseUrl, artifactId, {
+    cookie: first.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(replaced.status, 401, 'a retry replaces a crashed probe instead of accumulating sessions');
+  assert.equal(artifactCalls, 1);
+  const replacementToken = replacement.cookie.match(/__Host-lazying_session=([^; ]+)/u)?.[1];
+  assert.equal(state.controlStore.authenticateBrowserSession({ sessionToken: replacementToken }), null);
+
+  await state.stop(started.server);
+  started = await state.start();
+  const afterRestart = await artifactRequest(started.baseUrl, artifactId, {
+    cookie: replacement.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(afterRestart.status, 401, 'server restart cannot retain an in-memory acceptance session');
+  assert.equal(artifactCalls, 1);
+
+  const finalSession = await login(started.baseUrl, { sessionMode: 'ephemeral-memory' });
+  const logout = await post(started.baseUrl, '/api/logout', {}, {
+    cookie: finalSession.cookie,
+    csrf: finalSession.csrf
+  });
+  assert.equal(logout.status, 200);
+  const afterLogout = await artifactRequest(started.baseUrl, artifactId, {
+    cookie: finalSession.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(afterLogout.status, 401);
 });
 
 test('deletes Direct Chat only through the exact authenticated cursor-bound mutation', async (t) => {

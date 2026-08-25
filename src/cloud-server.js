@@ -43,6 +43,7 @@ const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
 const DYNAMIC_CACHE_CONTROL = 'no-store';
 const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
 const REMEMBERED_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+const EPHEMERAL_SESSION_MAX_AGE_SECONDS = 60;
 const GLOBAL_DISPATCH_RETRY_MS = 250;
 const REQUEST_BODY_TIMEOUT_MARGIN_MS = 30_000;
 const RESPONSE_RELEASE_ID = Symbol('responseReleaseId');
@@ -1074,12 +1075,30 @@ export function createCloudRequestHandler({
   });
   const streamGate = new ConcurrencyGate(limits.concurrentStreams, limits.concurrentStreamsPerSession);
   const jobs = new Map();
+  const ephemeralSessions = new Map();
+  let ephemeralExpiryTimer = null;
   let stopping = false;
   let backgroundDrain = null;
 
   async function authenticate(req, { csrf = true } = {}) {
     const sessionToken = parseCookie(req, SESSION_COOKIE_NAME);
     if (!sessionToken) return null;
+    const ephemeral = ephemeralSessions.get(sessionToken);
+    if (ephemeral) {
+      if (ephemeral.expiresAt <= epochMilliseconds(clock)) {
+        ephemeralSessions.delete(sessionToken);
+        return null;
+      }
+      if (csrf && !safeEqual(csrfFromRequest(req), ephemeral.csrfToken)) {
+        throw new CloudHttpError(403, 'csrf_rejected', 'The CSRF token is missing or invalid.');
+      }
+      return Object.freeze({
+        token: sessionToken,
+        view: ephemeral.view,
+        browserSession: browserSessionId(sessionToken),
+        ephemeral: true
+      });
+    }
     const session = await sessions.authenticateBrowserSession({ sessionToken });
     if (!session || session.accountId !== configuredAccount.principalId) return null;
     if (csrf) {
@@ -1092,7 +1111,8 @@ export function createCloudRequestHandler({
     return Object.freeze({
       token: sessionToken,
       view: session,
-      browserSession: browserSessionId(sessionToken)
+      browserSession: browserSessionId(sessionToken),
+      ephemeral: false
     });
   }
 
@@ -1119,19 +1139,38 @@ export function createCloudRequestHandler({
       }
       const sessionToken = opaqueToken();
       const csrfToken = opaqueToken();
-      const maximumAge = body.remember ? REMEMBERED_SESSION_MAX_AGE_SECONDS : SESSION_MAX_AGE_SECONDS;
+      const ephemeral = body.sessionMode === 'ephemeral-memory';
+      const maximumAge = ephemeral
+        ? EPHEMERAL_SESSION_MAX_AGE_SECONDS
+        : (body.remember ? REMEMBERED_SESSION_MAX_AGE_SECONDS : SESSION_MAX_AGE_SECONDS);
       const expiresAt = new Date(epochMilliseconds(clock) + maximumAge * 1_000).toISOString();
-      await sessions.createBrowserSession({
-        accountId: configuredAccount.principalId,
-        sessionToken,
-        csrfToken,
-        expiresAt,
-        idempotencyKey: derivedIdempotencyKey('login', sessionToken)
-      });
+      if (ephemeral) {
+        ephemeralSessions.clear();
+        if (ephemeralExpiryTimer) clearTimeout(ephemeralExpiryTimer);
+        ephemeralSessions.set(sessionToken, Object.freeze({
+          csrfToken,
+          expiresAt: Date.parse(expiresAt),
+          view: Object.freeze({ accountId: configuredAccount.principalId })
+        }));
+        ephemeralExpiryTimer = setTimeout(() => {
+          ephemeralSessions.delete(sessionToken);
+          ephemeralExpiryTimer = null;
+        }, maximumAge * 1_000);
+        ephemeralExpiryTimer.unref?.();
+      } else {
+        await sessions.createBrowserSession({
+          accountId: configuredAccount.principalId,
+          sessionToken,
+          csrfToken,
+          expiresAt,
+          idempotencyKey: derivedIdempotencyKey('login', sessionToken)
+        });
+      }
       sendJson(req, res, 200, {
         authenticated: true,
         username: configuredAccount.username,
-        csrfToken
+        csrfToken,
+        ...(ephemeral ? { sessionDisposition: 'ephemeral-memory' } : {})
       }, {
         'set-cookie': [sessionCookie(sessionToken, maximumAge), csrfCookie(csrfToken, maximumAge)]
       });
@@ -1158,12 +1197,20 @@ export function createCloudRequestHandler({
 
   async function handleLogout(req, res) {
     const session = requireAuthentication(await authenticate(req));
-    const idempotencyKey = derivedIdempotencyKey('logout', session.token);
-    await sessions.revokeBrowserSession({
-      accountId: configuredAccount.principalId,
-      sessionToken: session.token,
-      idempotencyKey
-    });
+    if (session.ephemeral) {
+      ephemeralSessions.delete(session.token);
+      if (ephemeralSessions.size === 0 && ephemeralExpiryTimer) {
+        clearTimeout(ephemeralExpiryTimer);
+        ephemeralExpiryTimer = null;
+      }
+    } else {
+      const idempotencyKey = derivedIdempotencyKey('logout', session.token);
+      await sessions.revokeBrowserSession({
+        accountId: configuredAccount.principalId,
+        sessionToken: session.token,
+        idempotencyKey
+      });
+    }
     sendJson(req, res, 200, {
       signedOut: true,
       // The frozen transport has no browser-session-scoped cancellation RPC.
@@ -1174,6 +1221,11 @@ export function createCloudRequestHandler({
 
   function closeGenerationJobs() {
     stopping = true;
+    ephemeralSessions.clear();
+    if (ephemeralExpiryTimer) {
+      clearTimeout(ephemeralExpiryTimer);
+      ephemeralExpiryTimer = null;
+    }
     if (backgroundDrain) return backgroundDrain;
     const pending = [...jobs.values()];
     for (const job of pending) {
@@ -1938,6 +1990,7 @@ export function createCloudRequestHandler({
     closeBackgroundJobs: { value: closeGenerationJobs, enumerable: true },
     activeDirectChatJobs: { get: () => jobs.size, enumerable: true },
     activeStreams: { get: () => streamGate.active, enumerable: true },
+    activeEphemeralSessions: { get: () => ephemeralSessions.size, enumerable: true },
     maximumBodyReadTimeoutMs: {
       value: Math.max(limits.bodyTimeoutMs, limits.visionBodyTimeoutMs)
     }

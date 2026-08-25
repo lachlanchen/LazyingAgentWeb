@@ -565,7 +565,7 @@ ${modulePreloads}
           <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
         </div>
       </form>
-      <p class="footer-note">AgInTi owns Agent runs, tools, context, compaction, and artifacts. This UI is a presentation surface.</p>
+      <p id="capability-note" class="footer-note">Chat · LocalLLM text only · no tools, file creation, or web search.</p>
     </section>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

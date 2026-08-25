@@ -215,6 +215,27 @@ function requestsAgentExecution(value) {
     || /^(?:make|draw|create|generate|render|display|show|calculate|compute)\b.{0,160}\b(?:plot|graph|chart)\b/iu.test(command);
 }
 
+function requestsAgentDocumentCreation(value) {
+  const text = String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
+  if (!text || /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:do\s+not|don['’]?t|dont|never|avoid|without|no\s+need\s+to)\b/iu.test(text)
+      || /^(?:please\s+)?(?:how\b|why\b|what\b|explain\b|describe\b|compare\b|review\b|discuss\b)/iu.test(text)) {
+    return false;
+  }
+  const action = normalizedExecutionAction(text);
+  const createsDocument = /^(?:make|create|generate|write|rewrite|revise|update|edit|modify|correct|fix|regenerate|recompile|produce|prepare|compile|typeset|render|export|build|deliver|provide|save)\b/iu.test(action)
+    || /^(?:创建|建立|生成|撰写|撰寫|重写|重寫|修改|修订|修訂|更新|重新生成|重新编译|重新編譯|编译|編譯|导出|導出|准备|準備|制作|製作|交付|排版)/u.test(action);
+  const hasTex = /(?:\.tex\b|\b(?:latex|tex)(?:\s+(?:source|file|document|format))?\b)/iu.test(text);
+  const hasPdf = /(?:\.pdf\b|\b(?:compiled\s+)?pdf\b)/iu.test(text);
+  return createsDocument && hasTex && hasPdf;
+}
+
+function requestedAvailableAgentTool(value, capabilities) {
+  if (requestsAgentExecution(value)) return "analysis";
+  if (capabilities?.artifacts?.kinds?.includes?.("file") === true
+      && requestsAgentDocumentCreation(value)) return "document";
+  return null;
+}
+
 function updateHandoffDraft(value) {
   if (typeof value !== "string" || value.length > 32_000 || !isUnicodeScalarText(value)
       || UNSAFE_MESSAGE_CONTROL.test(value)) {
@@ -969,7 +990,7 @@ function elementMap(document) {
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
     "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-    "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
+    "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
   ];
   return Object.freeze(Object.fromEntries(ids.map((id) => {
     const value = document.getElementById(id);
@@ -1564,6 +1585,32 @@ export function createBrowserApp({
     elements.search_limit.disabled = disabled || !state.agentSearchSelected;
   }
 
+  function updateCapabilityNote() {
+    if (state.mode === "agent" && state.capabilities.enabled === true) {
+      const fileCreation = state.capabilities.artifacts.kinds.includes("file");
+      const search = state.capabilities.search?.enabled === true;
+      const additions = [
+        ...(fileCreation ? ["TeX/PDF files"] : []),
+        ...(search ? ["optional web/paper Search"] : []),
+      ];
+      const unavailable = [
+        "image input",
+        ...(!fileCreation ? ["file creation"] : []),
+        ...(!search ? ["web search"] : []),
+      ];
+      elements.capability_note.textContent = [
+        "Agent · bounded Python 3.12 standard library · plots/tables/Markdown",
+        ...additions,
+        `no ${unavailable.join(", ")}`,
+      ].join(" · ") + ".";
+      return;
+    }
+    const input = state.chatCapabilities.visionInput === true ? "text + up to four images" : "text only";
+    const availability = state.capabilities.enabled === true ? "switch to Agent for tools" : "Agent unavailable";
+    elements.capability_note.textContent =
+      `Chat · LocalLLM ${input} · no tools, file creation, or web search · ${availability}.`;
+  }
+
   function selectedAgentSearch() {
     if (!state.agentSearchSelected) return undefined;
     const capability = state.capabilities.search;
@@ -1722,6 +1769,7 @@ export function createBrowserApp({
       ? "AgInTi owns planning, tools, context, compaction, runs, and artifacts."
       : "Durable server-owned conversations with LocalLLM, without Agent tools or browser-owned history.";
     elements.message_input.placeholder = state.mode === "agent" ? "Ask AgInTi Agent" : "Message LocalLLM";
+    updateCapabilityNote();
     updateImageControl();
     renderThreads();
     if (changed && restoreView && state.session.authenticated) {
@@ -4143,12 +4191,17 @@ export function createBrowserApp({
     let text;
     try { text = boundedMessage(draft); }
     catch { return; }
-    if (state.mode === "chat" && state.capabilities.enabled === true && !state.agentReplayFailed
-        && state.selectedImages.length === 0 && requestsAgentExecution(text)) {
+    const requestedTool = state.mode === "chat" && state.capabilities.enabled === true && !state.agentReplayFailed
+      && state.selectedImages.length === 0
+      ? requestedAvailableAgentTool(text, state.capabilities)
+      : null;
+    if (requestedTool !== null) {
       setMode("agent", { restoreView: false, remember: false });
       if (state.mode === "agent") {
         newConversation();
-        showToast("Handed to Agent to run code and show the result here.");
+        showToast(requestedTool === "document"
+          ? "Handed to Agent because TeX/PDF creation needs its verified file tool."
+          : "Handed to Agent to run code and show the result here.");
       }
     }
     const submissionSession = state.session;
@@ -4627,7 +4680,7 @@ export function createBrowserApp({
           ? "Updated · unsent draft ready"
           : recoveringAuthenticationDraft && !discardedCrossAccountDraft
           ? "Signed in · unsent draft ready"
-          : "Connected");
+          : capability.enabled === true ? "Connected" : "Connected · Chat only");
       }
       if (discardedCrossAccountDraft) {
         showToast("The previous account’s unsent draft and image were cleared before switching accounts.");

@@ -176,7 +176,7 @@ const APP_IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
+  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
 ];
 
 function appDocument({ basePath = "/", releaseId = CURRENT_RELEASE } = {}) {
@@ -906,7 +906,7 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.match(html, /id="agent-mode"[^>]*aria-pressed="false"/u);
   assert.match(html, /id="mode-switch"[^>]*hidden/u);
   assert.match(html, /<button id="send-message"[^>]*aria-label="Send Chat"[^>]*>Send Chat<\/button>/u);
-  assert.match(html, /AgInTi owns Agent runs, tools, context, compaction, and artifacts/u);
+  assert.match(html, /id="capability-note"[^>]*>Chat · LocalLLM text only · no tools, file creation, or web search\.<\/p>/u);
   assert.doesNotMatch(html, /name="(?:model|provider|runtime|tools|cwd|sandbox)/iu);
   assert.doesNotMatch(html, /value="[^"\n]*(?:password|token|secret)/iu);
   assert.match(BRIGHT_APP_CSS, /^:root \{[\s\S]*--bg: #f4f7f6/u);

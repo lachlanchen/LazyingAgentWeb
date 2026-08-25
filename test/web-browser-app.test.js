@@ -104,7 +104,7 @@ const IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit",
+  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
 ];
 
 class Document {
@@ -637,11 +637,15 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(enabled.document.getElementById("mode-switch").hidden, false);
   assert.equal(enabled.document.getElementById("agent-mode").getAttribute("aria-pressed"), "true");
   assert.equal(enabled.document.getElementById("search-controls").hidden, true, "legacy Agent capability keeps Search absent");
+  assert.match(enabled.document.getElementById("capability-note").textContent,
+    /bounded Python 3\.12[\s\S]*no image input, file creation, web search/iu);
 
   const malformed = harness({ agent: baseAgent({ ...capabilities({ enabled: true }), runtime: { model: "browser-choice" } }) });
   await malformed.app.initialize();
   assert.equal(malformed.document.getElementById("workspace").dataset.mode, "chat");
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
+  assert.equal(malformed.document.getElementById("connection-state").textContent, "Connected · Chat only");
+  assert.match(malformed.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
 });
 
 test("negotiated Agent Search binds one immutable selection to one start mutation", async () => {
@@ -1218,6 +1222,79 @@ test("explicit plot and code-run prompts in Direct Chat hand off to Agent with u
     assert.equal(send.textContent, "Run Agent");
     assert.equal(send.getAttribute("aria-label"), "Run Agent");
     assert.match(browser.document.getElementById("toast").textContent, /Handed to Agent/iu);
+  }
+});
+
+test("advertised TeX/PDF file creation requests hand off from Chat to Agent", async () => {
+  const completed = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  for (const prompt of [
+    "Create a LaTeX source and compile it to PDF with one figure.",
+    "Write a .tex report and provide the compiled .pdf.",
+    "Write a latex of qaoa compile and give me link of pdf with figures",
+    "请生成 LaTeX 源文件并编译成 PDF。",
+  ]) {
+    const started = [];
+    const agent = {
+      ...baseAgent(capabilities({
+        enabled: true,
+        actions: { cancel: true, resume: true, retry: false },
+        artifacts: { kinds: ["plot", "table", "markdown", "file"], schemaVersion: "1" },
+      })),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun(threadId, text) {
+        started.push({ threadId, text });
+        return { run: run() };
+      },
+      async *streamRunEvents() {
+        yield { event: completed, cursor: { seq: completed.seq, hash: completed.hash } };
+      },
+    };
+    const browser = harness({ agent });
+    await browser.app.initialize();
+    assert.match(browser.document.getElementById("capability-note").textContent, /TeX\/PDF files/iu);
+    browser.app.setMode("chat", { restoreView: false });
+    browser.document.getElementById("message-input").value = prompt;
+    await browser.app.submitMessage({ preventDefault() {} });
+
+    assert.deepEqual(started, [{ threadId: THREAD_ID, text: prompt }]);
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+    assert.match(browser.document.getElementById("toast").textContent, /TeX\/PDF creation/iu);
+  }
+});
+
+test("TeX/PDF wording stays in Chat when file creation is not advertised or not requested", async () => {
+  const prompts = [
+    "Write a latex of qaoa compile and give me link of pdf with figures",
+    "Explain the difference between LaTeX and PDF.",
+    "Do not create a LaTeX or PDF file.",
+  ];
+  for (const [index, prompt] of prompts.entries()) {
+    const fileCapability = index !== 0;
+    const chatRuns = [];
+    let agentStarts = 0;
+    const agent = {
+      ...baseAgent(capabilities({
+        enabled: true,
+        actions: { cancel: true, resume: true, retry: false },
+        ...(fileCapability
+          ? { artifacts: { kinds: ["plot", "table", "markdown", "file"], schemaVersion: "1" } }
+          : {}),
+      })),
+      async createThread() { throw new Error("unsupported document wording must not create an Agent thread"); },
+      async startRun() { agentStarts += 1; throw new Error("unsupported document wording must not start Agent"); },
+    };
+    const browser = harness({
+      agent,
+      chat: terminalTextChat({ onRun(ticket) { chatRuns.push(ticket.content); } }),
+    });
+    await browser.app.initialize();
+    browser.app.setMode("chat", { restoreView: false });
+    browser.document.getElementById("message-input").value = prompt;
+    await browser.app.submitMessage({ preventDefault() {} });
+
+    assert.deepEqual(chatRuns, [prompt]);
+    assert.equal(agentStarts, 0);
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
   }
 });
 

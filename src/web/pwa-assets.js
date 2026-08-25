@@ -679,6 +679,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .plot-grid, .plot-axis, .plot-series path { vector-effect: non-scaling-stroke; }
 .plot-tick { fill: var(--muted); font-size: 13px; }
 .plot-axis-label { font-size: 14px; font-weight: 650; }
+.plot-axis-offset { font-size: 11px; font-variant-numeric: tabular-nums; }
+.plot-label-compact { display: none; }
 .artifact-legend { display: flex; min-width: 0; max-width: 100%; flex-wrap: wrap; gap: .55rem .85rem; margin: .65rem 0 0; padding: 0; line-height: 1.35; list-style: none; }
 .artifact-legend li { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; overflow-wrap: anywhere; }
 .artifact-swatch { display: inline-block; width: .7rem; height: .7rem; flex: 0 0 auto; margin-right: .35rem; border-radius: 50%; }
@@ -744,8 +746,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .composer-actions { justify-content: flex-end; }
   .message { max-width: 94%; }
   .message[data-role="assistant"] { width: 94%; max-width: 94%; }
-  .plot-tick { font-size: 21px; }
-  .plot-axis-label { font-size: 22px; }
+  .plot-tick { font-size: 24px; }
+  .plot-y-tick { font-size: 22px; }
+  .plot-axis-label { font-size: 24px; }
+  .plot-axis-offset { font-size: 24px; }
+  .plot-label-wide { display: none; }
+  .plot-label-compact { display: inline; }
   .artifact-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); gap: .4rem .7rem; font-size: .92rem; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }

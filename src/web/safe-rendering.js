@@ -418,17 +418,78 @@ function plotBounds(plot) {
   return { minX, maxX, minY, maxY };
 }
 
-function formatPlotTick(value) {
+function formatPlotTick(value, precision = 2) {
   if (Object.is(value, -0) || value === 0) return "0";
   const magnitude = Math.abs(value);
-  if (magnitude >= 1_000 || magnitude < 0.001) return value.toExponential(1);
-  return Number(value.toPrecision(3)).toString();
+  if (magnitude >= 1_000 || magnitude < 0.001) {
+    const [coefficient, exponent] = value.toExponential(Math.max(0, precision - 1)).split("e");
+    const compactCoefficient = coefficient.includes(".")
+      ? coefficient.replace(/0+$/u, "").replace(/\.$/u, "")
+      : coefficient;
+    return `${compactCoefficient}e${Number(exponent)}`;
+  }
+  return Number(value.toPrecision(precision)).toString();
+}
+
+function labelsDistinguishValues(values, labels) {
+  for (let left = 0; left < values.length; left += 1) {
+    for (let right = left + 1; right < values.length; right += 1) {
+      if (values[left] !== values[right] && labels[left] === labels[right]) return false;
+    }
+  }
+  return true;
+}
+
+function formatPlotTicks(values, { allowOffset = false } = {}) {
+  const readableLabels = values.map((value) => formatPlotTick(value, 3));
+  if (labelsDistinguishValues(values, readableLabels)) return { labels: readableLabels, offset: null };
+  if (allowOffset) {
+    const offset = values[0];
+    const relative = values.map((value) => value - offset);
+    for (let precision = 2; precision <= 6; precision += 1) {
+      const labels = relative.map((value) => {
+        const label = formatPlotTick(value, precision);
+        return value > 0 ? `+${label}` : label;
+      });
+      if (labelsDistinguishValues(relative, labels)) {
+        return { labels, offset };
+      }
+    }
+  }
+  for (let precision = 4; precision <= 15; precision += 1) {
+    const labels = values.map((value) => formatPlotTick(value, precision));
+    if (labelsDistinguishValues(values, labels)) return { labels, offset: null };
+  }
+  return { labels: values.map(String), offset: null };
+}
+
+function formatPlotOffset(value) {
+  return value.toString().replace("e+", "e");
+}
+
+function compactPlotLabel(value, maximum) {
+  const characters = [...value];
+  return characters.length > maximum
+    ? `${characters.slice(0, maximum - 1).join("")}…`
+    : value;
+}
+
+function categoricalTickIndices(count, maximum) {
+  if (count <= maximum) return Array.from({ length: count }, (unused, index) => index);
+  const step = Math.max(2, Math.ceil((count - 1) / (maximum - 1)));
+  const indices = [];
+  for (let index = 0; index < count; index += step) indices.push(index);
+  if (indices.at(-1) !== count - 1) {
+    if (count - 1 - indices.at(-1) < 2) indices[indices.length - 1] = count - 1;
+    else indices.push(count - 1);
+  }
+  return indices;
 }
 
 function renderPlot(document, target, artifact) {
   const plot = normalizedPlot(artifact.spec);
   const bounds = plotBounds(plot);
-  const dimensions = { width: 720, height: 390, left: 76, right: 24, top: 28, bottom: 58 };
+  const dimensions = { width: 720, height: 390, left: 116, right: 32, top: 40, bottom: 58 };
   const innerWidth = dimensions.width - dimensions.left - dimensions.right;
   const innerHeight = dimensions.height - dimensions.top - dimensions.bottom;
   const xAt = (value) => dimensions.left + (value - bounds.minX) / (bounds.maxX - bounds.minX) * innerWidth;
@@ -445,12 +506,21 @@ function renderPlot(document, target, artifact) {
   const title = createSvg(document, "title");
   title.textContent = artifact.title;
   svg.appendChild(title);
+  const yTickValues = Array.from({ length: 5 }, (unused, tick) => (
+    bounds.maxY - (bounds.maxY - bounds.minY) * tick / 4
+  ));
+  const yTickLabels = formatPlotTicks(yTickValues).labels;
   for (let tick = 0; tick <= 4; tick += 1) {
     const y = dimensions.top + innerHeight * tick / 4;
     svg.appendChild(createSvg(document, "line", { class: "plot-grid", x1: dimensions.left, y1: y, x2: dimensions.width - dimensions.right, y2: y }));
-    const text = createSvg(document, "text", { class: "plot-tick plot-y-tick", x: dimensions.left - 10, y: y + 4, "text-anchor": "end" });
-    const value = bounds.maxY - (bounds.maxY - bounds.minY) * tick / 4;
-    text.textContent = formatPlotTick(value);
+    const text = createSvg(document, "text", {
+      class: "plot-tick plot-y-tick",
+      x: dimensions.left - 10,
+      y: y + 4,
+      "text-anchor": "end",
+      "aria-label": yTickValues[tick].toString(),
+    });
+    text.textContent = yTickLabels[tick];
     svg.appendChild(text);
   }
   const zeroY = yAt(0);
@@ -485,31 +555,54 @@ function renderPlot(document, target, artifact) {
   svg.appendChild(createSvg(document, "line", { class: "plot-axis", x1: dimensions.left, y1: zeroY, x2: dimensions.width - dimensions.right, y2: zeroY }));
   svg.appendChild(createSvg(document, "line", { class: "plot-axis", x1: dimensions.left, y1: dimensions.top, x2: dimensions.left, y2: dimensions.height - dimensions.bottom }));
   if (plot.labels) {
-    const step = Math.max(1, Math.ceil(plot.labels.length / 8));
-    plot.labels.forEach((value, index) => {
-      if (index % step !== 0 && index !== plot.labels.length - 1) return;
+    const indices = categoricalTickIndices(plot.labels.length, 4);
+    indices.forEach((index, position) => {
+      const value = plot.labels[index];
       const tick = createSvg(document, "text", {
         class: "plot-tick plot-x-tick",
+        "aria-label": value,
+        "data-label-index": index,
         x: plot.type === "bar"
           ? dimensions.left + (index + 0.5) / plot.labels.length * innerWidth
           : xAt(index),
         y: dimensions.height - dimensions.bottom + 19,
-        "text-anchor": "middle",
+        "text-anchor": indices.length === 1
+          ? "middle"
+          : (position === 0 ? "start" : (position === indices.length - 1 ? "end" : "middle")),
       });
-      tick.textContent = value.length > 16 ? `${value.slice(0, 15)}…` : value;
+      const wide = createSvg(document, "tspan", { class: "plot-label-wide" });
+      wide.textContent = compactPlotLabel(value, 7);
+      tick.appendChild(wide);
+      const compact = createSvg(document, "tspan", { class: "plot-label-compact" });
+      compact.textContent = compactPlotLabel(value, 5);
+      tick.appendChild(compact);
       svg.appendChild(tick);
     });
   } else {
+    const xTickValues = Array.from({ length: 5 }, (unused, index) => (
+      bounds.minX + (bounds.maxX - bounds.minX) * index / 4
+    ));
+    const formatted = formatPlotTicks(xTickValues, { allowOffset: true });
     for (let index = 0; index <= 4; index += 1) {
-      const value = bounds.minX + (bounds.maxX - bounds.minX) * index / 4;
       const tick = createSvg(document, "text", {
         class: "plot-tick plot-x-tick",
         x: dimensions.left + innerWidth * index / 4,
         y: dimensions.height - dimensions.bottom + 19,
-        "text-anchor": "middle",
+        "text-anchor": index === 0 ? "start" : (index === 4 ? "end" : "middle"),
+        "aria-label": xTickValues[index].toString(),
       });
-      tick.textContent = formatPlotTick(value);
+      tick.textContent = formatted.labels[index];
       svg.appendChild(tick);
+    }
+    if (formatted.offset !== null) {
+      const offset = createSvg(document, "text", {
+        class: "plot-tick plot-axis-offset plot-x-offset",
+        x: dimensions.width - dimensions.right,
+        y: 26,
+        "text-anchor": "end",
+      });
+      offset.textContent = `offset ${formatted.offset > 0 ? "+" : ""}${formatPlotOffset(formatted.offset)}`;
+      svg.appendChild(offset);
     }
   }
   if (plot.xLabel) {

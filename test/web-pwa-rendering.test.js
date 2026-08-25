@@ -848,8 +848,10 @@ test("Agent plots keep the workspace track and use readable desktop and iPhone g
   const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
   assert.match(mobileCss, /\.workspace \{[^}]*grid-column:\s*1;/u);
   assert.match(mobileCss, /\.message\[data-role="assistant"\] \{[^}]*width:\s*94%;[^}]*max-width:\s*94%;/u);
-  assert.match(mobileCss, /\.plot-tick \{[^}]*font-size:\s*21px;/u);
-  assert.match(mobileCss, /\.plot-axis-label \{[^}]*font-size:\s*22px;/u);
+  assert.match(mobileCss, /\.plot-tick \{[^}]*font-size:\s*24px;/u);
+  assert.match(mobileCss, /\.plot-axis-label \{[^}]*font-size:\s*24px;/u);
+  assert.match(mobileCss, /\.plot-label-wide \{[^}]*display:\s*none;/u);
+  assert.match(mobileCss, /\.plot-label-compact \{[^}]*display:\s*inline;/u);
   assert.match(mobileCss, /\.artifact-legend \{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 9rem\), 1fr\)\);/u);
 
   const desktopWorkspace = 1_280 - 280;
@@ -863,7 +865,7 @@ test("Agent plots keep the workspace track and use readable desktop and iPhone g
   assert.ok(desktopPlot > 720 && desktopPlot <= desktopMessage);
   assert.ok(iphonePlot > 300 && iphonePlot < iphoneTranscript);
   assert.ok(iphonePlot / (720 / 390) > 160, "iPhone plot retains a readable aspect height");
-  assert.ok(21 * iphonePlot / 720 >= 8.75, "responsive iPhone tick text stays readable");
+  assert.ok(24 * iphonePlot / 720 >= 10, "responsive iPhone tick text stays readable");
 });
 
 test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and clears only after authority", async () => {

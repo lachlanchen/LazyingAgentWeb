@@ -844,6 +844,102 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
   assert.match(browser.document.getElementById("toast").textContent, /prompt is still ready/u);
 });
 
+test("Agent thread creation retries a lost response with one idempotency key and one accepted user turn", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "Created once" }],
+    ["run.completed", {}],
+  ]);
+  const createCalls = [];
+  const waits = [];
+  const thread = agentThread();
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread(body, options) {
+      createCalls.push({ body, options });
+      if (createCalls.length === 1) {
+        throw Object.assign(new Error("thread response lost after dispatch"), { retryable: true });
+      }
+      return { thread };
+    },
+    async startRun(threadId, text) {
+      assert.equal(threadId, THREAD_ID);
+      assert.equal(text, "Create this Agent conversation once");
+      return { run: run("running") };
+    },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  const prompt = "Create this Agent conversation once";
+  browser.document.getElementById("message-input").value = prompt;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.deepEqual(waits, [250]);
+  assert.equal(createCalls.length, 2);
+  assert.deepEqual(createCalls[0].body, createCalls[1].body);
+  assert.equal(createCalls[0].options.idempotency, createCalls[1].options.idempotency);
+  assert.match(createCalls[0].options.idempotency, /^agent_thread_[A-Za-z0-9._~-]+$/u);
+  assert.equal(browser.document.getElementById("thread-list").children.length, 1);
+  const userTurns = browser.document.getElementById("messages").children
+    .filter((node) => node.dataset.role === "user");
+  assert.equal(userTurns.length, 1);
+  assert.equal(userTurns[0].textContent, prompt);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+});
+
+test("Agent first run retries a lost response with one idempotency key and one accepted user turn", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "Started once" }],
+    ["run.completed", {}],
+  ]);
+  const startCalls = [];
+  const waits = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun(threadId, text, options) {
+      startCalls.push({ threadId, text, options });
+      if (startCalls.length === 1) {
+        throw Object.assign(new Error("start response lost after dispatch"), { retryable: true });
+      }
+      return { run: run("running") };
+    },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  const prompt = "Start this Agent run once";
+  browser.document.getElementById("message-input").value = prompt;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.deepEqual(waits, [250]);
+  assert.equal(startCalls.length, 2);
+  assert.deepEqual(
+    startCalls.map(({ threadId, text }) => ({ threadId, text })),
+    [
+      { threadId: THREAD_ID, text: prompt },
+      { threadId: THREAD_ID, text: prompt },
+    ],
+  );
+  assert.equal(startCalls[0].options.idempotency, startCalls[1].options.idempotency);
+  assert.match(startCalls[0].options.idempotency, /^agent_start_[A-Za-z0-9._~-]+$/u);
+  const userTurns = browser.document.getElementById("messages").children
+    .filter((node) => node.dataset.role === "user");
+  assert.equal(userTurns.length, 1);
+  assert.equal(userTurns[0].textContent, prompt);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+});
+
 test("a user-selected Chat workspace survives reload without an automatic Agent handoff changing it", {
   concurrency: false,
 }, async (t) => {

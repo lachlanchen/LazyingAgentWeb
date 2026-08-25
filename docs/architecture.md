@@ -3,7 +3,7 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.28 candidate remains compatible with current v0.1.27
+is fail-closed. The v0.1.29 candidate remains compatible with current v0.1.27
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
@@ -352,7 +352,7 @@ unsent Direct Chat composer, an idle Agent composer, or an Agent draft following
 an authoritatively verified terminal run across that reload. Active sends or
 generations, nonterminal Agent work, ambiguous mutations, passwords, and other
 browser-held workflows remain reload blockers. The page encrypts a bounded
-record with AES-GCM. Its v0.1.28 inner payload schema v3 preserves the exact
+record with AES-GCM. Its v0.1.29 inner payload schema v3 preserves the exact
 mode, owned Agent thread ID when present, explicit Search settings or No Search,
 draft, and up to four canonical images.
 
@@ -374,9 +374,9 @@ opaquely with a key-authenticated successor proof; the successor must still
 authenticate the bound account before decryption.
 
 The v0.1.27 inner schema-v2 payload did not carry authoritative mode or Search
-state. When v0.1.28 opens one, it keeps the visible composer fenced until the
+state. When v0.1.29 opens one, it keeps the visible composer fenced until the
 user explicitly chooses the destination conversation and separately confirms
-**Search** or **No Search**. It does not infer either choice. A v0.1.28
+**Search** or **No Search**. It does not infer either choice. A v0.1.29
 schema-v3 payload instead restores its exact mode, owned thread, and Search
 choice, subject to current account ownership and capability verification.
 

@@ -4230,8 +4230,7 @@ test("a signed-out retained encrypted row crosses login release fencing through 
   assert.equal(source.document.getElementById("login-view").hidden, false);
   source.document.getElementById("username").value = "account-user";
   source.document.getElementById("password").value = "browser-password";
-  source.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
-  await settlePwaActions(4);
+  await source.app.login({ preventDefault() {} });
 
   assert.equal(loginCalls, 1);
   assert.equal(store.calls.take, 1, "the signed-out stale shell never decrypts the retained row a second time");

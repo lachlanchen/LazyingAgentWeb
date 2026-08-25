@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.28 candidate; v0.1.27 production):** production is promoted
+> **Deployment status (v0.1.29 candidate; v0.1.27 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -32,7 +32,7 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > lost retains its exact idempotency ticket for the next Send instead of
 > deadlocking or minting a duplicate. Numeric plot axes choose the shortest
 > distinguishing visible tick labels while retaining exact
-> values in accessible plot metadata. The v0.1.28 candidate also preserves an
+> values in accessible plot metadata. The v0.1.29 candidate also preserves an
 > unsent Agent follow-up across a release-fenced full reload: the encrypted
 > handoff retains its mode and owned thread, replays that thread after reload,
 > derives the authoritative terminal predecessor, and only then enables the
@@ -132,7 +132,7 @@ current app usable.
 If Update is confirmed while a definitively unsent Direct Chat composer is
 eligible, or while an exact Agent composer is idle or follows an authoritative
 terminal run, the page stores one bounded AES-GCM ciphertext in a dedicated
-IndexedDB store. The v0.1.28 inner payload schema v3 preserves the exact mode,
+IndexedDB store. The v0.1.29 inner payload schema v3 preserves the exact mode,
 owned Agent thread when present, explicit Search settings or No Search, draft,
 and bounded images. Its random key exists only in the replacement navigation
 fragment, which browsers never send in HTTP requests. The fragment deliberately
@@ -152,7 +152,7 @@ release fence through a key-authenticated opaque hop; account verification
 still happens only in the successor before any plaintext is shown.
 
 A v0.1.27 handoff has an inner schema-v2 payload that cannot prove its original
-conversation mode or Search choice. v0.1.28 therefore keeps that recovered
+conversation mode or Search choice. v0.1.29 therefore keeps that recovered
 composer read-only until the user explicitly chooses its destination and then
 confirms **Search** or **No Search**; it never guesses and never auto-sends.
 

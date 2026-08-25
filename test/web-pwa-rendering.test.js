@@ -6086,8 +6086,8 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
     `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content?v=${CURRENT_RELEASE}&download=1`,
   ]);
   assert.equal(fileLinks[0].textContent, "Open");
-  assert.equal(fileLinks[0].getAttribute("target"), "_blank");
-  assert.equal(fileLinks[0].getAttribute("rel"), "noopener noreferrer");
+  assert.equal(fileLinks[0].getAttribute("target"), null);
+  assert.equal(fileLinks[0].getAttribute("rel"), null);
   assert.equal(fileLinks[1].textContent, "Download");
   assert.equal(fileLinks[1].getAttribute("download"), "paper.pdf");
   assert.match(fileTarget.textContent, /paper\.pdf · 2\.4 MB/u);

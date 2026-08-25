@@ -746,8 +746,9 @@ function renderFile(runtime, target, artifact) {
   const controls = createNode(document, 'div', 'artifact-file-controls');
   const open = createNode(document, 'a', 'artifact-file-action artifact-file-open');
   open.setAttribute('href', openHref.href);
-  open.setAttribute('target', '_blank');
-  open.setAttribute('rel', 'noopener noreferrer');
+  // Keep protected artifacts in the current PWA browsing context. On iOS a
+  // new top-level window can leave the installed app's authenticated cookie
+  // store and turn a valid local artifact into a misleading sign-in failure.
   open.setAttribute('aria-label', `Open ${artifact.spec.filename}`);
   appendText(document, open, 'Open');
   controls.appendChild(open);

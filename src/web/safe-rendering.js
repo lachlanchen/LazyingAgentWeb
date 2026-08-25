@@ -418,16 +418,25 @@ function plotBounds(plot) {
   return { minX, maxX, minY, maxY };
 }
 
+function formatPlotTick(value) {
+  if (Object.is(value, -0) || value === 0) return "0";
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1_000 || magnitude < 0.001) return value.toExponential(1);
+  return Number(value.toPrecision(3)).toString();
+}
+
 function renderPlot(document, target, artifact) {
   const plot = normalizedPlot(artifact.spec);
   const bounds = plotBounds(plot);
-  const dimensions = { width: 720, height: 390, left: 64, right: 24, top: 28, bottom: 58 };
+  const dimensions = { width: 720, height: 390, left: 76, right: 24, top: 28, bottom: 58 };
   const innerWidth = dimensions.width - dimensions.left - dimensions.right;
   const innerHeight = dimensions.height - dimensions.top - dimensions.bottom;
   const xAt = (value) => dimensions.left + (value - bounds.minX) / (bounds.maxX - bounds.minX) * innerWidth;
   const yAt = (value) => dimensions.top + (bounds.maxY - value) / (bounds.maxY - bounds.minY) * innerHeight;
   const svg = createSvg(document, "svg", {
     viewBox: `0 0 ${dimensions.width} ${dimensions.height}`,
+    width: dimensions.width,
+    height: dimensions.height,
     role: "img",
     "aria-label": artifact.title,
     preserveAspectRatio: "xMidYMid meet",
@@ -439,9 +448,9 @@ function renderPlot(document, target, artifact) {
   for (let tick = 0; tick <= 4; tick += 1) {
     const y = dimensions.top + innerHeight * tick / 4;
     svg.appendChild(createSvg(document, "line", { class: "plot-grid", x1: dimensions.left, y1: y, x2: dimensions.width - dimensions.right, y2: y }));
-    const text = createSvg(document, "text", { class: "plot-tick", x: dimensions.left - 10, y: y + 4, "text-anchor": "end" });
+    const text = createSvg(document, "text", { class: "plot-tick plot-y-tick", x: dimensions.left - 10, y: y + 4, "text-anchor": "end" });
     const value = bounds.maxY - (bounds.maxY - bounds.minY) * tick / 4;
-    text.textContent = Math.abs(value) >= 1_000 ? value.toExponential(1) : Number(value.toFixed(2)).toString();
+    text.textContent = formatPlotTick(value);
     svg.appendChild(text);
   }
   const zeroY = yAt(0);
@@ -480,7 +489,7 @@ function renderPlot(document, target, artifact) {
     plot.labels.forEach((value, index) => {
       if (index % step !== 0 && index !== plot.labels.length - 1) return;
       const tick = createSvg(document, "text", {
-        class: "plot-tick",
+        class: "plot-tick plot-x-tick",
         x: plot.type === "bar"
           ? dimensions.left + (index + 0.5) / plot.labels.length * innerWidth
           : xAt(index),
@@ -494,18 +503,18 @@ function renderPlot(document, target, artifact) {
     for (let index = 0; index <= 4; index += 1) {
       const value = bounds.minX + (bounds.maxX - bounds.minX) * index / 4;
       const tick = createSvg(document, "text", {
-        class: "plot-tick",
+        class: "plot-tick plot-x-tick",
         x: dimensions.left + innerWidth * index / 4,
         y: dimensions.height - dimensions.bottom + 19,
         "text-anchor": "middle",
       });
-      tick.textContent = Math.abs(value) >= 1_000 ? value.toExponential(1) : Number(value.toFixed(2)).toString();
+      tick.textContent = formatPlotTick(value);
       svg.appendChild(tick);
     }
   }
   if (plot.xLabel) {
     const text = createSvg(document, "text", {
-      class: "plot-tick",
+      class: "plot-tick plot-axis-label plot-x-label",
       x: dimensions.left + innerWidth / 2,
       y: dimensions.height - 14,
       "text-anchor": "middle",
@@ -516,11 +525,12 @@ function renderPlot(document, target, artifact) {
   if (plot.yLabel) {
     const middle = dimensions.top + innerHeight / 2;
     const text = createSvg(document, "text", {
-      class: "plot-tick",
-      x: 16,
+      class: "plot-tick plot-axis-label plot-y-label",
+      x: 18,
       y: middle,
-      transform: `rotate(-90 16 ${middle})`,
+      transform: `rotate(-90 18 ${middle})`,
       "text-anchor": "middle",
+      "dominant-baseline": "middle",
     });
     text.textContent = plot.yLabel;
     svg.appendChild(text);

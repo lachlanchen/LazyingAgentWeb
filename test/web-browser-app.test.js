@@ -10,6 +10,7 @@ import { DirectChatTransportError } from "../src/web/direct-chat-client.js";
 const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
 const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
 const SECOND_RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const THIRD_RUN_ID = "run_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const SECOND_ARTIFACT_ID = `art_${"b".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
@@ -675,6 +676,172 @@ test("negotiated Agent Search binds one immutable selection to one start mutatio
   assert.equal(starts.length, 1);
   assert.equal(browser.document.getElementById("message-input").value, rejectedDraft);
   assert.match(browser.document.getElementById("toast").textContent, /valid Search mode and source limit/u);
+});
+
+test("a completed Agent thread continues for three turns through exact resume successors across reload", async () => {
+  const prompts = ["Calculate the values", "Now explain the result", "Compare it with the first answer"];
+  const runIds = [RUN_ID, SECOND_RUN_ID, THIRD_RUN_ID];
+  const histories = new Map();
+  for (let index = 0; index < runIds.length; index += 1) {
+    histories.set(runIds[index], await verifiedEvents([
+      ["output.delta", { text: `Answer ${index + 1}` }],
+      ["run.completed", {}],
+    ], { runId: runIds[index] }));
+  }
+  const acceptedTurns = [];
+  const starts = [];
+  const resumes = [];
+  let thread = null;
+  const persistAcceptedTurn = (runId, prompt) => {
+    acceptedTurns.push({ runId, prompt });
+    thread = agentThread({
+      title: "Agent calculation",
+      lastRunId: runId,
+      messages: acceptedTurns.flatMap((turn, index) => [
+        { id: `msg_user_multiturn_${index}`, role: "user", content: turn.prompt, runId: turn.runId },
+        { id: `msg_assistant_multiturn_${index}`, role: "assistant", content: `Stored answer ${index + 1}`, runId: turn.runId },
+      ]),
+    });
+  };
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: thread ? [thread] : [], nextBefore: null }; },
+    async createThread(_body, options) {
+      assert.match(options.idempotency, /^agent_thread_[A-Za-z0-9._~-]+$/u);
+      thread = agentThread();
+      return { thread };
+    },
+    async getThread(threadId) {
+      assert.equal(threadId, THREAD_ID);
+      return { thread };
+    },
+    async startRun(threadId, text, options) {
+      starts.push({ threadId, text, options });
+      assert.equal(thread.lastRunId, null, "runs/start is reserved for a pristine Agent thread");
+      persistAcceptedTurn(RUN_ID, text);
+      return { run: run("running", { id: RUN_ID, previousRunId: null }) };
+    },
+    async resumeRun(previousRunId, text, options) {
+      const nextIndex = resumes.length + 1;
+      const nextRunId = runIds[nextIndex];
+      resumes.push({ previousRunId, text, options });
+      assert.equal(previousRunId, runIds[nextIndex - 1]);
+      assert.equal(thread.lastRunId, previousRunId, "runs/resume extends only the exact durable head");
+      persistAcceptedTurn(nextRunId, text);
+      return { run: run("running", { id: nextRunId, previousRunId }) };
+    },
+    async runStatus(runId) {
+      return { run: terminalRun("completed", histories.get(runId), { id: runId }) };
+    },
+    async *streamRunEvents({ runId }) {
+      for (const event of histories.get(runId)) {
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      }
+    },
+  };
+
+  const firstBrowser = harness({ agent });
+  await firstBrowser.app.initialize();
+  for (const prompt of prompts.slice(0, 2)) {
+    firstBrowser.document.getElementById("message-input").value = prompt;
+    await firstBrowser.app.submitMessage({ preventDefault() {} });
+    assert.equal(firstBrowser.document.getElementById("workspace").dataset.status, "completed");
+    assert.equal(firstBrowser.document.getElementById("message-input").disabled, false);
+  }
+  assert.equal(starts.length, 1);
+  assert.equal(resumes.length, 1);
+  assert.match(starts[0].options.idempotency, /^agent_start_[A-Za-z0-9._~-]+$/u);
+  assert.match(resumes[0].options.idempotency, /^agent_followup_[A-Za-z0-9._~-]+$/u);
+  assert.deepEqual(
+    [starts[0].text, resumes[0].text],
+    prompts.slice(0, 2),
+    "the visible second prompt becomes the exact optional resume input text",
+  );
+
+  const reloaded = harness({ agent });
+  await reloaded.app.initialize();
+  assert.equal(reloaded.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(reloaded.document.getElementById("messages").textContent, /Answer 1/u);
+  assert.match(reloaded.document.getElementById("messages").textContent, /Answer 2/u);
+  reloaded.document.getElementById("message-input").value = prompts[2];
+  await reloaded.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(starts.length, 1, "a completed thread is never restarted as a pristine run");
+  assert.deepEqual(resumes.map(({ previousRunId, text }) => ({ previousRunId, text })), [
+    { previousRunId: RUN_ID, text: prompts[1] },
+    { previousRunId: SECOND_RUN_ID, text: prompts[2] },
+  ]);
+  assert.match(resumes[1].options.idempotency, /^agent_followup_[A-Za-z0-9._~-]+$/u);
+  assert.notEqual(resumes[0].options.idempotency, resumes[1].options.idempotency);
+  assert.equal(thread.lastRunId, THIRD_RUN_ID);
+  assert.equal(reloaded.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(reloaded.document.getElementById("messages").textContent, /Answer 3/u);
+});
+
+test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt remains editable", async () => {
+  const firstHistory = await verifiedEvents([["run.completed", {}]]);
+  const secondHistory = await verifiedEvents([
+    ["output.delta", { text: "Confirmed follow-up" }],
+    ["run.completed", {}],
+  ], { runId: SECOND_RUN_ID });
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_user_retry_0", role: "user", content: "First turn", runId: RUN_ID },
+      { id: "msg_assistant_retry_0", role: "assistant", content: "Stored first answer", runId: RUN_ID },
+    ],
+  });
+  const resumeCalls = [];
+  const waits = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus() { return { run: terminalRun("completed", firstHistory) }; },
+    async startRun() { throw new Error("a retained thread must not dispatch runs/start"); },
+    async resumeRun(previousRunId, text, options) {
+      resumeCalls.push({ previousRunId, text, options });
+      if (resumeCalls.length === 1) {
+        throw Object.assign(new Error("response lost after dispatch"), { retryable: true });
+      }
+      if (resumeCalls.length === 2) {
+        return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+      }
+      throw Object.assign(new Error("request rejected"), { retryable: false });
+    },
+    async *streamRunEvents({ runId }) {
+      const events = runId === RUN_ID ? firstHistory : secondHistory;
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+
+  browser.document.getElementById("message-input").value = "Retry this exact follow-up";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.deepEqual(waits, [250]);
+  assert.equal(resumeCalls.length, 2);
+  assert.equal(resumeCalls[0].options.idempotency, resumeCalls[1].options.idempotency);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  const messages = browser.document.getElementById("messages");
+  assert.match(messages.textContent, /Confirmed follow-up/u);
+  assert.equal(
+    messages.textContent.split("Retry this exact follow-up").length - 1,
+    1,
+    "a same-key transport retry renders its accepted user turn exactly once",
+  );
+
+  const rejectedDraft = "Keep this unconfirmed follow-up editable";
+  browser.document.getElementById("message-input").value = rejectedDraft;
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(resumeCalls.length, 3, "a definitive rejection is not retried");
+  assert.equal(browser.document.getElementById("message-input").value, rejectedDraft);
+  assert.equal(browser.document.getElementById("message-input").disabled, false);
+  assert.equal(messages.textContent.includes(rejectedDraft), false, "an unaccepted prompt never becomes conversation history");
+  assert.match(browser.document.getElementById("toast").textContent, /prompt is still ready/u);
 });
 
 test("a user-selected Chat workspace survives reload without an automatic Agent handoff changing it", {

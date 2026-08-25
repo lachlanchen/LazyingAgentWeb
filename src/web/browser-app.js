@@ -3093,9 +3093,23 @@ export function createBrowserApp({
     const session = state.session;
     const agent = state.agent;
     const current = () => state.session === session && state.agent === agent && state.session.authenticated;
+    const exactMutation = async (operation) => {
+      try { return await operation(); }
+      catch (error) {
+        if (error?.retryable !== true) throw error;
+        connection("Confirming Agent request", false);
+        await wait(250);
+        return await operation();
+      }
+    };
     let threadId = state.agentThreadId;
     if (!threadId) {
-      const { thread } = await agent.createThread({ title: conversationTitle(text) });
+      const idempotency = createBrowserOpaqueId("agent_thread");
+      const create = () => agent.createThread(
+        { title: conversationTitle(text) },
+        { idempotency },
+      );
+      const { thread } = await exactMutation(create);
       if (!current()) return;
       state.agentThreadId = thread.id;
       threadId = thread.id;
@@ -3103,18 +3117,31 @@ export function createBrowserApp({
       elements.conversation_title.textContent = thread.title;
       renderThreads();
     }
-    messageNode("user", text);
-    const { run } = await agent.startRun(threadId, text, {
-      idempotency: createBrowserOpaqueId("agent_start"),
+    const previousRunId = state.runId;
+    if (previousRunId !== null && !TERMINAL.has(state.agentRunStatus)) {
+      throw new AgintiProtocolError("A follow-up requires the current Agent run to be terminal", {
+        code: "AGENT_RUN_ACTIVE",
+      });
+    }
+    const idempotency = createBrowserOpaqueId(previousRunId === null ? "agent_start" : "agent_followup");
+    const options = {
+      idempotency,
       ...(search === undefined ? {} : { search }),
-    });
+    };
+    const dispatch = previousRunId === null
+      ? () => agent.startRun(threadId, text, options)
+      : () => agent.resumeRun(previousRunId, text, options);
+    const { run } = await exactMutation(dispatch);
     if (!current()) return;
+    const accepted = previousRunId === null
+      ? correlatedAgentRun(run, { runId: run?.id, threadId })
+      : correlatedResumedAgentRun(run, { previousRunId, threadId });
     if (search !== undefined) {
       state.agentSearchSelected = false;
       updateSearchControl();
     }
-    correlatedAgentRun(run, { runId: run?.id, threadId });
-    await streamAgentRun(run, { expectedThreadId: threadId });
+    messageNode("user", text);
+    await streamAgentRun(accepted, { expectedThreadId: threadId });
   }
 
   function workflowAttachmentFields(attachments) {
@@ -3575,8 +3602,9 @@ export function createBrowserApp({
           : "The thread may already exist. Your prompt remains visible and locked; Resume confirms the exact send.");
       } else {
         if (state.mode === "agent") {
+          if (elements.message_input.value === "") elements.message_input.value = draft;
           connection("Request interrupted", false);
-          showToast("AgInTi did not accept or complete this request. Existing server work was not replaced.");
+          showToast("AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying.");
         } else if (state.chatPendingSend) {
           connection("Send confirmation pending", false);
           showToast("The durable send is awaiting confirmation. Resume reuses it without dispatching a duplicate.");

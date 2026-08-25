@@ -3,7 +3,7 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.24 candidate remains compatible with current v0.1.23
+is fail-closed. The v0.1.25 candidate remains compatible with current v0.1.24
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
@@ -19,6 +19,13 @@ deterministic bounded-execution path, bypass model planning, and preserve
 failure and successor-run state for durable reload and exact idempotent Resume
 behavior, including an optional corrected prompt. The PWA persists only the
 non-private Chat/Agent workspace preference, never browser-owned chat history.
+After a terminal Agent run, a later prompt resumes that exact predecessor as a
+successor run instead of trying to start the thread again. Creation, start, and
+resume mutations use immutable idempotency keys; one retry may resolve an
+uncertain transport result without duplicating a run. A rejected prompt remains
+editable and is not rendered as accepted history. Plot artifacts explicitly
+occupy the workspace column and scale to the available message width, with
+readable mobile ticks, non-scaling strokes, and wrapping legends.
 When a failed or cancelled predecessor has no persisted assistant message, the
 browser reserves that run's chronological assistant position before replaying
 verified history, so a corrected successor's output and artifacts remain after
@@ -423,7 +430,7 @@ admission, tunnel outage and rollback. A live Docker/model acceptance run is
 additionally blocked whenever the shared-workstation resource policy fails.
 Releases are immutable and retain the current and immediately previous
 reproducible package with an executable rollback. Passing offline package tests
-alone does not authorize deployment. Current v0.1.22 production exposes Agent
+alone does not authorize deployment. Current v0.1.24 production exposes Agent
 only while AgInTi returns the accepted native capability proof; removing or
 invalidating that proof disables Agent. A live PWA or Direct Chat deployment
 alone neither authorizes nor implies Agent enablement, and Direct Chat remains a

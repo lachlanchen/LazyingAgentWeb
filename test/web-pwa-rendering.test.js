@@ -819,6 +819,53 @@ test("mobile sidebar and send controls expose comfortable touch targets", () => 
   assert.match(touchTargetRule[1], /min-height:\s*48px;/u);
 });
 
+test("Agent plots keep the workspace track and use readable desktop and iPhone geometry", () => {
+  const workspaceRule = /\.workspace \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const assistantRule = /\.message\[data-role="assistant"\] \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const plotRule = /\.artifact-plot \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const legendRule = /\.artifact-legend \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const legendItemRule = /\.artifact-legend li \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(workspaceRule);
+  assert.ok(assistantRule);
+  assert.ok(plotRule);
+  assert.ok(legendRule);
+  assert.ok(legendItemRule);
+  assert.match(workspaceRule[1], /grid-column:\s*2;/u);
+  assert.match(assistantRule[1], /width:\s*min\(100%, 760px\);/u);
+  assert.match(assistantRule[1], /max-width:\s*min\(100%, 760px\);/u);
+  assert.match(plotRule[1], /width:\s*100%;/u);
+  assert.match(plotRule[1], /height:\s*auto;/u);
+  assert.match(plotRule[1], /max-width:\s*100%;/u);
+  assert.match(plotRule[1], /aspect-ratio:\s*720 \/ 390;/u);
+  assert.match(legendRule[1], /flex-wrap:\s*wrap;/u);
+  assert.match(legendItemRule[1], /min-width:\s*0;/u);
+  assert.match(legendItemRule[1], /max-width:\s*100%;/u);
+  assert.match(legendItemRule[1], /overflow-wrap:\s*anywhere;/u);
+  assert.match(BRIGHT_APP_CSS, /\.plot-grid, \.plot-axis, \.plot-series path \{[^}]*vector-effect:\s*non-scaling-stroke;/u);
+
+  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
+  const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
+  assert.match(mobileCss, /\.workspace \{[^}]*grid-column:\s*1;/u);
+  assert.match(mobileCss, /\.message\[data-role="assistant"\] \{[^}]*width:\s*94%;[^}]*max-width:\s*94%;/u);
+  assert.match(mobileCss, /\.plot-tick \{[^}]*font-size:\s*21px;/u);
+  assert.match(mobileCss, /\.plot-axis-label \{[^}]*font-size:\s*22px;/u);
+  assert.match(mobileCss, /\.artifact-legend \{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 9rem\), 1fr\)\);/u);
+
+  const desktopWorkspace = 1_280 - 280;
+  const desktopTranscript = desktopWorkspace - 2 * Math.max(16, (desktopWorkspace - 850) / 2);
+  const desktopMessage = Math.min(desktopTranscript, 760);
+  const desktopPlot = desktopMessage - 2 * 16 - 2;
+  const iphoneTranscript = 390 - 2 * 16;
+  const iphoneMessage = iphoneTranscript * 0.94;
+  const iphonePlot = iphoneMessage - 2 * 16 - 2;
+  assert.equal(desktopMessage, 760);
+  assert.ok(desktopPlot > 720 && desktopPlot <= desktopMessage);
+  assert.ok(iphonePlot > 300 && iphonePlot < iphoneTranscript);
+  assert.ok(iphonePlot / (720 / 390) > 160, "iPhone plot retains a readable aspect height");
+  assert.ok(21 * iphonePlot / 720 >= 8.75, "responsive iPhone tick text stays readable");
+});
+
 test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and clears only after authority", async () => {
   const now = "2026-08-24T08:00:00.000Z";
   const hashA = "a".repeat(64);
@@ -2733,12 +2780,21 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
     schemaVersion: "1",
     type: "line",
     labels: ["A", "B"],
-    series: [{ name: "Value", data: [1, 2] }],
+    series: [{ name: "Value", data: [-148.413159, 0] }],
   })), true);
   assert.equal(target.dataset.status, "ready");
   assert.equal(target.walk().some((node) => node.tagName === "svg"), true);
   assert.equal(target.walk().some((node) => node.tagName === "script"), false);
   const plotNodes = target.walk();
+  const plotSvg = plotNodes.find((node) => node.tagName === "svg");
+  assert.equal(plotSvg.getAttribute("viewBox"), "0 0 720 390");
+  assert.equal(plotSvg.getAttribute("width"), "720");
+  assert.equal(plotSvg.getAttribute("height"), "390");
+  assert.equal(plotSvg.getAttribute("preserveAspectRatio"), "xMidYMid meet");
+  const yTicks = plotNodes.filter((node) => node.getAttribute("class")?.split(/\s+/u).includes("plot-y-tick"));
+  assert.equal(yTicks.length, 5);
+  assert.deepEqual(yTicks.map((node) => node.textContent), ["0", "-37.1", "-74.2", "-111", "-148"]);
+  assert.equal(plotNodes.filter((node) => node.getAttribute("class")?.split(/\s+/u).includes("plot-x-tick")).length, 2);
   const swatches = plotNodes.filter((node) => /(?:^|\s)artifact-swatch-\d(?:\s|$)/u.test(node.className));
   assert.equal(swatches.length, 1);
   assert.equal(swatches[0].className.includes("artifact-swatch-0"), true);

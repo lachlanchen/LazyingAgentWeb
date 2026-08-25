@@ -27,6 +27,7 @@ import { createRunPresentation } from "../src/web/presentation-state.js";
 
 const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
 const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
+const SECOND_RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
 const ZERO_HASH = "0".repeat(64);
@@ -474,12 +475,21 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
       if (url.endsWith(AGINTI_RPC_PATHS.runsStart)) {
         return jsonResponse({ schemaVersion: "1", run: publicRun() });
       }
+      if (url.endsWith(AGINTI_RPC_PATHS.runsResume)) {
+        return jsonResponse({
+          schemaVersion: "1",
+          run: publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID }),
+        });
+      }
       return jsonResponse({ schemaVersion: "1", threads: [], nextBefore: null });
     },
   });
   await client.listThreads();
   await client.createThread({ title: "Plot values" });
   await client.startRun(THREAD_ID, "Find grounded evidence", { search: { mode: "web", limit: 5 } });
+  await client.resumeRun(RUN_ID, "Compare with the prior answer", {
+    idempotency: "agent_followup_exact_1234567890",
+  });
   assert.equal(calls[0].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsList}`);
   assert.equal(calls[1].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsCreate}`);
   assert.equal(calls[0].options.method, "POST");
@@ -494,6 +504,12 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
     input: { text: "Find grounded evidence", search: { mode: "web", limit: 5 } },
   });
   assert.equal(calls[2].options.headers.get("idempotency-key"), "mutation-key-1234567890");
+  assert.equal(calls[3].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.runsResume}`);
+  assert.deepEqual(JSON.parse(calls[3].options.body), {
+    runId: RUN_ID,
+    input: { text: "Compare with the prior answer" },
+  });
+  assert.equal(calls[3].options.headers.get("idempotency-key"), "agent_followup_exact_1234567890");
   for (const name of [
     "authorization",
     "x-aginti-principal-id",

@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.24 candidate; v0.1.23 production):** production is promoted
+> **Deployment status (v0.1.25 candidate; v0.1.24 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -12,15 +12,21 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > separate and does not enable or authorize Agent. Current accepted Agent
 > requests can execute one exact fenced `python` block without model planning,
 > retain public failure reasons across reload, and follow exact idempotent Resume
-> successor runs with an optional corrected prompt. Direct Chat remembers the
-> user's non-private workspace-mode preference across a full reload, while
+> successor runs with an optional corrected prompt. The v0.1.25 candidate makes
+> completed Agent conversations truly multi-turn: later prompts resume the exact
+> terminal predecessor, retry an uncertain mutation once with the same idempotency
+> key, and keep any rejected prompt editable without an optimistic duplicate.
+> Direct Chat remembers the user's non-private workspace-mode preference across
+> a full reload, while
 > confirmed sign-out fences stale history reads. The accepted v0.1.23 release also
 > keeps failed-predecessor and corrected-success messages in chronological
 > order when their verified output and plot artifacts are restored after reload.
 > The baseline accepted artifacts remain declarative plot, table, and Markdown
-> schemas. v0.1.24 preserves the v0.1.23 backward-compatible,
-> default-disabled grounded-search
-> extension: only an exact AgInTi capability may reveal the explicit Search
+> schemas. Responsive plot artifacts in v0.1.25 use the available message width,
+> retain readable axes on DPR3 phones, wrap legends, and cannot be reflowed into
+> the sidebar column by privacy masking. v0.1.24 preserves the v0.1.23
+> backward-compatible, default-disabled grounded-search extension: only an exact
+> AgInTi capability may reveal the explicit Search
 > controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and
 > admit bounded HTTPS-only `sources` artifacts. It also adds an exact-origin,
 > session-and-CSRF-bound fallback for iOS/PWA requests that omit all or part of

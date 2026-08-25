@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.25 candidate; v0.1.24 production):** production is promoted
+> **Deployment status (v0.1.26 candidate; v0.1.25 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -12,7 +12,7 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > separate and does not enable or authorize Agent. Current accepted Agent
 > requests can execute one exact fenced `python` block without model planning,
 > retain public failure reasons across reload, and follow exact idempotent Resume
-> successor runs with an optional corrected prompt. The v0.1.25 candidate makes
+> successor runs with an optional corrected prompt. The accepted v0.1.25 release makes
 > completed Agent conversations truly multi-turn: later prompts resume the exact
 > terminal predecessor, retry an uncertain mutation once with the same idempotency
 > key, and keep any rejected prompt editable without an optimistic duplicate.
@@ -24,7 +24,13 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > The baseline accepted artifacts remain declarative plot, table, and Markdown
 > schemas. Responsive plot artifacts in v0.1.25 use the available message width,
 > retain readable axes on DPR3 phones, wrap legends, and cannot be reflowed into
-> the sidebar column by privacy masking. v0.1.24 preserves the v0.1.23
+> the sidebar column by privacy masking. The v0.1.26 candidate also makes an
+> already-restored Agent-thread selection idempotent: clicking it cannot launch
+> a redundant ledger replay that detaches and rebuilds messages or figures, while
+> an invalid replay or unconfirmed mutation remains explicitly reopenable for
+> authoritative recovery. A brand-new conversation whose creation response is
+> lost retains its exact idempotency ticket for the next Send instead of
+> deadlocking or minting a duplicate. v0.1.24 preserves the v0.1.23
 > backward-compatible, default-disabled grounded-search extension: only an exact
 > AgInTi capability may reveal the explicit Search
 > controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and

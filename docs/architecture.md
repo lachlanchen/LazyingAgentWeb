@@ -3,7 +3,7 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.25 candidate remains compatible with current v0.1.24
+is fail-closed. The v0.1.26 candidate remains compatible with current v0.1.25
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
@@ -26,6 +26,18 @@ uncertain transport result without duplicating a run. A rejected prompt remains
 editable and is not rendered as accepted history. Plot artifacts explicitly
 occupy the workspace column and scale to the available message width, with
 readable mobile ticks, non-scaling strokes, and wrapping legends.
+Once a verified Agent thread has settled, selecting that same thread is an
+idempotent view operation: it preserves the existing message and artifact DOM
+instead of starting a redundant ledger replay. A failed or nonterminal replay
+remains reopenable so recovery is never hidden by that optimization. An Agent
+mutation with an unusable response enters the same fail-closed history fence:
+the draft stays editable, but another mutation is rejected until reopening the
+thread completes an authoritative read without redispatching the draft.
+If the thread-creation response itself remains unavailable, the browser has no
+thread identity to reopen; it instead retains the exact creation body and
+idempotency key in memory. The next Send confirms that same creation before
+starting one run, while thread navigation, mode changes, and PWA activation stay
+fenced so they cannot discard or duplicate the ambiguous operation.
 When a failed or cancelled predecessor has no persisted assistant message, the
 browser reserves that run's chronological assistant position before replaying
 verified history, so a corrected successor's output and artifacts remain after
@@ -430,7 +442,7 @@ admission, tunnel outage and rollback. A live Docker/model acceptance run is
 additionally blocked whenever the shared-workstation resource policy fails.
 Releases are immutable and retain the current and immediately previous
 reproducible package with an executable rollback. Passing offline package tests
-alone does not authorize deployment. Current v0.1.24 production exposes Agent
+alone does not authorize deployment. Current v0.1.25 production exposes Agent
 only while AgInTi returns the accepted native capability proof; removing or
 invalidating that proof disables Agent. A live PWA or Direct Chat deployment
 alone neither authorizes nor implies Agent enablement, and Direct Chat remains a

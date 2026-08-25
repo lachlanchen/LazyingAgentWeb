@@ -1036,6 +1036,7 @@ export function createBrowserApp({
     agentReplayOfferResume: true,
     agentCancelPending: false,
     agentPendingResume: null,
+    agentPendingThreadCreate: null,
     agentSearchSelected: false,
     streamAbort: null,
     streamKind: null,
@@ -1410,6 +1411,10 @@ export function createBrowserApp({
     const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
     const changed = nextMode !== state.mode;
     if (changed && interactionLocked()) return;
+    if (changed && state.mode === "agent" && state.agentPendingThreadCreate !== null) {
+      showToast("Retry the ready prompt to confirm its exact Agent conversation before changing modes.");
+      return;
+    }
     if (changed && state.mode === "chat" && state.chatPendingDeletion) {
       showToast("Confirm the pending conversation deletion before changing modes.");
       return;
@@ -2314,6 +2319,13 @@ export function createBrowserApp({
       && error.status < 499;
   }
 
+  function isAuthoritativeAgentRejection(error) {
+    return error?.retryable === false
+      && Number.isSafeInteger(error.status)
+      && error.status >= 400
+      && error.status < 499;
+  }
+
   function releaseRejectedChatWorkflow(workflow, error) {
     const composer = workflow.lockedComposer ?? workflow.recoveryComposer;
     if (composer !== null && composer !== undefined) {
@@ -3023,6 +3035,10 @@ export function createBrowserApp({
 
   async function openThread(threadId, { mode = state.mode } = {}) {
     if (interactionLocked() || mode !== state.mode) return;
+    if (mode === "agent" && state.agentPendingThreadCreate !== null) {
+      showToast("Retry the ready prompt to confirm its exact Agent conversation before opening another one.");
+      return;
+    }
     if (mode === "chat" && state.chatPendingDeletion) {
       showToast("Retry the pending conversation deletion before opening another conversation.");
       return;
@@ -3031,6 +3047,15 @@ export function createBrowserApp({
       showToast("Confirm the pending durable send with Resume before opening another conversation.");
       return;
     }
+    // A successful Agent restoration already owns the complete verified
+    // presentation for this thread. Treat another click on that settled
+    // selection as idempotent: replaying it would briefly leave the old
+    // completed DOM visible, then detach and rebuild every message/artifact.
+    // A nonterminal run may still need a fresh read, and a failed ledger
+    // replay must remain reopenable as promised by its recovery message.
+    if (mode === "agent" && threadId === state.agentThreadId
+        && state.agentReplayFailed !== true
+        && (state.runId === null || TERMINAL.has(state.agentRunStatus))) return;
     state.busy = true;
     updateImageControl();
     renderThreads();
@@ -3104,13 +3129,31 @@ export function createBrowserApp({
     };
     let threadId = state.agentThreadId;
     if (!threadId) {
-      const idempotency = createBrowserOpaqueId("agent_thread");
+      const pendingCreate = state.agentPendingThreadCreate ?? Object.freeze({
+        title: conversationTitle(text),
+        idempotency: createBrowserOpaqueId("agent_thread"),
+      });
+      state.agentPendingThreadCreate = pendingCreate;
       const create = () => agent.createThread(
-        { title: conversationTitle(text) },
-        { idempotency },
+        { title: pendingCreate.title },
+        { idempotency: pendingCreate.idempotency },
       );
-      const { thread } = await exactMutation(create);
-      if (!current()) return;
+      let result;
+      try {
+        result = await exactMutation(create);
+      } catch (error) {
+        // A bounded non-retryable 4xx proves that this exact create was not
+        // accepted, including a release-fence rejection. Do not retain an
+        // ambiguity fence that would prevent the required app refresh.
+        if (isAuthoritativeAgentRejection(error)
+            && state.agentPendingThreadCreate === pendingCreate) {
+          state.agentPendingThreadCreate = null;
+        }
+        throw error;
+      }
+      const { thread } = result;
+      if (!current() || state.agentPendingThreadCreate !== pendingCreate) return;
+      state.agentPendingThreadCreate = null;
       state.agentThreadId = thread.id;
       threadId = thread.id;
       state.agentThreads.unshift(thread);
@@ -3603,8 +3646,20 @@ export function createBrowserApp({
       } else {
         if (state.mode === "agent") {
           if (elements.message_input.value === "") elements.message_input.value = draft;
+          if (state.agentThreadId !== null) {
+            // Until a fresh authoritative read succeeds, the dispatch may have
+            // reached AgInTi even though its response was unusable. Reuse the
+            // existing fail-closed history fence so another send cannot create
+            // a successor from stale local state and same-thread reopen cannot
+            // take the settled-view no-op path.
+            state.agentReplayFailed = true;
+          }
           connection("Request interrupted", false);
-          showToast("AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying.");
+          showToast(state.agentThreadId !== null
+            ? "AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying."
+            : state.agentPendingThreadCreate !== null
+              ? "AgInTi did not confirm the new conversation. Your prompt is still ready; retry it to confirm the same exact conversation without creating a duplicate."
+              : "AgInTi rejected the new conversation. Your prompt is still ready; edit it or retry when the service is available.");
         } else if (state.chatPendingSend) {
           connection("Send confirmation pending", false);
           showToast("The durable send is awaiting confirmation. Resume reuses it without dispatching a duplicate.");
@@ -3680,6 +3735,7 @@ export function createBrowserApp({
       state.runId = null;
       state.agentRunStatus = null;
       state.agentPendingResume = null;
+      state.agentPendingThreadCreate = null;
       state.agentSearchSelected = false;
       state.agentReplayFailed = false;
       clearConversation();
@@ -3951,6 +4007,7 @@ export function createBrowserApp({
     state.runId = null;
     state.agentRunStatus = null;
     state.agentPendingResume = null;
+    state.agentPendingThreadCreate = null;
     state.agentSearchSelected = false;
     state.agentReplayFailed = false;
     clearConversation();
@@ -4221,6 +4278,10 @@ export function createBrowserApp({
 
   function newConversation() {
     if (interactionLocked()) return;
+    if (state.mode === "agent" && state.agentPendingThreadCreate !== null) {
+      showToast("Retry the ready prompt to confirm its exact Agent conversation before creating another one.");
+      return;
+    }
     if (state.mode === "agent" && state.agentReplayFailed) {
       showToast("Reopen an Agent conversation and restore its verified history before creating new work.");
       return;
@@ -4263,7 +4324,7 @@ export function createBrowserApp({
       || state.imagePreparing || state.chatPendingSend !== null || state.chatPendingDeletion !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
-      || state.agentPendingResume !== null
+      || state.agentPendingResume !== null || state.agentPendingThreadCreate !== null
       || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
       || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
   }

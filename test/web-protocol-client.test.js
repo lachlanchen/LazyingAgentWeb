@@ -16,6 +16,7 @@ import {
   validateAgentResponse,
   validateArtifact,
   validateEventEnvelope,
+  validateThreadRunAncestry,
   verifyAgentEvent,
 } from "../src/web/aginti-protocol.js";
 import {
@@ -28,6 +29,7 @@ import { createRunPresentation } from "../src/web/presentation-state.js";
 const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
 const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
 const SECOND_RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const THIRD_RUN_ID = "run_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const NOW = "2026-08-20T08:00:00.000Z";
 const ZERO_HASH = "0".repeat(64);
@@ -414,6 +416,141 @@ test("public responses and artifacts reject private state, active content, URLs,
     { id: ARTIFACT_ID, title: "Unsafe", kind: "markdown", spec: { schemaVersion: "1", markdown: "read /home/aginti/private" } },
     { ...artifact(), downloadUrl: "https://example.test/private" },
   ]) assert.throws(() => validateArtifact(candidate));
+});
+
+test("persisted Agent messages cannot make a pristine thread replay or restart", () => {
+  const message = (role) => ({
+    id: `msg_${role}_1234567890abcdef`,
+    role,
+    content: role === "user" ? "Run the calculation" : "Stored result",
+    runId: RUN_ID,
+    createdAt: NOW,
+    digest: role === "user" ? "a".repeat(64) : "b".repeat(64),
+  });
+  for (const role of ["user", "assistant"]) {
+    assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+      schemaVersion: "1",
+      thread: publicThread({ messages: [message(role)] }),
+    }), /replay messages require a lastRunId/u);
+  }
+  assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({ status: "running" }),
+  }), /running thread requires a lastRunId/u);
+  for (const replay of [
+    { prunedMessageCount: 0, anchorDigest: "c".repeat(64) },
+    { prunedMessageCount: 1, anchorDigest: ZERO_HASH },
+  ]) {
+    assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+      schemaVersion: "1",
+      thread: publicThread({ replay }),
+    }), /replay anchor is inconsistent/u);
+  }
+  const replayable = validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({
+      lastRunId: RUN_ID,
+      messages: [message("user"), message("assistant")],
+    }),
+  }).thread;
+  assert.equal(replayable.lastRunId, RUN_ID);
+  assert.deepEqual(replayable.messages.map(({ role, runId }) => ({ role, runId })), [
+    { role: "user", runId: RUN_ID },
+    { role: "assistant", runId: RUN_ID },
+  ]);
+});
+
+test("thread replay ancestry accepts one exact chain and one proven omitted prefix", () => {
+  const message = (runId, index) => ({
+    id: `msg_lineage_${String(index).padStart(16, "0")}`,
+    role: "user",
+    content: `Accepted turn ${index}`,
+    runId,
+    createdAt: NOW,
+    digest: String(index).repeat(64),
+  });
+  const first = publicRun({ id: RUN_ID, previousRunId: null, status: "completed" });
+  const second = publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID, status: "completed" });
+  const third = publicRun({ id: THIRD_RUN_ID, previousRunId: SECOND_RUN_ID, status: "completed" });
+  const ancestry = validateThreadRunAncestry(publicThread({
+    lastRunId: THIRD_RUN_ID,
+    messages: [message(SECOND_RUN_ID, 2), message(THIRD_RUN_ID, 3), message(RUN_ID, 1)],
+  }), [third, first, second]);
+  assert.deepEqual(ancestry.runs.map((run) => run.id), [RUN_ID, SECOND_RUN_ID, THIRD_RUN_ID]);
+  assert.equal(ancestry.headRun.id, THIRD_RUN_ID);
+  assert.equal(ancestry.omittedPrefix, false);
+  assert.equal(ancestry.requiresThreadRefresh, false);
+  assert.equal(Object.isFrozen(ancestry.runs), true);
+
+  const suffix = validateThreadRunAncestry(publicThread({
+    lastRunId: THIRD_RUN_ID,
+    replay: { prunedMessageCount: 2, anchorDigest: "c".repeat(64) },
+    messages: [message(THIRD_RUN_ID, 3)],
+  }), [third]);
+  assert.deepEqual(suffix.runs.map((run) => run.id), [THIRD_RUN_ID]);
+  assert.equal(suffix.headRun.id, THIRD_RUN_ID);
+  assert.equal(suffix.omittedPrefix, true);
+  assert.equal(suffix.requiresThreadRefresh, false);
+
+  const completedDuringRead = validateThreadRunAncestry(publicThread({
+    status: "running",
+    lastRunId: THIRD_RUN_ID,
+    messages: [message(THIRD_RUN_ID, 3)],
+  }), [publicRun({ id: THIRD_RUN_ID, previousRunId: null, status: "completed" })]);
+  assert.equal(completedDuringRead.headRun.status, "completed");
+  assert.equal(completedDuringRead.requiresThreadRefresh, true,
+    "a terminal run read after a running thread snapshot requests a fresh thread before follow-up");
+});
+
+test("thread replay ancestry rejects branches, cycles, and an unproved missing predecessor", () => {
+  const message = (runId, index) => ({
+    id: `msg_ancestry_${String(index).padStart(16, "0")}`,
+    role: "user",
+    content: `Accepted turn ${index}`,
+    runId,
+    createdAt: NOW,
+    digest: String(index).repeat(64),
+  });
+  const threeRunThread = publicThread({
+    lastRunId: THIRD_RUN_ID,
+    messages: [message(RUN_ID, 1), message(SECOND_RUN_ID, 2), message(THIRD_RUN_ID, 3)],
+  });
+  assert.throws(() => validateThreadRunAncestry(threeRunThread, [
+    publicRun({ id: RUN_ID, previousRunId: null, status: "completed" }),
+    publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID, status: "completed" }),
+    publicRun({ id: THIRD_RUN_ID, previousRunId: RUN_ID, status: "completed" }),
+  ]), /ancestry branches/u);
+
+  assert.throws(() => validateThreadRunAncestry(threeRunThread, [
+    publicRun({ id: RUN_ID, previousRunId: SECOND_RUN_ID, status: "completed" }),
+    publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID, status: "completed" }),
+    publicRun({ id: THIRD_RUN_ID, previousRunId: null, status: "completed" }),
+  ]), /ancestry contains a cycle/u);
+
+  assert.throws(() => validateThreadRunAncestry(publicThread({
+    lastRunId: SECOND_RUN_ID,
+    messages: [message(SECOND_RUN_ID, 2)],
+  }), [publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID, status: "completed" })]), /missing without a pruned-prefix proof/u);
+
+  const opaqueNativePrefix = validateThreadRunAncestry(publicThread({
+    lastRunId: SECOND_RUN_ID,
+    messages: [],
+  }), [publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID, status: "completed" })]);
+  assert.deepEqual(opaqueNativePrefix.runs.map((run) => run.id), [SECOND_RUN_ID]);
+  assert.equal(opaqueNativePrefix.omittedPrefix, true,
+    "a full retained-native get projection may keep its durable predecessor opaque");
+
+  assert.throws(() => validateThreadRunAncestry(publicThread({
+    lastRunId: RUN_ID,
+    messages: [message(RUN_ID, 1)],
+  }), [publicRun({ id: RUN_ID, previousRunId: null, status: "running" })]), /thread status does not match/u,
+  "an idle replay cannot unlock a nonterminal head");
+
+  assert.throws(() => validateThreadRunAncestry(publicThread({
+    status: "deleting",
+    lastRunId: RUN_ID,
+    messages: [message(RUN_ID, 1)],
+  }), [publicRun({ id: RUN_ID, previousRunId: null, status: "completed" })]), /deleting thread cannot unlock/u);
 });
 
 test("event ledger verifies exact hashes, ownership, sequence, and previous hash", async () => {

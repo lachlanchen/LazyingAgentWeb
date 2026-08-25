@@ -3,7 +3,7 @@
 This document describes the implemented standalone package boundary.
 Production is promoted independently from repository commits, with immutable
 acceptance receipts and a verified rollback release. The historical Agent gate
-is fail-closed. The v0.1.27 candidate remains compatible with current v0.1.25
+is fail-closed. The v0.1.28 candidate remains compatible with current v0.1.27
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
@@ -26,6 +26,12 @@ uncertain transport result without duplicating a run. A rejected prompt remains
 editable and is not rendered as accepted history. Plot artifacts explicitly
 occupy the workspace column and scale to the available message width, with
 readable mobile ticks, non-scaling strokes, and wrapping legends.
+When a release fence requires a full-page refresh while an Agent follow-up is
+still unsent, the encrypted handoff retains the Agent mode and owned thread ID.
+The successor page reloads and verifies that thread, derives its authoritative
+terminal run, and restores the draft without dispatching it. A later Send uses
+the normal Resume mutation for that predecessor; the handoff never stores a
+possibly stale run ID and never routes Agent work into Direct Chat.
 Once a verified Agent thread has settled, selecting that same thread is an
 idempotent view operation: it preserves the existing message and artifact DOM
 instead of starting a redundant ledger replay. A failed or nonterminal replay
@@ -341,14 +347,38 @@ window, is offered through **Update** or **Later**:
 - A failed or offline update leaves the current app usable and retries after
   connectivity returns.
 
-A confirmed Update or explicit API release mismatch can carry only a definitively unsent composer
-across that reload. The page encrypts a bounded record with AES-GCM, keeps the
-random key only in a URL fragment, scrubs the fragment synchronously, then
-atomically takes and deletes the record before validating its account, scope,
-source/target release, age, digest, and up to four canonical images. Restoration never
-dispatches a request. Passwords, active or ambiguous sends, generations, Agent
-runs, and other browser-held workflows remain reload blockers. Malformed,
-expired, and excess orphan ciphertexts are pruned.
+A confirmed Update or explicit API release mismatch can carry a definitively
+unsent Direct Chat composer, an idle Agent composer, or an Agent draft following
+an authoritatively verified terminal run across that reload. Active sends or
+generations, nonterminal Agent work, ambiguous mutations, passwords, and other
+browser-held workflows remain reload blockers. The page encrypts a bounded
+record with AES-GCM. Its v0.1.28 inner payload schema v3 preserves the exact
+mode, owned Agent thread ID when present, explicit Search settings or No Search,
+draft, and up to four canonical images.
+
+The random key exists only in a URL fragment and is therefore never sent in an
+HTTP request. The page retains that fragment until the authenticated atomic
+take and decryption succeed, instead of orphaning the encrypted IndexedDB row
+during sign-in or a reload. It is reattached only to a bounded recovery retry or
+an authenticated, chain-proved release hop, then scrubbed after successful
+recovery. The account, scope, source/target release chain, age, digest, and image
+contract are revalidated before the protected composer is unlocked; restoration
+never dispatches a request. Malformed, expired, and excess orphan ciphertexts
+are pruned.
+
+The same v3 envelope can contain an empty exact thread selection when a release
+fence interrupts same-account authenticated read recovery. That record resumes
+only server-owned Agent or Direct Chat history and contains no mutation ticket.
+If the session expires before the hop, a retained durable ciphertext is carried
+opaquely with a key-authenticated successor proof; the successor must still
+authenticate the bound account before decryption.
+
+The v0.1.27 inner schema-v2 payload did not carry authoritative mode or Search
+state. When v0.1.28 opens one, it keeps the visible composer fenced until the
+user explicitly chooses the destination conversation and separately confirms
+**Search** or **No Search**. It does not infer either choice. A v0.1.28
+schema-v3 payload instead restores its exact mode, owned thread, and Search
+choice, subject to current account ownership and capability verification.
 
 `pageshow` and visible-state resume revalidate the server session. A revoked
 session returns to sign-in while keeping unsent composer work in page memory;
@@ -445,7 +475,7 @@ admission, tunnel outage and rollback. A live Docker/model acceptance run is
 additionally blocked whenever the shared-workstation resource policy fails.
 Releases are immutable and retain the current and immediately previous
 reproducible package with an executable rollback. Passing offline package tests
-alone does not authorize deployment. Current v0.1.25 production exposes Agent
+alone does not authorize deployment. Current v0.1.27 production exposes Agent
 only while AgInTi returns the accepted native capability proof; removing or
 invalidating that proof disables Agent. A live PWA or Direct Chat deployment
 alone neither authorizes nor implies Agent enablement, and Direct Chat remains a

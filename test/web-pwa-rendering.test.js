@@ -39,6 +39,7 @@ import { DirectChatProtocolError, DirectChatTransportError } from "../src/web/di
 const ARTIFACT_ID = `art_${"a".repeat(64)}`;
 const CURRENT_RELEASE = `release-${"a".repeat(64)}`;
 const NEXT_RELEASE = `release-${"b".repeat(64)}`;
+const LATER_RELEASE = `release-${"c".repeat(64)}`;
 const OLD_RELEASE = `release-${"0".repeat(64)}`;
 const BOOTSTRAP_IMPORTS = `
   import katex from "./katex.mjs";
@@ -478,6 +479,7 @@ function updateControllerHarness({
   environment,
   registerPromise,
   restore = async () => ({ authenticated: false }),
+  login = async () => ({ authenticated: false }),
   locationHref,
   agent,
   chat,
@@ -522,7 +524,7 @@ function updateControllerHarness({
     navigator,
     sessionClient: {
       async restore() { restoreCalls += 1; return await restore(); },
-      async login() { return { authenticated: false }; },
+      async login(input) { return await login(input); },
       async logout() { return { signedOut: true, agentCancellationPending: false }; },
     },
     createAgentClient() {
@@ -615,6 +617,28 @@ function canonicalPngHeader(width = 64, height = 64) {
   return bytes;
 }
 
+function completedAgentRun({ id, threadId, previousRunId = null, createdAt, lastHash, output = "Done" }) {
+  return Object.freeze({
+    id,
+    threadId,
+    previousRunId,
+    status: "completed",
+    createdAt,
+    startedAt: createdAt,
+    completedAt: createdAt,
+    cancelRequestedAt: null,
+    output,
+    error: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      snapshotHash: "d".repeat(64),
+      runtimeRevision: 1,
+      contextDigest: "e".repeat(64),
+    }),
+    eventCursor: Object.freeze({ firstSeq: 1, lastSeq: 1, lastHash, prunedThroughSeq: 0 }),
+  });
+}
+
 function idleAuthenticatedPwaClients(mutationCalls = { prepareThread: 0, createThread: 0, startRun: 0 }) {
   const agent = {
     async capabilities() {
@@ -679,6 +703,178 @@ async function stageEncryptedTextUpdateHandoff() {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(source.replacements.length, 1);
   return { href: source.replacements[0], record: [...store.records.entries()][0] };
+}
+
+async function legacyV2DraftHandoff({
+  draft = "Continue the exact TeX and PDF task",
+  createdAt = 50_000,
+} = {}) {
+  const encoder = new TextEncoder();
+  const handoffId = "7".repeat(64);
+  const keyBytes = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+  const keyText = Buffer.from(keyBytes).toString("base64url");
+  const accountDigest = createHash("sha256")
+    .update(encoder.encode("lazying-agent-update-account\u0000account-user"))
+    .digest("hex");
+  const encode = (value) => {
+    const metadata = encoder.encode(JSON.stringify(value));
+    const bytes = new Uint8Array(4 + metadata.byteLength);
+    new DataView(bytes.buffer).setUint32(0, metadata.byteLength);
+    bytes.set(metadata, 4);
+    return bytes;
+  };
+  const unsigned = {
+    schemaVersion: "2",
+    scope: "/",
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    accountDigest,
+    threadId: null,
+    draft,
+    images: [],
+  };
+  const record = {
+    ...unsigned,
+    digest: createHash("sha256").update(encode(unsigned)).digest("hex"),
+  };
+  const envelope = {
+    schemaVersion: "2",
+    scope: "/",
+    handoffId,
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    expiresAt: createdAt + 5 * 60 * 1_000,
+  };
+  const iv = Uint8Array.from({ length: 12 }, (_, index) => 0xa0 + index);
+  const key = await globalThis.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt({
+    name: "AES-GCM",
+    iv,
+    additionalData: encoder.encode(JSON.stringify(envelope)),
+    tagLength: 128,
+  }, key, encode(record)));
+  const stored = { ...envelope, iv, ciphertext };
+  return {
+    href: `https://llm.lazying.art/?v=${NEXT_RELEASE}#lazying-update-handoff=${handoffId}.${keyText}`,
+    storageEntry: [`/\u0000${handoffId}`, stored],
+  };
+}
+
+async function currentV3AgentDraftHandoff({
+  draft,
+  threadId,
+  search,
+  mode = "agent",
+  createdAt = 60_000,
+} = {}) {
+  const encoder = new TextEncoder();
+  const handoffId = "8".repeat(64);
+  const keyBytes = Uint8Array.from({ length: 32 }, (_, index) => 0x40 + index);
+  const keyText = Buffer.from(keyBytes).toString("base64url");
+  const encode = (value) => {
+    const metadata = encoder.encode(JSON.stringify(value));
+    const bytes = new Uint8Array(4 + metadata.byteLength);
+    new DataView(bytes.buffer).setUint32(0, metadata.byteLength);
+    bytes.set(metadata, 4);
+    return bytes;
+  };
+  const unsigned = {
+    schemaVersion: "3",
+    scope: "/",
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    accountDigest: createHash("sha256")
+      .update(encoder.encode("lazying-agent-update-account\u0000account-user"))
+      .digest("hex"),
+    threadId,
+    draft,
+    mode,
+    search: mode === "agent" ? search : null,
+    images: [],
+  };
+  const record = {
+    ...unsigned,
+    digest: createHash("sha256").update(encode(unsigned)).digest("hex"),
+  };
+  const envelope = {
+    schemaVersion: "2",
+    scope: "/",
+    handoffId,
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    expiresAt: createdAt + 5 * 60 * 1_000,
+  };
+  const iv = Uint8Array.from({ length: 12 }, (_, index) => 0xb0 + index);
+  const key = await globalThis.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt({
+    name: "AES-GCM",
+    iv,
+    additionalData: encoder.encode(JSON.stringify(envelope)),
+    tagLength: 128,
+  }, key, encode(record)));
+  return {
+    href: `https://llm.lazying.art/?v=${NEXT_RELEASE}#lazying-update-handoff=${handoffId}.${keyText}`,
+    storageEntry: [`/\u0000${handoffId}`, { ...envelope, iv, ciphertext }],
+  };
+}
+
+function enabledAgentPwaCapability() {
+  return Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    search: Object.freeze({
+      enabled: true,
+      modes: Object.freeze(["web", "papers", "both"]),
+      maximumSources: 20,
+    }),
+    artifacts: Object.freeze({
+      kinds: Object.freeze(["plot", "table", "markdown", "sources"]),
+      schemaVersion: "1",
+    }),
+  });
+}
+
+function emptyAgentPwaThread({ id, title, instant = "2026-08-25T15:00:00.000Z" }) {
+  return Object.freeze({
+    id,
+    title,
+    status: "idle",
+    revision: 1,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "9".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([]),
+  });
+}
+
+async function settlePwaActions(turns = 2) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+async function settlePwaUntil(predicate, turns = 100) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return predicate();
 }
 
 test("content-addressed PWA shell is bright and has safe session/password-manager semantics", async () => {
@@ -2296,7 +2492,7 @@ test("a definitively unsent image survives a confirmed stale-PWA update exactly 
     createObjectUrl: () => "blob:restored-image",
     revokeObjectUrl() {},
   });
-  assert.deepEqual(restored.historyReplacements, [`/?v=${NEXT_RELEASE}`], "the decryption key is scrubbed before async startup");
+  assert.deepEqual(restored.historyReplacements, [], "the fragment remains reload-safe until authenticated decryption succeeds");
   await restored.app.initialize();
   assert.equal(restored.document.getElementById("message-input").value, "Describe this exact restored image");
   assert.equal(restored.document.getElementById("image-preview").hidden, false);
@@ -2305,6 +2501,2473 @@ test("a definitively unsent image survives a confirmed stale-PWA update exactly 
   assert.deepEqual(restoredMutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
   assert.equal(store.calls.take, 1);
   assert.equal(store.records.size, 0, "the encrypted handoff is deleted before validation and restored only in memory");
+  assert.deepEqual(restored.historyReplacements, [`/?v=${NEXT_RELEASE}`], "successful decryption scrubs the one-time key");
+});
+
+test("an Agent draft keeps its exact mode and thread across a versioned full-page update", async () => {
+  const threadId = "thr_12345678-1234-4123-8123-123456789abc";
+  const runId = "run_12345678-1234-4123-8123-123456789abc";
+  const successorRunId = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const instant = "2026-08-25T10:00:00.000Z";
+  const terminalEvent = async (ownedRunId) => {
+    const envelope = {
+      schemaVersion: "1",
+      id: `${ownedRunId}.1`,
+      seq: 1,
+      type: "run.completed",
+      threadId,
+      runId: ownedRunId,
+      createdAt: instant,
+      payload: {},
+      previousHash: "0".repeat(64),
+    };
+    const value = {
+      ...envelope,
+      hash: createHash("sha256").update(canonicalJson(envelope), "utf8").digest("hex"),
+    };
+    return await verifyAgentEvent(value, {
+      expectedRunId: ownedRunId,
+      expectedThreadId: threadId,
+      afterSeq: 0,
+      previousHash: "0".repeat(64),
+      digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+    });
+  };
+  const priorTerminalEvent = await terminalEvent(runId);
+  const successorTerminalEvent = await terminalEvent(successorRunId);
+  const thread = Object.freeze({
+    id: threadId,
+    title: "TeX and PDF work",
+    status: "idle",
+    revision: 3,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: runId,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "a".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([
+      Object.freeze({
+        id: "msg_1234567890abcdef",
+        role: "user",
+        content: "Create the first verified result",
+        runId,
+        createdAt: instant,
+        digest: "b".repeat(64),
+      }),
+      Object.freeze({
+        id: "msg_abcdef1234567890",
+        role: "assistant",
+        content: "The first verified result is complete.",
+        runId,
+        createdAt: instant,
+        digest: "c".repeat(64),
+      }),
+    ]),
+  });
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    search: Object.freeze({
+      enabled: true,
+      modes: Object.freeze(["web", "papers", "both"]),
+      maximumSources: 20,
+    }),
+    artifacts: Object.freeze({
+      kinds: Object.freeze(["plot", "table", "markdown", "sources"]),
+      schemaVersion: "1",
+    }),
+  });
+  const priorRun = Object.freeze({
+    id: runId,
+    threadId,
+    previousRunId: null,
+    status: "completed",
+    createdAt: instant,
+    startedAt: instant,
+    completedAt: instant,
+    cancelRequestedAt: null,
+    output: "The first verified result is complete.",
+    error: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      snapshotHash: "d".repeat(64),
+      runtimeRevision: 1,
+      contextDigest: "a".repeat(64),
+    }),
+    eventCursor: Object.freeze({
+      firstSeq: 1,
+      lastSeq: 1,
+      lastHash: priorTerminalEvent.hash,
+      prunedThroughSeq: 0,
+    }),
+  });
+  const successorRun = Object.freeze({
+    id: successorRunId,
+    threadId,
+    previousRunId: runId,
+    status: "starting",
+  });
+  const reads = { source: 0, restored: 0 };
+  let staleResumeCalls = 0;
+  let successfulResumeCalls = 0;
+  const makeAgent = (stage) => ({
+    async capabilities() { return capability; },
+    async listThreads() {
+      if (stage === "restored") throw new Error("injected sidebar list outage");
+      return { schemaVersion: "1", threads: [thread], nextBefore: null };
+    },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      reads[stage] += 1;
+      return { schemaVersion: "1", thread };
+    },
+    async runStatus(requestedRunId) {
+      assert.equal(requestedRunId, runId);
+      return { schemaVersion: "1", run: priorRun };
+    },
+    async resumeRun(previousRunId, text, options) {
+      assert.equal(previousRunId, runId);
+      assert.equal(text, "Continue this exact Agent thread after the deployment");
+      assert.deepEqual(options.search, { mode: "papers", limit: 6 });
+      if (stage === "source") {
+        staleResumeCalls += 1;
+        throw Object.assign(new Error("stale Agent release"), {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: NEXT_RELEASE,
+        });
+      }
+      successfulResumeCalls += 1;
+      return { schemaVersion: "1", run: successorRun };
+    },
+    async *streamRunEvents({ runId: requestedRunId }) {
+      const event = requestedRunId === runId
+        ? priorTerminalEvent
+        : requestedRunId === successorRunId ? successorTerminalEvent : null;
+      if (event === null) throw new Error("unexpected Agent run replay");
+      yield { event, cursor: { seq: 1, hash: event.hash } };
+    },
+  });
+  const sourceChat = idleAuthenticatedPwaClients().chat;
+  const store = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const source = updateControllerHarness({
+    environment,
+    now: () => 40_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: makeAgent("source"),
+    chat: sourceChat,
+    updateHandoffStore: store,
+  });
+  await source.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(source.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(source.document.getElementById("conversation-title").textContent, thread.title);
+  source.document.getElementById("search-toggle").dispatch("click");
+  source.document.getElementById("search-mode").value = "papers";
+  source.document.getElementById("search-limit").value = "6";
+  source.document.getElementById("message-input").value = "Continue this exact Agent thread after the deployment";
+  await source.app.submitMessage({ preventDefault() {} });
+  await store.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(staleResumeCalls, 1);
+  assert.equal(source.replacements.length, 1);
+  assert.equal([...store.records.values()][0].schemaVersion, "2",
+    "the v3 mode-aware payload remains inside the v2 cross-tab-compatible encrypted envelope");
+
+  const replayFailureStore = memoryUpdateHandoffStore([...store.records.entries()]);
+  const replayDelegate = makeAgent("restored");
+  let replayGetAttempts = 0;
+  const replayFailureAgent = {
+    ...replayDelegate,
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      replayGetAttempts += 1;
+      if (replayGetAttempts === 1) throw new Error("injected exact ledger read outage");
+      return await replayDelegate.getThread(requested);
+    },
+  };
+  const replayFailure = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 40_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: replayFailureAgent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: replayFailureStore,
+  });
+  await replayFailure.app.initialize();
+  assert.equal(replayFailure.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(replayFailure.document.getElementById("message-input").disabled, true);
+  assert.equal(replayFailure.document.getElementById("send-message").disabled, true);
+  assert.equal(replayFailureStore.records.size, 1,
+    "a failed exact replay keeps the encrypted handoff reloadable");
+  assert.match(replayFailure.window.location.href, /#lazying-update-handoff=/u);
+  const retryThread = [...replayFailure.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.ok(retryThread, "the exact owned retry target remains visible after list and ledger outages");
+  retryThread.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replayGetAttempts, 2);
+  assert.equal(replayFailure.document.getElementById("message-input").disabled, false);
+  assert.equal(
+    replayFailure.document.getElementById("message-input").value,
+    "Continue this exact Agent thread after the deployment",
+  );
+  assert.equal(replayFailureStore.records.size, 0,
+    "a verified exact retry consumes the retained recovery row and unlocks the composer");
+  reads.restored = 0;
+
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 40_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: makeAgent("restored"),
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(restored.document.getElementById("agent-mode").getAttribute("aria-pressed"), "true");
+  assert.equal(restored.document.getElementById("chat-mode").getAttribute("aria-pressed"), "false");
+  assert.equal(restored.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(
+    restored.document.getElementById("message-input").value,
+    "Continue this exact Agent thread after the deployment",
+  );
+  assert.equal(restored.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+  assert.equal(restored.document.getElementById("search-mode").value, "papers");
+  assert.equal(restored.document.getElementById("search-limit").value, "6");
+  assert.equal(reads.restored, 1, "the handoff reopens the owned Agent thread exactly once");
+  const restoredThreadButton = [...restored.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.equal(restoredThreadButton?.getAttribute("aria-current"), "true",
+    "the directly verified thread is restored even when the sidebar list request failed");
+  assert.equal(successfulResumeCalls, 0, "restoring the draft is read-only");
+  assert.equal(store.records.size, 0);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(successfulResumeCalls, 1, "the next Send resumes the replayed terminal Agent run");
+  assert.equal(restored.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("a v0.1.27 text-only v2 handoff is visible but fenced until its conversation is chosen", async () => {
+  const legacy = await legacyV2DraftHandoff();
+  const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+  let agentMutations = 0;
+  const agent = {
+    async capabilities() {
+      return {
+        schemaVersion: "1",
+        enabled: true,
+        agent: { kind: "aginti", label: "AgInTi Agent" },
+        model: { label: "LocalLLM" },
+        actions: { cancel: true, resume: true, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+      };
+    },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async createThread() { agentMutations += 1; throw new Error("legacy recovery must remain read-only"); },
+    async startRun() { agentMutations += 1; throw new Error("legacy recovery must remain read-only"); },
+    async *streamRunEvents() {},
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: legacy.href,
+    now: () => 50_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  assert.deepEqual(restored.historyReplacements, []);
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(restored.document.getElementById("message-input").value, "Continue the exact TeX and PDF task");
+  assert.equal(restored.document.getElementById("message-input").disabled, true);
+  assert.equal(restored.document.getElementById("send-message").disabled, true);
+  assert.match(restored.document.getElementById("toast").textContent, /choose its exact conversation/iu);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentMutations, 0);
+  restored.document.getElementById("new-thread").dispatch("click");
+  assert.equal(restored.document.getElementById("message-input").value, "Continue the exact TeX and PDF task");
+  assert.equal(restored.document.getElementById("message-input").disabled, true,
+    "the legacy prompt stays immutable until Search or No Search is explicit");
+  assert.equal(restored.document.getElementById("send-message").disabled, false);
+  assert.match(restored.document.getElementById("toast").textContent, /confirm No Search/iu);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentMutations, 0, "the first Run only confirms No Search");
+  assert.equal(restored.document.getElementById("message-input").disabled, false);
+  assert.equal(restored.document.getElementById("send-message").disabled, false);
+  assert.equal(store.records.size, 0);
+
+});
+
+test("an unsupported recovered Agent Search stays read-only until explicit No Search confirmation", async () => {
+  const threadId = "thr_22222222-2222-4222-8222-222222222222";
+  const runId = "run_22222222-2222-4222-8222-222222222222";
+  const instant = "2026-08-25T13:00:00.000Z";
+  const thread = Object.freeze({
+    id: threadId,
+    title: "Recovered Search ownership",
+    status: "idle",
+    revision: 1,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "2".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([]),
+  });
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: "Continue without silently changing this Search intent",
+    threadId,
+    search: { mode: "papers", limit: 6 },
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  const terminalEnvelope = {
+    schemaVersion: "1",
+    id: `${runId}.1`,
+    seq: 1,
+    type: "run.completed",
+    threadId,
+    runId,
+    createdAt: instant,
+    payload: {},
+    previousHash: "0".repeat(64),
+  };
+  const terminalEvent = await verifyAgentEvent({
+    ...terminalEnvelope,
+    hash: createHash("sha256").update(canonicalJson(terminalEnvelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId,
+    expectedThreadId: threadId,
+    afterSeq: 0,
+    previousHash: "0".repeat(64),
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+  let starts = 0;
+  let dispatchedOptions = null;
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    search: Object.freeze({
+      enabled: true,
+      modes: Object.freeze(["web", "papers", "both"]),
+      maximumSources: 3,
+    }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown", "sources"]), schemaVersion: "1" }),
+  });
+  const agent = {
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      return { schemaVersion: "1", thread };
+    },
+    async startRun(requestedThreadId, text, options) {
+      starts += 1;
+      assert.equal(requestedThreadId, threadId);
+      assert.equal(text, "Continue without silently changing this Search intent");
+      dispatchedOptions = options;
+      return { schemaVersion: "1", run: { id: runId, threadId, status: "starting" } };
+    },
+    async *streamRunEvents() {
+      yield { event: terminalEvent, cursor: { seq: 1, hash: terminalEvent.hash } };
+    },
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 60_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(restored.document.getElementById("message-input").value,
+    "Continue without silently changing this Search intent");
+  assert.equal(restored.document.getElementById("message-input").disabled, true);
+  assert.equal(restored.document.getElementById("send-message").disabled, false,
+    `Run remains available only as an explicit choice confirmation; toast=${restored.document.getElementById("toast").textContent}`);
+  assert.equal(restored.document.getElementById("search-toggle").getAttribute("aria-pressed"), "false");
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts, 0, "the confirmation press performs no Agent mutation");
+  assert.equal(restored.document.getElementById("message-input").disabled, false);
+  assert.equal(store.records.size, 0);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts, 1);
+  assert.equal(Object.hasOwn(dispatchedOptions, "search"), false,
+    "the second press dispatches only after No Search is explicit");
+});
+
+test("an unresolved Agent Search downgrade survives repeated same-account authentication", async () => {
+  let sessionValid = true;
+  let maximumSources = 20;
+  let mutations = 0;
+  const capability = () => Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    search: Object.freeze({
+      enabled: true,
+      modes: Object.freeze(["web", "papers", "both"]),
+      maximumSources,
+    }),
+    artifacts: Object.freeze({
+      kinds: Object.freeze(["plot", "table", "markdown", "sources"]),
+      schemaVersion: "1",
+    }),
+  });
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => sessionValid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "renewed-csrf-token-long-enough",
+    }),
+    agent: {
+      async capabilities() { return capability(); },
+      async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+      async createThread() { mutations += 1; throw new Error("confirmation must remain read-only"); },
+      async startRun() { mutations += 1; throw new Error("confirmation must remain read-only"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+  });
+  await harness.app.initialize();
+  const input = harness.document.getElementById("message-input");
+  harness.document.getElementById("search-toggle").dispatch("click");
+  harness.document.getElementById("search-mode").value = "papers";
+  harness.document.getElementById("search-limit").value = "6";
+  input.value = "Keep the unresolved Search choice across every sign-in";
+  maximumSources = 3;
+  sessionValid = false;
+
+  const signInAgain = async () => {
+    harness.window.dispatch("pageshow", { persisted: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    harness.document.getElementById("username").value = "account-user";
+    harness.document.getElementById("password").value = "browser-password";
+    harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(input.value, "Keep the unresolved Search choice across every sign-in");
+    assert.equal(input.disabled, true);
+    assert.equal(harness.document.getElementById("send-message").disabled, false);
+  };
+
+  await signInAgain();
+  harness.document.getElementById("chat-mode").dispatch("click");
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent",
+    "the unresolved Agent prompt cannot escape into Direct Chat");
+  await signInAgain();
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(mutations, 0, "the first Run after repeated auth only confirms No Search");
+  assert.equal(input.disabled, false);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+});
+
+test("a stale declared Agent head cannot unlock a follow-up when a verified successor exists", async () => {
+  const threadId = "thr_33333333-3333-4333-8333-333333333333";
+  const firstRunId = "run_33333333-3333-4333-8333-333333333333";
+  const successorRunId = "run_44444444-4444-4444-8444-444444444444";
+  const firstAt = "2026-08-25T14:00:00.000Z";
+  const successorAt = "2026-08-25T14:01:00.000Z";
+  const message = (id, role, runId, createdAt, digest) => Object.freeze({
+    id,
+    role,
+    content: role === "user" ? "Continue the chain" : "Verified result",
+    runId,
+    createdAt,
+    digest,
+  });
+  const thread = Object.freeze({
+    id: threadId,
+    title: "Hostile stale head",
+    status: "idle",
+    revision: 5,
+    createdAt: firstAt,
+    updatedAt: successorAt,
+    lastRunId: firstRunId,
+    authority: Object.freeze({
+      kind: "aginti", mapped: true, runtimeRevision: 1,
+      contextDigest: "e".repeat(64), lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([
+      message("msg_stale_head_00000001", "user", firstRunId, firstAt, "1".repeat(64)),
+      message("msg_stale_head_00000002", "assistant", firstRunId, firstAt, "2".repeat(64)),
+      message("msg_stale_head_00000003", "user", successorRunId, successorAt, "3".repeat(64)),
+      message("msg_stale_head_00000004", "assistant", successorRunId, successorAt, "4".repeat(64)),
+    ]),
+  });
+  const runs = new Map([
+    [firstRunId, completedAgentRun({
+      id: firstRunId, threadId, createdAt: firstAt, lastHash: "5".repeat(64),
+    })],
+    [successorRunId, completedAgentRun({
+      id: successorRunId, threadId, previousRunId: firstRunId,
+      createdAt: successorAt, lastHash: "6".repeat(64),
+    })],
+  ]);
+  const capability = Object.freeze({
+    schemaVersion: "1", enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: "Never resume a stale declared head",
+    threadId,
+    search: null,
+    createdAt: 61_000,
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let mutations = 0;
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 61_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { schemaVersion: "1", thread }; },
+      async runStatus(runId) { return { schemaVersion: "1", run: runs.get(runId) }; },
+      async resumeRun() { mutations += 1; throw new Error("stale head must never mutate"); },
+      async *streamRunEvents() { throw new Error("invalid ancestry must fail before streaming"); },
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("message-input").value, "Never resume a stale declared head");
+  assert.equal(restored.document.getElementById("message-input").disabled, true);
+  assert.equal(restored.document.getElementById("send-message").disabled, true);
+  assert.match(restored.document.getElementById("toast").textContent, /history could not be restored safely/iu);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(mutations, 0);
+  assert.equal(store.records.size, 1, "the prompt stays protected while ancestry is rejected");
+});
+
+test("a running-to-terminal Agent read race refreshes the thread before follow-up unlock", async () => {
+  const threadId = "thr_55555555-5555-4555-8555-555555555555";
+  const runId = "run_55555555-5555-4555-8555-555555555555";
+  const instant = "2026-08-25T15:00:00.000Z";
+  const userMessage = Object.freeze({
+    id: "msg_refresh_race_0000001", role: "user", content: "Finish atomically",
+    runId, createdAt: instant, digest: "7".repeat(64),
+  });
+  const assistantMessage = Object.freeze({
+    id: "msg_refresh_race_0000002", role: "assistant", content: "Finished",
+    runId, createdAt: instant, digest: "8".repeat(64),
+  });
+  const baseThread = {
+    id: threadId,
+    title: "Completion read race",
+    revision: 2,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: runId,
+    authority: Object.freeze({
+      kind: "aginti", mapped: true, runtimeRevision: 1,
+      contextDigest: "e".repeat(64), lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+  };
+  const runningThread = Object.freeze({ ...baseThread, status: "running", messages: Object.freeze([userMessage]) });
+  const settledThread = Object.freeze({
+    ...baseThread, status: "idle", revision: 3,
+    messages: Object.freeze([userMessage, assistantMessage]),
+  });
+  const terminalEnvelope = {
+    schemaVersion: "1", id: `${runId}.1`, seq: 1, type: "run.completed",
+    threadId, runId, createdAt: instant, payload: {}, previousHash: "0".repeat(64),
+  };
+  const terminalEvent = await verifyAgentEvent({
+    ...terminalEnvelope,
+    hash: createHash("sha256").update(canonicalJson(terminalEnvelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId, expectedThreadId: threadId, afterSeq: 0,
+    previousHash: "0".repeat(64),
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+  const run = completedAgentRun({
+    id: runId, threadId, createdAt: instant, lastHash: terminalEvent.hash, output: "Finished",
+  });
+  const capability = Object.freeze({
+    schemaVersion: "1", enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: "Continue only after the settled head is re-read",
+    threadId,
+    search: null,
+    createdAt: 62_000,
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let threadReads = 0;
+  let statusReads = 0;
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 62_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [runningThread], nextBefore: null }; },
+      async getThread() {
+        threadReads += 1;
+        return { schemaVersion: "1", thread: threadReads === 1 ? runningThread : settledThread };
+      },
+      async runStatus() { statusReads += 1; return { schemaVersion: "1", run }; },
+      async *streamRunEvents() {
+        yield { event: terminalEvent, cursor: { seq: 1, hash: terminalEvent.hash } };
+      },
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await restored.app.initialize();
+  assert.equal(threadReads, 2, "the terminal status triggers one bounded authoritative thread refresh");
+  assert.equal(statusReads, 2, "the refreshed thread/run pair is revalidated together");
+  assert.equal(restored.document.getElementById("conversation-title").textContent, settledThread.title);
+  assert.equal(restored.document.getElementById("message-input").value,
+    "Continue only after the settled head is re-read");
+  assert.equal(restored.document.getElementById("message-input").disabled, false);
+  assert.equal(restored.document.getElementById("send-message").disabled, false);
+  assert.equal(store.records.size, 0);
+
+  const regressedThread = Object.freeze({
+    ...baseThread,
+    status: "idle",
+    revision: 3,
+    lastRunId: null,
+    messages: Object.freeze([]),
+  });
+  const hostileHandoff = await currentV3AgentDraftHandoff({
+    draft: "Never accept a regressed refreshed head",
+    threadId,
+    search: null,
+    createdAt: 63_000,
+  });
+  const hostileStore = memoryUpdateHandoffStore([hostileHandoff.storageEntry]);
+  let hostileThreadReads = 0;
+  const hostile = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: hostileHandoff.href,
+    now: () => 63_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [runningThread], nextBefore: null }; },
+      async getThread() {
+        hostileThreadReads += 1;
+        return { schemaVersion: "1", thread: hostileThreadReads === 1 ? runningThread : regressedThread };
+      },
+      async runStatus() { return { schemaVersion: "1", run }; },
+      async *streamRunEvents() { throw new Error("a regressed head must fail before streaming"); },
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: hostileStore,
+  });
+  await hostile.app.initialize();
+  assert.equal(hostileThreadReads, 2);
+  assert.equal(hostile.document.getElementById("message-input").disabled, true);
+  assert.equal(hostile.document.getElementById("send-message").disabled, true);
+  assert.equal(hostileStore.records.size, 1);
+});
+
+test("an exact v3 Agent recovery keeps a conflicting composer until two explicit Resume actions", async () => {
+  const threadId = "thr_55555555-5555-4555-8555-555555555555";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Exact protected Agent destination",
+  });
+  const protectedDraft = "Continue the exact protected Agent work";
+  const conflict = "Safari restored a different Agent draft";
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: protectedDraft,
+    threadId,
+    search: null,
+    createdAt: 64_000,
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let exactReads = 0;
+  let mutations = 0;
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability(); },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      exactReads += 1;
+      return { schemaVersion: "1", thread };
+    },
+    async createThread() { mutations += 1; throw new Error("recovery must not create a thread"); },
+    async startRun() { mutations += 1; throw new Error("recovery must not start a run"); },
+    async resumeRun() { mutations += 1; throw new Error("recovery must not resume a run"); },
+    async *streamRunEvents() {},
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 64_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  const input = restored.document.getElementById("message-input");
+  input.value = conflict;
+  await restored.app.initialize();
+
+  assert.equal(exactReads, 1, "the exact owned thread is verified even though its protected draft conflicts");
+  assert.equal(restored.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(input.value, conflict);
+  assert.equal(input.disabled, true);
+  assert.equal(store.records.size, 1, "verification alone cannot consume a draft that is not installed");
+  assert.match(restored.window.location.href, /#lazying-update-handoff=/u);
+
+  restored.document.getElementById("resume-run").dispatch("click");
+  await settlePwaActions();
+  assert.equal(input.value, conflict, "the first Resume only records explicit replacement confirmation");
+  assert.equal(store.records.size, 1);
+  assert.equal(mutations, 0);
+  assert.match(restored.document.getElementById("toast").textContent, /again to replace/iu);
+
+  restored.document.getElementById("resume-run").dispatch("click");
+  await settlePwaActions(4);
+  assert.equal(input.value, protectedDraft, "the protected record, never the conflicting DOM value, wins confirmation");
+  assert.equal(input.disabled, false);
+  assert.equal(store.records.size, 0, "the row is consumed only after owned-thread verification and installation");
+  assert.doesNotMatch(restored.window.location.href, /#lazying-update-handoff=/u);
+  assert.equal(mutations, 0);
+});
+
+test("an exact v3 Agent capability retry cannot capture a conflicting composer as the recovery draft", async () => {
+  const threadId = "thr_66666666-6666-4666-8666-666666666666";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Capability-recovered Agent destination",
+    instant: "2026-08-25T15:10:00.000Z",
+  });
+  const protectedDraft = "Keep this exact Agent draft through capability recovery";
+  const conflict = "Safari restored stale conflicting text";
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: protectedDraft,
+    threadId,
+    search: null,
+    createdAt: 65_000,
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let capabilityAvailable = false;
+  let capabilityAttempts = 0;
+  let exactReads = 0;
+  let mutations = 0;
+  const agent = {
+    async capabilities() {
+      capabilityAttempts += 1;
+      if (!capabilityAvailable) throw new Error("injected three-probe Agent outage");
+      return enabledAgentPwaCapability();
+    },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      exactReads += 1;
+      return { schemaVersion: "1", thread };
+    },
+    async createThread() { mutations += 1; throw new Error("recovery must not create a thread"); },
+    async startRun() { mutations += 1; throw new Error("recovery must not start a run"); },
+    async resumeRun() { mutations += 1; throw new Error("recovery must not resume a run"); },
+    async *streamRunEvents() {},
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 65_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+    wait: async () => {},
+  });
+  const input = restored.document.getElementById("message-input");
+  input.value = conflict;
+  await restored.app.initialize();
+  assert.equal(capabilityAttempts, 3);
+  assert.equal(exactReads, 0);
+  assert.equal(input.value, conflict);
+  assert.equal(store.records.size, 1);
+
+  capabilityAvailable = true;
+  restored.document.getElementById("resume-run").dispatch("click");
+  await settlePwaActions();
+  assert.equal(capabilityAttempts, 3, "the first Resume only confirms replacement and performs no probe");
+  assert.equal(input.value, conflict);
+  assert.equal(store.records.size, 1);
+  assert.match(restored.document.getElementById("toast").textContent, /again to replace/iu);
+
+  restored.document.getElementById("resume-run").dispatch("click");
+  await settlePwaActions(5);
+  assert.equal(capabilityAttempts, 4, "the confirmed second Resume retries capability in-page");
+  assert.equal(exactReads, 1, "capability recovery verifies the exact owned thread before unlocking");
+  assert.equal(input.value, protectedDraft, "the encrypted record remains authoritative across capability retry");
+  assert.equal(input.disabled, false);
+  assert.equal(store.records.size, 0);
+  assert.equal(mutations, 0);
+});
+
+test("an exact protected Agent read release mismatch migrates its row without a mutation", async (t) => {
+  const capability = enabledAgentPwaCapability();
+  const threadId = "thr_77777777-7777-4777-8777-777777777777";
+  const runId = "run_77777777-7777-4777-8777-777777777777";
+  const instant = "2026-08-25T15:20:00.000Z";
+  const baseThread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Release-fenced Agent destination",
+    instant,
+  });
+  const persistedThread = Object.freeze({
+    ...baseThread,
+    revision: 2,
+    lastRunId: runId,
+    messages: Object.freeze([
+      Object.freeze({
+        id: "msg_release_fence_0001",
+        role: "user",
+        content: "Create a protected result",
+        runId,
+        createdAt: instant,
+        digest: "1".repeat(64),
+      }),
+      Object.freeze({
+        id: "msg_release_fence_0002",
+        role: "assistant",
+        content: "Protected result",
+        runId,
+        createdAt: instant,
+        digest: "2".repeat(64),
+      }),
+    ]),
+  });
+  const mismatch = () => Object.assign(new Error("exact Agent read requires successor shell"), {
+    code: "client_release_mismatch",
+    status: 409,
+    retryable: false,
+    serverRelease: LATER_RELEASE,
+  });
+
+  for (const failingRead of ["getThread", "runStatus"]) {
+    await t.test(failingRead, async () => {
+      const handoff = await currentV3AgentDraftHandoff({
+        draft: `Preserve this draft across ${failingRead} release fencing`,
+        threadId,
+        search: null,
+        createdAt: 66_000,
+      });
+      const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+      let mutations = 0;
+      let getThreadCalls = 0;
+      let runStatusCalls = 0;
+      const restored = updateControllerHarness({
+        waiting: false,
+        environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+        releaseId: NEXT_RELEASE,
+        locationHref: handoff.href,
+        now: () => 66_001,
+        restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+        agent: {
+          async capabilities() { return capability; },
+          async listThreads() { return { schemaVersion: "1", threads: [persistedThread], nextBefore: null }; },
+          async getThread(requested) {
+            assert.equal(requested, threadId);
+            getThreadCalls += 1;
+            if (failingRead === "getThread") throw mismatch();
+            return { schemaVersion: "1", thread: persistedThread };
+          },
+          async runStatus(requested) {
+            assert.equal(requested, runId);
+            runStatusCalls += 1;
+            throw mismatch();
+          },
+          async createThread() { mutations += 1; throw new Error("must not create while migrating"); },
+          async startRun() { mutations += 1; throw new Error("must not run while migrating"); },
+          async resumeRun() { mutations += 1; throw new Error("must not resume while migrating"); },
+          async *streamRunEvents() { throw new Error("release fencing must happen before event replay"); },
+        },
+        chat: idleAuthenticatedPwaClients().chat,
+        updateHandoffStore: store,
+      });
+      await restored.app.initialize();
+
+      assert.equal(getThreadCalls, 1);
+      assert.equal(runStatusCalls, failingRead === "runStatus" ? 1 : 0);
+      assert.equal(mutations, 0);
+      assert.equal(restored.replacements.length, 1);
+      assert.match(
+        restored.replacements[0],
+        new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+      );
+      assert.equal(store.records.size, 1, "the migrated encrypted row remains available to the successor shell");
+      const migrated = [...store.records.values()][0];
+      assert.equal(migrated.sourceRelease, NEXT_RELEASE);
+      assert.equal(migrated.targetRelease, LATER_RELEASE);
+    });
+  }
+});
+
+test("a legacy v2 existing-Agent choice survives same-account expiry before Search confirmation", async () => {
+  const threadId = "thr_88888888-8888-4888-8888-888888888888";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Chosen legacy Agent destination",
+    instant: "2026-08-25T15:30:00.000Z",
+  });
+  const protectedDraft = "Keep this legacy prompt on the explicitly chosen Agent thread";
+  const legacy = await legacyV2DraftHandoff({ draft: protectedDraft, createdAt: 67_000 });
+  const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+  let sessionValid = true;
+  let exactReads = 0;
+  let mutations = 0;
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: legacy.href,
+    now: () => 67_001,
+    restore: async () => sessionValid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "second-csrf-token-long-enough",
+    }),
+    agent: {
+      async capabilities() { return enabledAgentPwaCapability(); },
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread(requested) {
+        assert.equal(requested, threadId);
+        exactReads += 1;
+        return { schemaVersion: "1", thread };
+      },
+      async createThread() { mutations += 1; throw new Error("legacy replay must never create a replacement thread"); },
+      async startRun() { mutations += 1; throw new Error("first confirmation must remain read-only"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await harness.app.initialize();
+  const chosenThread = [...harness.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.ok(chosenThread);
+  chosenThread.dispatch("click");
+  await settlePwaActions();
+  assert.equal(exactReads, 1);
+  assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(harness.document.getElementById("message-input").value, protectedDraft);
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+  assert.equal(store.records.size, 1, "the row remains until Search or No Search is confirmed");
+
+  sessionValid = false;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await settlePwaActions();
+  harness.document.getElementById("username").value = "account-user";
+  harness.document.getElementById("password").value = "browser-password";
+  harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+  await settlePwaActions(4);
+
+  assert.equal(exactReads, 2, "same-account sign-in replays the previously chosen exact Agent thread");
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(harness.document.getElementById("message-input").value, protectedDraft);
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+  const replayedThread = [...harness.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.equal(replayedThread?.getAttribute("aria-current"), "true");
+  assert.equal(store.records.size, 1);
+  assert.equal(mutations, 0);
+
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(mutations, 0, "the first Run after sign-in only confirms No Search");
+  assert.equal(harness.document.getElementById("message-input").disabled, false);
+  assert.equal(store.records.size, 0);
+});
+
+test("an installed exact v3 Agent handoff detects composer or Search divergence before replay consumption", async (t) => {
+  const threadId = "thr_99999999-9999-4999-8999-999999999999";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Replay-raced protected Agent destination",
+    instant: "2026-08-25T15:40:00.000Z",
+  });
+  const protectedDraft = "Keep the exact installed prompt until replay settles";
+
+  for (const divergence of ["textarea", "search"]) {
+    await t.test(divergence, async () => {
+      const handoff = await currentV3AgentDraftHandoff({
+        draft: protectedDraft,
+        threadId,
+        search: { mode: "papers", limit: 6 },
+        createdAt: 68_000,
+      });
+      const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+      let beginRead;
+      const readStarted = new Promise((resolve) => { beginRead = resolve; });
+      let finishRead;
+      const readResult = new Promise((resolve) => { finishRead = resolve; });
+      let exactReads = 0;
+      let mutations = 0;
+      const restored = updateControllerHarness({
+        waiting: false,
+        environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+        releaseId: NEXT_RELEASE,
+        locationHref: handoff.href,
+        now: () => 68_001,
+        restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+        agent: {
+          async capabilities() { return enabledAgentPwaCapability(); },
+          async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+          async getThread(requested) {
+            assert.equal(requested, threadId);
+            exactReads += 1;
+            if (exactReads === 1) {
+              beginRead();
+              return await readResult;
+            }
+            return { schemaVersion: "1", thread };
+          },
+          async createThread() { mutations += 1; throw new Error("replay recovery must not create"); },
+          async startRun() { mutations += 1; throw new Error("replay recovery must not run"); },
+          async resumeRun() { mutations += 1; throw new Error("replay recovery must not resume"); },
+          async *streamRunEvents() {},
+        },
+        chat: idleAuthenticatedPwaClients().chat,
+        updateHandoffStore: store,
+      });
+      const input = restored.document.getElementById("message-input");
+      const searchMode = restored.document.getElementById("search-mode");
+      const searchLimit = restored.document.getElementById("search-limit");
+      const initialization = restored.app.initialize();
+      await readStarted;
+      assert.equal(input.value, protectedDraft, "the protected record is installed before exact ledger replay settles");
+      assert.equal(restored.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+      assert.equal(searchMode.value, "papers");
+      assert.equal(searchLimit.value, "6");
+
+      if (divergence === "textarea") input.value = "Programmatic textarea divergence during replay";
+      else {
+        searchMode.value = "web";
+        searchLimit.value = "2";
+      }
+      finishRead({ schemaVersion: "1", thread });
+      await initialization;
+
+      assert.equal(store.records.size, 1, `${divergence} divergence must invalidate installation before consumption`);
+      assert.match(restored.window.location.href, /#lazying-update-handoff=/u);
+      assert.equal(input.disabled, true);
+      if (divergence === "textarea") assert.equal(input.value, "Programmatic textarea divergence during replay");
+      else {
+        assert.equal(input.value, protectedDraft);
+        assert.equal(searchMode.value, "web");
+        assert.equal(searchLimit.value, "2");
+      }
+
+      restored.document.getElementById("resume-run").dispatch("click");
+      await settlePwaActions();
+      assert.equal(store.records.size, 1, "the first Resume only confirms replacement of the diverged browser state");
+      if (divergence === "textarea") assert.equal(input.value, "Programmatic textarea divergence during replay");
+      else {
+        assert.equal(searchMode.value, "web");
+        assert.equal(searchLimit.value, "2");
+      }
+      assert.match(restored.document.getElementById("toast").textContent, /again to replace/iu);
+
+      restored.document.getElementById("resume-run").dispatch("click");
+      await settlePwaActions(4);
+      assert.equal(input.value, protectedDraft);
+      assert.equal(restored.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+      assert.equal(searchMode.value, "papers");
+      assert.equal(searchLimit.value, "6");
+      assert.equal(input.disabled, false);
+      assert.equal(store.records.size, 0);
+      assert.ok(exactReads >= 2, "the confirmed restore re-verifies exact thread ownership before consumption");
+      assert.equal(mutations, 0);
+    });
+  }
+});
+
+test("a legacy v2 mode-switch list mismatch migrates one encrypted row and performs one versioned replace", async () => {
+  const protectedDraft = "Carry this ambiguous legacy prompt through the required shell update";
+  const legacy = await legacyV2DraftHandoff({ draft: protectedDraft, createdAt: 69_000 });
+  const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+  let listCalls = 0;
+  let mutations = 0;
+  const mismatch = () => Object.assign(new Error("Agent thread list requires successor shell"), {
+    code: "client_release_mismatch",
+    status: 409,
+    retryable: false,
+    serverRelease: LATER_RELEASE,
+  });
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: legacy.href,
+    now: () => 69_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return enabledAgentPwaCapability(); },
+      async listThreads() {
+        listCalls += 1;
+        if (listCalls > 1) throw mismatch();
+        return { schemaVersion: "1", threads: [], nextBefore: null };
+      },
+      async createThread() { mutations += 1; throw new Error("legacy migration must not create"); },
+      async startRun() { mutations += 1; throw new Error("legacy migration must not run"); },
+      async resumeRun() { mutations += 1; throw new Error("legacy migration must not resume"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await harness.app.initialize();
+  assert.equal(listCalls, 1);
+  assert.equal(harness.document.getElementById("message-input").value, protectedDraft);
+  assert.equal(store.records.size, 1);
+
+  harness.document.getElementById("chat-mode").dispatch("click");
+  await settlePwaActions();
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "chat");
+  harness.document.getElementById("agent-mode").dispatch("click");
+  await settlePwaActions(4);
+
+  assert.equal(listCalls, 2, "the release fence is raised by the Agent list read after mode switching");
+  assert.equal(mutations, 0);
+  assert.equal(harness.replacements.length, 1, "one mismatch produces exactly one full versioned navigation");
+  assert.match(
+    harness.replacements[0],
+    new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+  );
+  assert.equal(store.records.size, 1);
+  const migrated = [...store.records.values()][0];
+  assert.equal(migrated.sourceRelease, NEXT_RELEASE);
+  assert.equal(migrated.targetRelease, LATER_RELEASE);
+  assert.equal(store.calls.discard, 0);
+});
+
+test("an uninstalled conflicting handoff refuses release-mismatch navigation and retains its original row", async () => {
+  const threadId = "thr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const protectedDraft = "Do not reload until this exact protected prompt owns the composer";
+  const conflict = "A conflicting browser-only composer must remain visible";
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: protectedDraft,
+    threadId,
+    search: null,
+    createdAt: 70_000,
+  });
+  const originalEnvelope = structuredClone(handoff.storageEntry[1]);
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let mutations = 0;
+  const mismatch = Object.assign(new Error("Agent list requires successor shell"), {
+    code: "client_release_mismatch",
+    status: 409,
+    retryable: false,
+    serverRelease: LATER_RELEASE,
+  });
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 70_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return enabledAgentPwaCapability(); },
+      async listThreads() { throw mismatch; },
+      async createThread() { mutations += 1; throw new Error("unsafe mismatch path must not create"); },
+      async startRun() { mutations += 1; throw new Error("unsafe mismatch path must not run"); },
+      async resumeRun() { mutations += 1; throw new Error("unsafe mismatch path must not resume"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  const input = harness.document.getElementById("message-input");
+  input.value = conflict;
+  await harness.app.initialize();
+
+  assert.equal(input.value, conflict);
+  assert.equal(input.disabled, true);
+  assert.equal(harness.replacements.length, 0, "navigation would lose the conflicting browser-only value");
+  assert.equal(store.records.size, 1);
+  const retained = [...store.records.values()][0];
+  assert.equal(retained.sourceRelease, originalEnvelope.sourceRelease);
+  assert.equal(retained.targetRelease, originalEnvelope.targetRelease);
+  assert.deepEqual(retained.ciphertext, originalEnvelope.ciphertext);
+  assert.equal(store.calls.discard, 0);
+  assert.match(harness.window.location.href, /#lazying-update-handoff=/u);
+  assert.equal(mutations, 0);
+});
+
+test("same-account reauthentication preserves an uninstalled conflict and a pending legacy Search choice", async (t) => {
+  await t.test("uninstalled exact-v3 conflict", async () => {
+    const threadId = "thr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const thread = emptyAgentPwaThread({
+      id: threadId,
+      title: "Same-account conflicting recovery",
+      instant: "2026-08-25T15:50:00.000Z",
+    });
+    const protectedDraft = "Protected exact prompt must still await replacement consent";
+    const conflict = "Keep this divergent browser composer through sign-in";
+    const handoff = await currentV3AgentDraftHandoff({
+      draft: protectedDraft,
+      threadId,
+      search: null,
+      createdAt: 71_000,
+    });
+    const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+    let sessionValid = true;
+    let exactReads = 0;
+    let mutations = 0;
+    const harness = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      locationHref: handoff.href,
+      now: () => 71_001,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => ({
+        authenticated: true,
+        username: "account-user",
+        csrfToken: "second-csrf-token-long-enough",
+      }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread(requested) {
+          assert.equal(requested, threadId);
+          exactReads += 1;
+          return { schemaVersion: "1", thread };
+        },
+        async createThread() { mutations += 1; throw new Error("reauth recovery must not create"); },
+        async startRun() { mutations += 1; throw new Error("reauth recovery must not run"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: store,
+    });
+    const input = harness.document.getElementById("message-input");
+    input.value = conflict;
+    await harness.app.initialize();
+    assert.equal(exactReads, 1);
+    assert.equal(input.value, conflict);
+    assert.equal(store.records.size, 1);
+
+    sessionValid = false;
+    harness.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    harness.document.getElementById("username").value = "account-user";
+    harness.document.getElementById("password").value = "browser-password";
+    harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+    await settlePwaActions(4);
+
+    assert.equal(exactReads, 2);
+    assert.equal(input.value, conflict, "same-account reauth cannot silently install over an unconfirmed conflict");
+    assert.equal(input.disabled, true);
+    assert.equal(store.records.size, 1);
+    assert.match(harness.window.location.href, /#lazying-update-handoff=/u);
+    assert.equal(mutations, 0);
+  });
+
+  await t.test("legacy chosen Search", async () => {
+    const threadId = "thr_cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const thread = emptyAgentPwaThread({
+      id: threadId,
+      title: "Legacy Search destination",
+      instant: "2026-08-25T16:00:00.000Z",
+    });
+    const protectedDraft = "Preserve this explicitly chosen legacy papers Search";
+    const legacy = await legacyV2DraftHandoff({ draft: protectedDraft, createdAt: 72_000 });
+    const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+    let sessionValid = true;
+    let exactReads = 0;
+    let mutations = 0;
+    const harness = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      locationHref: legacy.href,
+      now: () => 72_001,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => ({
+        authenticated: true,
+        username: "account-user",
+        csrfToken: "second-csrf-token-long-enough",
+      }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread(requested) {
+          assert.equal(requested, threadId);
+          exactReads += 1;
+          return { schemaVersion: "1", thread };
+        },
+        async createThread() { mutations += 1; throw new Error("chosen Search recovery must not create"); },
+        async startRun() { mutations += 1; throw new Error("Search confirmation must not run"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: store,
+    });
+    await harness.app.initialize();
+    const chosenThread = [...harness.document.getElementById("thread-list").children]
+      .find((entry) => entry.dataset.threadId === threadId);
+    assert.ok(chosenThread);
+    chosenThread.dispatch("click");
+    await settlePwaActions();
+    assert.equal(exactReads, 1);
+    assert.equal(store.records.size, 1, "the chosen destination still awaits an explicit Search choice");
+    harness.document.getElementById("search-mode").value = "papers";
+    harness.document.getElementById("search-limit").value = "6";
+    harness.document.getElementById("search-toggle").dispatch("click");
+    assert.equal(harness.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+    assert.equal(store.records.size, 0, "choosing Search resolves the legacy handoff before authentication expires");
+
+    sessionValid = false;
+    harness.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    harness.document.getElementById("username").value = "account-user";
+    harness.document.getElementById("password").value = "browser-password";
+    harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+    await settlePwaActions(4);
+
+    assert.equal(exactReads, 2);
+    assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
+    assert.equal(harness.document.getElementById("message-input").value, protectedDraft);
+    assert.equal(harness.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+    assert.equal(harness.document.getElementById("search-mode").value, "papers");
+    assert.equal(harness.document.getElementById("search-limit").value, "6");
+    assert.equal(harness.document.getElementById("message-input").disabled, false);
+    assert.equal(harness.document.getElementById("send-message").disabled, false);
+    assert.equal(store.records.size, 0);
+    assert.equal(mutations, 0);
+  });
+});
+
+test("memory-only same-account Agent and Chat recovery survive post-login release fencing", async (t) => {
+  await t.test("Agent exact-thread hydration while login is busy", async () => {
+    const threadId = "thr_dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const thread = emptyAgentPwaThread({
+      id: threadId,
+      title: "Memory-only Agent release recovery",
+      instant: "2026-08-25T16:10:00.000Z",
+    });
+    const draft = "Carry this memory-only Agent draft to the required release";
+    const store = memoryUpdateHandoffStore();
+    let sessionValid = true;
+    let fenceAfterLogin = false;
+    let exactReads = 0;
+    let mutations = 0;
+    const mismatch = () => Object.assign(new Error("exact Agent hydration requires successor shell"), {
+      code: "client_release_mismatch",
+      status: 409,
+      retryable: false,
+      serverRelease: LATER_RELEASE,
+    });
+    const source = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      now: () => 73_000,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => ({
+        authenticated: true,
+        username: "account-user",
+        csrfToken: "second-csrf-token-long-enough",
+      }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread(requested) {
+          assert.equal(requested, threadId);
+          exactReads += 1;
+          if (fenceAfterLogin) throw mismatch();
+          return { schemaVersion: "1", thread };
+        },
+        async createThread() { mutations += 1; throw new Error("release recovery must not create"); },
+        async startRun() { mutations += 1; throw new Error("release recovery must not run"); },
+        async resumeRun() { mutations += 1; throw new Error("release recovery must not resume"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: store,
+    });
+    await source.app.initialize();
+    assert.equal(exactReads, 1);
+    source.document.getElementById("search-toggle").dispatch("click");
+    source.document.getElementById("search-mode").value = "papers";
+    source.document.getElementById("search-limit").value = "6";
+    source.document.getElementById("message-input").value = draft;
+    sessionValid = false;
+    source.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    fenceAfterLogin = true;
+    source.document.getElementById("username").value = "account-user";
+    source.document.getElementById("password").value = "browser-password";
+    await source.app.login({ preventDefault() {} });
+
+    assert.equal(exactReads, 2);
+    assert.equal(mutations, 0);
+    assert.equal(source.replacements.length, 1,
+      `the busy login path defers one safe navigation until staging finishes; toast=${source.document.getElementById("toast").textContent}; mode=${source.document.getElementById("workspace").dataset.mode}; records=${store.records.size}`);
+    assert.match(
+      source.replacements[0],
+      new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+    );
+    assert.equal(store.records.size, 1);
+
+    fenceAfterLogin = false;
+    const successor = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+      releaseId: LATER_RELEASE,
+      locationHref: source.replacements[0],
+      now: () => 73_001,
+      restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "third-csrf-token-long-enough" }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread() { return { schemaVersion: "1", thread }; },
+        async createThread() { mutations += 1; throw new Error("successor restore must not create"); },
+        async startRun() { mutations += 1; throw new Error("successor restore must not run"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: store,
+    });
+    await successor.app.initialize();
+    assert.equal(successor.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(successor.document.getElementById("conversation-title").textContent, thread.title);
+    assert.equal(successor.document.getElementById("message-input").value, draft);
+    assert.equal(successor.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+    assert.equal(successor.document.getElementById("search-mode").value, "papers");
+    assert.equal(successor.document.getElementById("search-limit").value, "6");
+    assert.equal(store.records.size, 0);
+    assert.equal(mutations, 0);
+  });
+
+  await t.test("Chat list hydration while login is busy", async () => {
+    const draft = "Carry this memory-only Direct Chat draft to the required release";
+    const store = memoryUpdateHandoffStore();
+    const idle = idleAuthenticatedPwaClients();
+    let sessionValid = true;
+    let fenceAfterLogin = false;
+    let listCalls = 0;
+    const mismatch = () => Object.assign(new Error("Chat hydration requires successor shell"), {
+      code: "client_release_mismatch",
+      status: 409,
+      retryable: false,
+      serverRelease: LATER_RELEASE,
+    });
+    const chat = {
+      ...idle.chat,
+      async listThreads() {
+        listCalls += 1;
+        if (fenceAfterLogin) throw mismatch();
+        return { threads: [] };
+      },
+    };
+    const source = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      now: () => 74_000,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => ({
+        authenticated: true,
+        username: "account-user",
+        csrfToken: "second-csrf-token-long-enough",
+      }),
+      agent: idle.agent,
+      chat,
+      updateHandoffStore: store,
+    });
+    await source.app.initialize();
+    assert.equal(source.document.getElementById("workspace").dataset.mode, "chat");
+    source.document.getElementById("message-input").value = draft;
+    sessionValid = false;
+    source.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    fenceAfterLogin = true;
+    source.document.getElementById("username").value = "account-user";
+    source.document.getElementById("password").value = "browser-password";
+    await source.app.login({ preventDefault() {} });
+
+    assert.ok(listCalls >= 2);
+    assert.deepEqual(idle.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+    assert.equal(source.replacements.length, 1,
+      `Chat recovery must stage after login hydration fencing; toast=${source.document.getElementById("toast").textContent}; mode=${source.document.getElementById("workspace").dataset.mode}; records=${store.records.size}`);
+    assert.match(
+      source.replacements[0],
+      new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+    );
+    assert.equal(store.records.size, 1);
+
+    const successorIdle = idleAuthenticatedPwaClients();
+    const successor = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+      releaseId: LATER_RELEASE,
+      locationHref: source.replacements[0],
+      now: () => 74_001,
+      restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "third-csrf-token-long-enough" }),
+      agent: successorIdle.agent,
+      chat: successorIdle.chat,
+      updateHandoffStore: store,
+    });
+    await successor.app.initialize();
+    assert.equal(successor.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(successor.document.getElementById("message-input").value, draft);
+    assert.equal(successor.document.getElementById("message-input").disabled, false);
+    assert.equal(store.records.size, 0);
+    assert.deepEqual(successorIdle.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  });
+
+  await t.test("Chat list mismatch after login clears", async () => {
+    const draft = "Keep this Chat draft when the post-login mode switch discovers a newer shell";
+    const store = memoryUpdateHandoffStore();
+    const idle = idleAuthenticatedPwaClients();
+    let sessionValid = true;
+    let fenceList = false;
+    let listCalls = 0;
+    const chat = {
+      ...idle.chat,
+      async listThreads() {
+        listCalls += 1;
+        if (fenceList) {
+          throw Object.assign(new Error("post-login Chat list requires successor shell"), {
+            code: "client_release_mismatch",
+            status: 409,
+            retryable: false,
+            serverRelease: LATER_RELEASE,
+          });
+        }
+        return { threads: [] };
+      },
+    };
+    const source = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      now: () => 74_500,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => ({
+        authenticated: true,
+        username: "account-user",
+        csrfToken: "second-csrf-token-long-enough",
+      }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+        async *streamRunEvents() {},
+      },
+      chat,
+      updateHandoffStore: store,
+    });
+    await source.app.initialize();
+    source.document.getElementById("chat-mode").dispatch("click");
+    await settlePwaActions();
+    source.document.getElementById("message-input").value = draft;
+    sessionValid = false;
+    source.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    source.document.getElementById("username").value = "account-user";
+    source.document.getElementById("password").value = "browser-password";
+    source.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+    await settlePwaActions(4);
+    assert.equal(source.replacements.length, 0);
+    assert.equal(source.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(source.document.getElementById("message-input").value, draft);
+
+    fenceList = true;
+    source.document.getElementById("agent-mode").dispatch("click");
+    await settlePwaActions();
+    source.document.getElementById("chat-mode").dispatch("click");
+    await settlePwaUntil(() => source.replacements.length > 0);
+    assert.ok(listCalls >= 3);
+    assert.equal(source.replacements.length, 1, "a mismatch after login clears stages and navigates exactly once");
+    assert.match(
+      source.replacements[0],
+      new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+    );
+    assert.equal(store.records.size, 1);
+    assert.deepEqual(idle.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  });
+});
+
+test("a signed-out retained encrypted row crosses login release fencing through an opaque authenticated chain hop", async () => {
+  const threadId = "thr_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Opaque signed-out successor recovery",
+    instant: "2026-08-25T16:20:00.000Z",
+  });
+  const draft = "Decrypt this protected prompt only after successor authentication";
+  const handoff = await currentV3AgentDraftHandoff({
+    draft,
+    threadId,
+    search: null,
+    createdAt: 75_000,
+  });
+  const originalEnvelope = structuredClone(handoff.storageEntry[1]);
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let sessionValid = true;
+  let loginCalls = 0;
+  let mutations = 0;
+  const unavailableAgent = idleAuthenticatedPwaClients().agent;
+  const source = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 75_001,
+    restore: async () => sessionValid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => {
+      loginCalls += 1;
+      throw Object.assign(new Error("login requires successor shell"), {
+        code: "client_release_mismatch",
+        status: 409,
+        retryable: false,
+        serverRelease: LATER_RELEASE,
+      });
+    },
+    agent: unavailableAgent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await source.app.initialize();
+  assert.equal(store.calls.take, 1, "the authenticated destination opened and durably re-retained the exact row");
+  assert.equal(store.records.size, 1);
+  assert.equal(source.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(source.document.getElementById("message-input").value, draft);
+  assert.equal(source.document.getElementById("message-input").disabled, true);
+  sessionValid = false;
+  source.window.dispatch("pageshow", { persisted: true });
+  await settlePwaActions();
+  assert.equal(source.document.getElementById("login-view").hidden, false);
+  source.document.getElementById("username").value = "account-user";
+  source.document.getElementById("password").value = "browser-password";
+  source.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+  await settlePwaActions(4);
+
+  assert.equal(loginCalls, 1);
+  assert.equal(store.calls.take, 1, "the signed-out stale shell never decrypts the retained row a second time");
+  assert.equal(store.records.size, 1);
+  assert.deepEqual([...store.records.values()][0].ciphertext, originalEnvelope.ciphertext);
+  assert.equal(source.replacements.length, 1);
+  assert.match(
+    source.replacements[0],
+    new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=[a-f0-9]{64}\\.[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{43}$`, "u"),
+  );
+
+  const successor = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+    releaseId: LATER_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 75_002,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "successor-csrf-token-long-enough" }),
+    agent: {
+      async capabilities() { return enabledAgentPwaCapability(); },
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { schemaVersion: "1", thread }; },
+      async createThread() { mutations += 1; throw new Error("opaque restore must not create"); },
+      async startRun() { mutations += 1; throw new Error("opaque restore must not run"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await successor.app.initialize();
+  assert.equal(successor.document.getElementById("message-input").value, draft);
+  assert.equal(successor.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(store.records.size, 0);
+  assert.equal(mutations, 0);
+});
+
+test("a signed-out Search-on Agent row ignores auth control reset but still rejects unrelated browser work", async (t) => {
+  const threadId = "thr_12121212-1212-4212-8212-121212121212";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Signed-out Search recovery",
+    instant: "2026-08-25T16:25:00.000Z",
+  });
+  const draft = "Carry this exact Search-on Agent prompt through the signed-out update";
+  const search = Object.freeze({ mode: "papers", limit: 6 });
+
+  const retainedSearchSource = async ({ createdAt }) => {
+    const handoff = await currentV3AgentDraftHandoff({ draft, threadId, search, createdAt });
+    const originalEnvelope = structuredClone(handoff.storageEntry[1]);
+    const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+    let sessionValid = true;
+    let loginCalls = 0;
+    let exactReads = 0;
+    let mutations = 0;
+    const source = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      locationHref: handoff.href,
+      now: () => createdAt + 1,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => {
+        loginCalls += 1;
+        throw Object.assign(new Error("login requires the Search-capable successor shell"), {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: LATER_RELEASE,
+        });
+      },
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread() {
+          exactReads += 1;
+          throw new Error("retain the installed record until its exact ledger can be verified");
+        },
+        async createThread() { mutations += 1; throw new Error("recovery must not create"); },
+        async startRun() { mutations += 1; throw new Error("recovery must not run"); },
+        async resumeRun() { mutations += 1; throw new Error("recovery must not resume"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: store,
+    });
+    await source.app.initialize();
+    assert.equal(exactReads, 1);
+    assert.equal(store.calls.take, 1);
+    assert.equal(store.records.size, 1);
+    assert.equal(source.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(source.document.getElementById("message-input").value, draft);
+    assert.equal(source.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+    assert.equal(source.document.getElementById("search-mode").value, "papers");
+    assert.equal(source.document.getElementById("search-limit").value, "6");
+
+    sessionValid = false;
+    source.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    assert.equal(source.document.getElementById("login-view").hidden, false);
+    // Authentication reset intentionally owns Chat/Search-off internally. Make
+    // the hidden control state observable without introducing a user change.
+    source.app.setMode("chat");
+    assert.equal(source.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(source.document.getElementById("search-toggle").getAttribute("aria-pressed"), "false");
+    return {
+      source,
+      store,
+      originalEnvelope,
+      get loginCalls() { return loginCalls; },
+      get mutations() { return mutations; },
+    };
+  };
+
+  await t.test("the reset Chat/Search-off controls do not compete with the encrypted Agent owner", async () => {
+    const recovery = await retainedSearchSource({ createdAt: 75_100 });
+    recovery.source.document.getElementById("username").value = "account-user";
+    recovery.source.document.getElementById("password").value = "browser-password";
+    await recovery.source.app.login({ preventDefault() {} });
+
+    assert.equal(recovery.loginCalls, 1);
+    assert.equal(recovery.mutations, 0);
+    assert.equal(recovery.store.calls.take, 1, "the stale signed-out shell never decrypts twice");
+    assert.equal(recovery.store.records.size, 1);
+    assert.deepEqual([...recovery.store.records.values()][0].ciphertext, recovery.originalEnvelope.ciphertext);
+    assert.equal(recovery.source.replacements.length, 1, "the opaque row chains exactly once");
+    assert.match(
+      recovery.source.replacements[0],
+      new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=[a-f0-9]{64}\\.[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{43}$`, "u"),
+    );
+
+    let successorMutations = 0;
+    const successor = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+      releaseId: LATER_RELEASE,
+      locationHref: recovery.source.replacements[0],
+      now: () => 75_102,
+      restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "successor-csrf-token-long-enough" }),
+      agent: {
+        async capabilities() { return enabledAgentPwaCapability(); },
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread() { return { schemaVersion: "1", thread }; },
+        async createThread() { successorMutations += 1; throw new Error("successor restore must not create"); },
+        async startRun() { successorMutations += 1; throw new Error("successor restore must not run"); },
+        async resumeRun() { successorMutations += 1; throw new Error("successor restore must not resume"); },
+        async *streamRunEvents() {},
+      },
+      chat: idleAuthenticatedPwaClients().chat,
+      updateHandoffStore: recovery.store,
+    });
+    await successor.app.initialize();
+    assert.equal(successor.document.getElementById("workspace").dataset.mode, "agent");
+    assert.equal(successor.document.getElementById("conversation-title").textContent, thread.title);
+    assert.equal(successor.document.getElementById("message-input").value, draft);
+    assert.equal(successor.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+    assert.equal(successor.document.getElementById("search-mode").value, "papers");
+    assert.equal(successor.document.getElementById("search-limit").value, "6");
+    assert.equal(successor.replacements.length, 0);
+    assert.equal(recovery.store.calls.take, 2);
+    assert.equal(recovery.store.records.size, 0);
+    assert.equal(successorMutations, 0);
+  });
+
+  await t.test("a genuinely different signed-out draft still blocks the opaque hop", async () => {
+    const recovery = await retainedSearchSource({ createdAt: 75_200 });
+    const conflict = "Safari restored a genuinely different unsent prompt";
+    recovery.source.document.getElementById("message-input").value = conflict;
+    recovery.source.document.getElementById("username").value = "account-user";
+    recovery.source.document.getElementById("password").value = "browser-password";
+    await recovery.source.app.login({ preventDefault() {} });
+
+    assert.equal(recovery.loginCalls, 1);
+    assert.equal(recovery.mutations, 0);
+    assert.equal(recovery.source.replacements.length, 0);
+    assert.equal(recovery.source.document.getElementById("message-input").value, conflict);
+    assert.equal(recovery.store.calls.take, 1);
+    assert.equal(recovery.store.records.size, 1);
+    assert.deepEqual([...recovery.store.records.values()][0].ciphertext, recovery.originalEnvelope.ciphertext);
+    assert.match(recovery.source.document.getElementById("login-error").textContent, /different browser-restored draft/u);
+  });
+
+  await t.test("an unrelated selected image still blocks the opaque hop", async () => {
+    const chatThreadId = "chat_signed_out_image_conflict_xxxx";
+    const chatDraft = "Keep this exact retained Chat prompt separate from a restored image";
+    const handoff = await currentV3AgentDraftHandoff({
+      draft: chatDraft,
+      threadId: chatThreadId,
+      search: null,
+      mode: "chat",
+      createdAt: 75_300,
+    });
+    const originalEnvelope = structuredClone(handoff.storageEntry[1]);
+    const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+    const idle = idleAuthenticatedPwaClients();
+    const chatThread = Object.freeze({
+      threadId: chatThreadId,
+      title: "Signed-out image conflict",
+      modelAlias: "local-default",
+      revision: 0,
+      ledgerHash: null,
+      messageCount: 0,
+      ledgerBytes: 0,
+      currentGenerationId: null,
+      createdAt: "2026-08-25T16:26:00.000Z",
+      updatedAt: "2026-08-25T16:26:00.000Z",
+    });
+    const bytes = canonicalPngHeader();
+    let sessionValid = true;
+    let loginCalls = 0;
+    const source = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      locationHref: handoff.href,
+      now: () => 75_301,
+      restore: async () => sessionValid
+        ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+        : { authenticated: false },
+      login: async () => {
+        loginCalls += 1;
+        throw Object.assign(new Error("login requires the successor shell"), {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: LATER_RELEASE,
+        });
+      },
+      agent: idle.agent,
+      chat: {
+        ...idle.chat,
+        async listThreads() { return { threads: [chatThread] }; },
+        async getThread() { throw new Error("retain the installed Chat record for explicit verification"); },
+      },
+      updateHandoffStore: store,
+      async canonicalizeImage() {
+        return Object.freeze({
+          attachmentId: "image_signed_out_unrelated_0001",
+          mediaType: "image/png",
+          byteLength: bytes.byteLength,
+          width: 64,
+          height: 64,
+          bytes,
+          previewBlob: new Blob([bytes], { type: "image/png" }),
+        });
+      },
+      createObjectUrl: () => "blob:signed-out-unrelated-image",
+      revokeObjectUrl() {},
+    });
+    await source.app.initialize();
+    assert.equal(source.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(source.document.getElementById("message-input").value, chatDraft);
+    assert.equal(store.records.size, 1);
+
+    const imageInput = source.document.getElementById("image-input");
+    imageInput.files = [{ name: "unrelated.png" }];
+    imageInput.dispatch("change");
+    await settlePwaActions(4);
+    assert.equal(source.document.getElementById("image-preview").hidden, false);
+    sessionValid = false;
+    source.window.dispatch("pageshow", { persisted: true });
+    await settlePwaActions();
+    assert.equal(source.document.getElementById("login-view").hidden, false);
+    assert.equal(source.document.getElementById("image-preview").hidden, false);
+    source.document.getElementById("username").value = "account-user";
+    source.document.getElementById("password").value = "browser-password";
+    await source.app.login({ preventDefault() {} });
+
+    assert.equal(loginCalls, 1);
+    assert.equal(source.replacements.length, 0);
+    assert.equal(store.calls.take, 1);
+    assert.equal(store.records.size, 1);
+    assert.deepEqual([...store.records.values()][0].ciphertext, originalEnvelope.ciphertext);
+    assert.equal(source.document.getElementById("image-preview").hidden, false);
+    assert.deepEqual(idle.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  });
+});
+
+test("a pre-showApp capability release fence exposes Resume for a conflicting protected composer", async () => {
+  const threadId = "thr_ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const protectedDraft = "Keep the protected prompt behind an explicit replacement action";
+  const conflict = "Safari restored different browser-only work before hydration";
+  const handoff = await currentV3AgentDraftHandoff({
+    draft: protectedDraft,
+    threadId,
+    search: null,
+    createdAt: 76_000,
+  });
+  const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+  let mutations = 0;
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: handoff.href,
+    now: () => 76_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() {
+        throw Object.assign(new Error("capability endpoint requires successor shell"), {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: LATER_RELEASE,
+        });
+      },
+      async listThreads() { throw new Error("capability fence must happen before Agent listing"); },
+      async createThread() { mutations += 1; throw new Error("capability recovery must not create"); },
+      async startRun() { mutations += 1; throw new Error("capability recovery must not run"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  const input = harness.document.getElementById("message-input");
+  input.value = conflict;
+  await harness.app.initialize();
+
+  assert.equal(harness.replacements.length, 0);
+  assert.equal(store.records.size, 1);
+  assert.equal(input.value, conflict);
+  assert.equal(harness.document.getElementById("login-view").hidden, true);
+  assert.equal(harness.document.getElementById("app-view").hidden, false, "authenticated protected work must expose its recovery UI");
+  assert.equal(harness.document.getElementById("resume-run").hidden, false);
+  assert.equal(harness.document.getElementById("resume-run").disabled, false);
+  harness.document.getElementById("resume-run").dispatch("click");
+  await settlePwaActions();
+  assert.equal(input.value, conflict);
+  assert.equal(store.records.size, 1);
+  assert.match(harness.document.getElementById("toast").textContent, /again to replace/iu);
+  assert.equal(mutations, 0);
+});
+
+test("New conversation consumes one exact Search-on Agent recovery without a detach loop", async (t) => {
+  const threadId = "thr_10101010-1010-4010-8010-101010101010";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Search-on detach source",
+    instant: "2026-08-25T16:30:00.000Z",
+  });
+  const protectedDraft = "Detach this exact Search-on prompt to one new Agent conversation";
+
+  for (const variant of ["replay-failure", "stale-install"]) {
+    await t.test(variant, async () => {
+      const handoff = await currentV3AgentDraftHandoff({
+        draft: protectedDraft,
+        threadId,
+        search: { mode: "papers", limit: 6 },
+        createdAt: 77_000,
+      });
+      const store = memoryUpdateHandoffStore([handoff.storageEntry]);
+      let mutations = 0;
+      let beginRead;
+      const readStarted = new Promise((resolve) => { beginRead = resolve; });
+      let finishRead;
+      const readResult = new Promise((resolve) => { finishRead = resolve; });
+      const restored = updateControllerHarness({
+        waiting: false,
+        environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+        releaseId: NEXT_RELEASE,
+        locationHref: handoff.href,
+        now: () => 77_001,
+        restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+        agent: {
+          async capabilities() { return enabledAgentPwaCapability(); },
+          async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+          async getThread() {
+            if (variant === "replay-failure") throw new Error("injected exact replay outage");
+            beginRead();
+            return await readResult;
+          },
+          async createThread() { mutations += 1; throw new Error("detach must not create eagerly"); },
+          async startRun() { mutations += 1; throw new Error("detach must not run"); },
+          async resumeRun() { mutations += 1; throw new Error("detach must not resume"); },
+          async *streamRunEvents() {},
+        },
+        chat: idleAuthenticatedPwaClients().chat,
+        updateHandoffStore: store,
+      });
+      let initialization;
+      if (variant === "stale-install") {
+        initialization = restored.app.initialize();
+        await readStarted;
+        restored.document.getElementById("search-mode").value = "web";
+        restored.document.getElementById("search-limit").value = "2";
+        finishRead({ schemaVersion: "1", thread });
+        await initialization;
+      } else await restored.app.initialize();
+
+      assert.equal(store.records.size, 1);
+      assert.equal(restored.document.getElementById("message-input").value, protectedDraft);
+      const newConversation = restored.document.getElementById("new-thread");
+      assert.equal(newConversation.disabled, false);
+      newConversation.dispatch("click");
+      await settlePwaActions();
+      if (variant === "stale-install") {
+        assert.equal(store.records.size, 1, "the first detach click only confirms replacement of stale Search state");
+        assert.equal(restored.document.getElementById("search-mode").value, "web");
+        assert.match(restored.document.getElementById("toast").textContent, /again to replace/iu);
+        newConversation.dispatch("click");
+        await settlePwaActions();
+      }
+
+      assert.equal(store.records.size, 0);
+      assert.equal(store.calls.discard, 1, "the retained row is consumed exactly once");
+      assert.doesNotMatch(restored.window.location.href, /#lazying-update-handoff=/u);
+      assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+      assert.equal(restored.document.getElementById("conversation-title").textContent, "New conversation");
+      assert.equal(restored.document.getElementById("message-input").value, protectedDraft);
+      assert.equal(restored.document.getElementById("message-input").disabled, false);
+      assert.equal(restored.document.getElementById("search-toggle").getAttribute("aria-pressed"), "false");
+      assert.equal(mutations, 0);
+
+      newConversation.dispatch("click");
+      await settlePwaActions();
+      assert.equal(store.calls.discard, 1, "a second ordinary New conversation cannot re-enter detach recovery");
+      assert.equal(store.records.size, 0);
+      assert.equal(mutations, 0);
+    });
+  }
+});
+
+test("a conflicting browser-restored composer needs a second explicit action before protected replacement", async () => {
+  const staged = await stageEncryptedTextUpdateHandoff();
+  for (const action of ["resume-run", "new-thread"]) {
+    const store = memoryUpdateHandoffStore([staged.record]);
+    const clients = idleAuthenticatedPwaClients();
+    const restored = updateControllerHarness({
+      waiting: false,
+      environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+      releaseId: NEXT_RELEASE,
+      locationHref: staged.href,
+      now: () => 20_001,
+      restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+      agent: clients.agent,
+      chat: clients.chat,
+      updateHandoffStore: store,
+    });
+    const input = restored.document.getElementById("message-input");
+    input.value = "Safari restored a different local draft";
+    await restored.app.initialize();
+    assert.equal(input.value, "Safari restored a different local draft");
+    assert.equal(input.disabled, true);
+    restored.document.getElementById(action).dispatch("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(input.value, "Safari restored a different local draft",
+      "the first action only asks for explicit replacement confirmation");
+    assert.equal(store.records.size, 1);
+    assert.match(restored.document.getElementById("toast").textContent, /again to replace/iu);
+    restored.document.getElementById(action).dispatch("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(input.value, "private handoff draft");
+    assert.equal(input.disabled, false);
+    assert.equal(store.records.size, 0);
+    assert.deepEqual(clients.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  }
+});
+
+test("an ambiguous v2 draft remains assignable to Chat when Agent capability is unavailable", async () => {
+  const legacy = await legacyV2DraftHandoff({ draft: "Preserve this one-time rollout draft" });
+  const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+  let capabilityAttempts = 0;
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: legacy.href,
+    now: () => 50_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { capabilityAttempts += 1; throw new Error("injected Agent outage"); },
+      async listThreads() { throw new Error("Agent list must not run"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+    wait: async () => {},
+  });
+  await restored.app.initialize();
+  assert.equal(capabilityAttempts, 3);
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(restored.document.getElementById("message-input").value, "Preserve this one-time rollout draft");
+  assert.equal(restored.document.getElementById("message-input").disabled, true);
+  assert.equal(store.records.size, 1);
+  restored.document.getElementById("new-thread").dispatch("click");
+  assert.equal(restored.document.getElementById("message-input").disabled, false);
+  assert.equal(restored.document.getElementById("send-message").disabled, false);
+  assert.equal(store.records.size, 0);
+});
+
+test("a transient post-update Agent capability outage retains the v3 draft and disables dispatch", async () => {
+  const capability = {
+    schemaVersion: "1",
+    enabled: true,
+    agent: { kind: "aginti", label: "AgInTi Agent" },
+    model: { label: "LocalLLM" },
+    actions: { cancel: true, resume: true, retry: false },
+    attachments: { enabled: false },
+    artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
+  };
+  let sourceMutations = 0;
+  const sourceAgent = {
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async createThread() { sourceMutations += 1; throw new Error("must not create during update staging"); },
+    async startRun() { sourceMutations += 1; throw new Error("must not run during update staging"); },
+    async *streamRunEvents() {},
+  };
+  const store = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const source = updateControllerHarness({
+    environment,
+    now: () => 60_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: sourceAgent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await source.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "Keep this Agent draft through a capability outage";
+  source.document.getElementById("apply-update").dispatch("click");
+  await store.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(source.replacements.length, 1);
+
+  let capabilityAttempts = 0;
+  let restoredMutations = 0;
+  const unavailableAgent = {
+    async capabilities() { capabilityAttempts += 1; throw new Error("injected Agent capability outage"); },
+    async listThreads() { throw new Error("Agent list must stay fenced"); },
+    async createThread() { restoredMutations += 1; throw new Error("must not create while fenced"); },
+    async startRun() { restoredMutations += 1; throw new Error("must not run while fenced"); },
+    async *streamRunEvents() {},
+  };
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 60_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: unavailableAgent,
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+    wait: async () => {},
+  });
+  assert.equal(restored.historyReplacements.length, 0, "the key remains reload-safe before authenticated decryption");
+  await restored.app.initialize();
+  assert.equal(capabilityAttempts, 3);
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(
+    restored.document.getElementById("message-input").value,
+    "Keep this Agent draft through a capability outage",
+  );
+  assert.equal(restored.document.getElementById("message-input").disabled, true,
+    "the visible draft cannot diverge from the retained encrypted recovery row");
+  assert.equal(restored.document.getElementById("send-message").disabled, true);
+  assert.match(restored.document.getElementById("toast").textContent, /remains protected/iu);
+  assert.equal(store.records.size, 1, "the encrypted row is restored until a later verified Agent startup consumes it");
+  assert.equal(restored.historyReplacements.length, 0);
+  assert.match(restored.window.location.href, /#lazying-update-handoff=/u);
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(restoredMutations, 0);
+  assert.equal(sourceMutations, 0);
+});
+
+test("a pre-consumption release mismatch migrates the encrypted handoff to the exact newer release", async () => {
+  const staged = await stageEncryptedTextUpdateHandoff();
+  const store = memoryUpdateHandoffStore([staged.record]);
+  const idle = idleAuthenticatedPwaClients();
+  const stale = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: staged.href,
+    now: () => 20_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      ...idle.agent,
+      async capabilities() {
+        throw Object.assign(new Error("stale handoff destination release"), {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: LATER_RELEASE,
+        });
+      },
+    },
+    chat: idle.chat,
+    updateHandoffStore: store,
+  });
+  await stale.app.initialize();
+  assert.equal(stale.replacements.length, 1);
+  assert.match(
+    stale.replacements[0],
+    new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+  );
+  const migrated = [...store.records.values()][0];
+  assert.equal(migrated.sourceRelease, NEXT_RELEASE);
+  assert.equal(migrated.targetRelease, LATER_RELEASE);
+
+  const recovered = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+    releaseId: LATER_RELEASE,
+    locationHref: stale.replacements[0],
+    now: () => 20_002,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idle.agent,
+    chat: idle.chat,
+    updateHandoffStore: store,
+  });
+  await recovered.app.initialize();
+  assert.equal(recovered.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(recovered.document.getElementById("message-input").value, "private handoff draft");
+  assert.equal(recovered.document.getElementById("message-input").disabled, false);
+  assert.equal(store.records.size, 0);
+});
+
+test("a session-restore release fence carries an unread handoff to the successor before account-bound decryption", async () => {
+  const staged = await stageEncryptedTextUpdateHandoff();
+  const store = memoryUpdateHandoffStore([staged.record]);
+  const stale = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: staged.href,
+    now: () => 20_001,
+    restore: async () => {
+      throw Object.assign(new Error("session endpoint requires the successor shell"), {
+        code: "client_release_mismatch",
+        status: 409,
+        retryable: false,
+        serverRelease: LATER_RELEASE,
+      });
+    },
+    updateHandoffStore: store,
+  });
+  await stale.app.initialize();
+  assert.equal(store.calls.take, 0, "no plaintext is opened before the account session is authenticated");
+  assert.equal(store.records.size, 1);
+  assert.equal(stale.replacements.length, 1);
+  assert.match(
+    stale.replacements[0],
+    new RegExp(`^https://llm\\.lazying\\.art/\\?v=${LATER_RELEASE}#lazying-update-handoff=`, "u"),
+  );
+
+  const idle = idleAuthenticatedPwaClients();
+  const recovered = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+    releaseId: LATER_RELEASE,
+    locationHref: stale.replacements[0],
+    now: () => 20_002,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idle.agent,
+    chat: idle.chat,
+    updateHandoffStore: store,
+  });
+  await recovered.app.initialize();
+  assert.equal(recovered.document.getElementById("message-input").value, "private handoff draft");
+  assert.equal(recovered.document.getElementById("message-input").disabled, false);
+  assert.equal(store.records.size, 0);
+});
+
+test("an authentic encrypted handoff for another target release is rejected without a chained-hop proof", async () => {
+  const staged = await stageEncryptedTextUpdateHandoff();
+  const store = memoryUpdateHandoffStore([staged.record]);
+  const idle = idleAuthenticatedPwaClients();
+  const foreignTarget = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: LATER_RELEASE }),
+    releaseId: LATER_RELEASE,
+    locationHref: staged.href.replace(`?v=${NEXT_RELEASE}`, `?v=${LATER_RELEASE}`),
+    now: () => 20_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idle.agent,
+    chat: idle.chat,
+    updateHandoffStore: store,
+  });
+  await foreignTarget.app.initialize();
+  assert.equal(foreignTarget.document.getElementById("message-input").value, "");
+  assert.equal(store.records.size, 0);
+  assert.doesNotMatch(foreignTarget.window.location.href, /#lazying-update-handoff=/u);
+});
+
+test("a protected handoff read outage fences the composer and remains reload-retryable", async () => {
+  const staged = await stageEncryptedTextUpdateHandoff();
+  const baseStore = memoryUpdateHandoffStore([staged.record]);
+  const failingStore = {
+    ...baseStore,
+    async take() {
+      baseStore.calls.take += 1;
+      throw new Error("injected IndexedDB read outage");
+    },
+  };
+  const idle = idleAuthenticatedPwaClients();
+  const blocked = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: staged.href,
+    now: () => 20_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idle.agent,
+    chat: idle.chat,
+    updateHandoffStore: failingStore,
+  });
+  await blocked.app.initialize();
+  assert.equal(baseStore.records.size, 1);
+  assert.match(blocked.window.location.href, /#lazying-update-handoff=/u);
+  assert.equal(blocked.document.getElementById("message-input").disabled, true);
+  assert.equal(blocked.document.getElementById("send-message").disabled, true);
+  assert.equal(blocked.document.getElementById("new-thread").disabled, true);
+
+  const retried = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: blocked.window.location.href,
+    now: () => 20_002,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: idle.agent,
+    chat: idle.chat,
+    updateHandoffStore: baseStore,
+  });
+  await retried.app.initialize();
+  assert.equal(retried.document.getElementById("message-input").value, "private handoff draft");
+  assert.equal(retried.document.getElementById("message-input").disabled, false);
+  assert.equal(baseStore.records.size, 0);
 });
 
 test("an explicit release mismatch hard-refreshes by exact version and restores two unsent images from encrypted handoff", async () => {
@@ -2610,6 +5273,421 @@ test("a PWA resume with a revoked session preserves the unsent draft and returns
   assert.match(harness.document.getElementById("login-error").textContent, /session expired/u);
 });
 
+test("same-account reauthentication replays the exact Agent thread before the preserved draft can send", async () => {
+  const instant = "2026-08-25T11:00:00.000Z";
+  const threadId = "thr_99999999-9999-4999-8999-999999999999";
+  const thread = Object.freeze({
+    id: threadId,
+    title: "Long TeX and PDF session",
+    status: "idle",
+    revision: 1,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "d".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([]),
+  });
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    search: Object.freeze({
+      enabled: true,
+      modes: Object.freeze(["web", "papers", "both"]),
+      maximumSources: 20,
+    }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown", "sources"]), schemaVersion: "1" }),
+  });
+  let valid = true;
+  let exactReads = 0;
+  let agentStarts = 0;
+  const agent = {
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      exactReads += 1;
+      return { schemaVersion: "1", thread };
+    },
+    async startRun(requestedThreadId, text, options) {
+      assert.equal(requestedThreadId, threadId);
+      assert.equal(text, "Continue this exact Agent session after sign-in");
+      assert.deepEqual(options.search, { mode: "papers", limit: 6 });
+      agentStarts += 1;
+      throw new Error("stop after proving Agent routing");
+    },
+    async *streamRunEvents() {},
+  };
+  const chatClients = idleAuthenticatedPwaClients();
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => valid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "second-csrf-token-long-enough",
+    }),
+    agent,
+    chat: chatClients.chat,
+  });
+  await harness.app.initialize();
+  assert.equal(exactReads, 1);
+  harness.document.getElementById("search-toggle").dispatch("click");
+  harness.document.getElementById("search-mode").value = "papers";
+  harness.document.getElementById("search-limit").value = "6";
+  harness.document.getElementById("message-input").value = "Continue this exact Agent session after sign-in";
+  valid = false;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("login-view").hidden, false);
+  assert.equal(
+    harness.document.getElementById("message-input").value,
+    "Continue this exact Agent session after sign-in",
+  );
+
+  harness.document.getElementById("username").value = "account-user";
+  harness.document.getElementById("password").value = "browser-password";
+  harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exactReads, 2, "the same owned Agent thread is verified after the new browser session is issued");
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+  assert.equal(harness.document.getElementById("search-toggle").getAttribute("aria-pressed"), "true");
+  assert.equal(harness.document.getElementById("search-mode").value, "papers");
+  assert.equal(harness.document.getElementById("search-limit").value, "6");
+  assert.equal(
+    harness.document.getElementById("message-input").value,
+    "Continue this exact Agent session after sign-in",
+  );
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentStarts, 1);
+  assert.equal(chatClients.mutationCalls.startRun, 0, "the preserved Agent prompt never falls through to Direct Chat");
+});
+
+test("session revalidation waits for an in-flight Agent thread create before revoking the browser session", async () => {
+  const instant = "2026-08-25T11:30:00.000Z";
+  const thread = Object.freeze({
+    id: "thr_77777777-7777-4777-8777-777777777777",
+    title: "Pending exact Agent create",
+    status: "idle",
+    revision: 1,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "f".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([]),
+  });
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  let restoreCalls = 0;
+  let resolveRevalidation;
+  const revalidation = new Promise((resolve) => { resolveRevalidation = resolve; });
+  let resolveCreate;
+  const createResponse = new Promise((resolve) => { resolveCreate = resolve; });
+  let createCalls = 0;
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => {
+      restoreCalls += 1;
+      if (restoreCalls === 1) {
+        return { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" };
+      }
+      if (restoreCalls === 2) return await revalidation;
+      return { authenticated: false };
+    },
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+      async createThread() { createCalls += 1; return await createResponse; },
+      async startRun() { throw Object.assign(new Error("stop after create ownership is confirmed"), { retryable: false }); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+  });
+  await harness.app.initialize();
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(restoreCalls, 2, "the foreground session read is now in flight");
+  harness.document.getElementById("message-input").value = "Create exactly one Agent thread despite session revocation";
+  const submission = harness.app.submitMessage({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(createCalls, 1);
+  resolveRevalidation({ authenticated: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("login-view").hidden, true,
+    "the revoked read cannot erase an unresolved idempotent create ticket");
+  resolveCreate({ schemaVersion: "1", thread });
+  await submission;
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(createCalls, 1);
+  assert.equal(restoreCalls, 3, "the deferred revalidation runs after the mutation reconciles");
+  assert.equal(harness.document.getElementById("login-view").hidden, false);
+  assert.equal(
+    harness.document.getElementById("message-input").value,
+    "Create exactly one Agent thread despite session revocation",
+  );
+});
+
+test("same-account reauthentication preserves an unresolved legacy-v2 destination fence", async () => {
+  const legacy = await legacyV2DraftHandoff({ draft: "Keep the ambiguous rollout prompt owned" });
+  const store = memoryUpdateHandoffStore([legacy.storageEntry]);
+  let valid = true;
+  let agentMutations = 0;
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: legacy.href,
+    now: () => 80_001,
+    restore: async () => valid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "second-csrf-token-long-enough",
+    }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+      async createThread() { agentMutations += 1; throw new Error("legacy recovery must remain read-only"); },
+      async startRun() { agentMutations += 1; throw new Error("legacy recovery must remain read-only"); },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+  });
+  await harness.app.initialize();
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  valid = false;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.document.getElementById("username").value = "account-user";
+  harness.document.getElementById("password").value = "browser-password";
+  harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("message-input").value, "Keep the ambiguous rollout prompt owned");
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(harness.document.getElementById("send-message").disabled, true);
+  assert.equal(store.records.size, 1);
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentMutations, 0);
+  harness.document.getElementById("new-thread").dispatch("click");
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentMutations, 0, "reauthentication does not bypass the explicit No Search confirmation");
+  assert.equal(harness.document.getElementById("message-input").disabled, false);
+  assert.equal(store.records.size, 0);
+});
+
+test("a memory-only Agent auth draft retries capability verification in-page", async () => {
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  let sessionValid = true;
+  let capabilityAvailable = true;
+  let capabilityAttempts = 0;
+  const agent = {
+    async capabilities() {
+      capabilityAttempts += 1;
+      if (!capabilityAvailable) throw new Error("injected Agent capability outage");
+      return capability;
+    },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async *streamRunEvents() {},
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => sessionValid
+      ? { authenticated: true, username: "account-user", csrfToken: "first-csrf-token-long-enough" }
+      : { authenticated: false },
+    login: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "second-csrf-token-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    wait: async () => {},
+  });
+  await harness.app.initialize();
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  harness.document.getElementById("message-input").value = "Preserve this new Agent thread draft in memory";
+  sessionValid = false;
+  capabilityAvailable = false;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.document.getElementById("username").value = "account-user";
+  harness.document.getElementById("password").value = "browser-password";
+  harness.document.getElementById("login-form").dispatch("submit", { preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(capabilityAttempts, 4, "startup succeeded before the three bounded post-login probes failed");
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("message-input").value, "Preserve this new Agent thread draft in memory");
+  assert.equal(harness.document.getElementById("send-message").disabled, true);
+  assert.equal(harness.document.getElementById("resume-run").hidden, false);
+  assert.match(harness.document.getElementById("toast").textContent, /Resume retries Agent verification/iu);
+  capabilityAvailable = true;
+  harness.document.getElementById("resume-run").dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(capabilityAttempts, 5);
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(harness.document.getElementById("message-input").value, "Preserve this new Agent thread draft in memory");
+  assert.equal(harness.document.getElementById("message-input").disabled, false);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+});
+
+test("an exact Agent update stays ownership-fenced when durable re-retention and replay both fail", async () => {
+  const instant = "2026-08-25T12:00:00.000Z";
+  const threadId = "thr_88888888-8888-4888-8888-888888888888";
+  const thread = Object.freeze({
+    id: threadId,
+    title: "Exact locally owned Agent thread",
+    status: "idle",
+    revision: 1,
+    createdAt: instant,
+    updatedAt: instant,
+    lastRunId: null,
+    authority: Object.freeze({
+      kind: "aginti",
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: "e".repeat(64),
+      lastCompaction: null,
+    }),
+    replay: Object.freeze({ prunedMessageCount: 0, anchorDigest: "0".repeat(64) }),
+    messages: Object.freeze([]),
+  });
+  const capability = Object.freeze({
+    schemaVersion: "1",
+    enabled: true,
+    agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
+    model: Object.freeze({ label: "LocalLLM" }),
+    actions: Object.freeze({ cancel: true, resume: true, retry: false }),
+    attachments: Object.freeze({ enabled: false }),
+    artifacts: Object.freeze({ kinds: Object.freeze(["plot", "table", "markdown"]), schemaVersion: "1" }),
+  });
+  const sourceStore = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const source = updateControllerHarness({
+    environment,
+    now: () => 90_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { schemaVersion: "1", thread }; },
+      async *streamRunEvents() {},
+    },
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: sourceStore,
+  });
+  await source.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "Never send this exact Agent follow-up to Direct Chat";
+  source.document.getElementById("apply-update").dispatch("click");
+  await sourceStore.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const targetBaseStore = memoryUpdateHandoffStore([...sourceStore.records.entries()]);
+  const targetStore = {
+    ...targetBaseStore,
+    async save() {
+      targetBaseStore.calls.save += 1;
+      throw new Error("injected protected-store re-retention failure");
+    },
+  };
+  let exactReads = 0;
+  let agentMutations = 0;
+  const chatClients = idleAuthenticatedPwaClients();
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 90_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: {
+      async capabilities() { return capability; },
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { exactReads += 1; throw new Error("injected exact-ledger outage"); },
+      async createThread() { agentMutations += 1; throw new Error("must remain fenced"); },
+      async startRun() { agentMutations += 1; throw new Error("must remain fenced"); },
+      async *streamRunEvents() {},
+    },
+    chat: chatClients.chat,
+    updateHandoffStore: targetStore,
+  });
+  await restored.app.initialize();
+  assert.equal(exactReads, 1);
+  assert.equal(targetStore.records.size, 0, "the injected retention failure leaves no durable reload copy");
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(restored.document.getElementById("message-input").value, "Never send this exact Agent follow-up to Direct Chat");
+  assert.equal(restored.document.getElementById("message-input").disabled, true);
+  assert.equal(restored.document.getElementById("send-message").disabled, true);
+  restored.document.getElementById("chat-mode").dispatch("click");
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  await restored.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentMutations, 0);
+  assert.equal(chatClients.mutationCalls.startRun, 0);
+  restored.document.getElementById("new-thread").dispatch("click");
+  assert.equal(restored.document.getElementById("message-input").disabled, false,
+    "explicit New conversation is the only non-replay path that detaches the memory-only prompt");
+});
+
 test("one stable worker registration discovers v1, v2, and v3 without a second version authority", async () => {
   const maps = await Promise.all(["v1", "v2", "v3"].map((marker) => productionMap({ label: "stable-worker", marker })));
   let servedSource = maps[0].get(maps[0].serviceWorkerRoute).body;
@@ -2903,4 +5981,164 @@ test("rendering implementation contains no HTML injection, dynamic code executio
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/iu);
   assert.doesNotMatch(source, /\beval\s*\(|new\s+Function\b/iu);
   assert.doesNotMatch(source, /\bfetch\s*\(/u);
+});
+
+// Legacy encrypted update-handoff compatibility. Keep these fixtures separate
+// from current-version update tests so their historical wire bytes stay fixed.
+test("an encrypted inner-v1 Chat handoff restores its exact draft and PNG without a mutation", async () => {
+  const encoder = new TextEncoder();
+  const createdAt = 125_000;
+  const draft = "Restore this exact legacy PNG prompt without sending it";
+  const threadId = "chat_inner_v1_compat_xxxxxxxxx";
+  const handoffId = "9".repeat(64);
+  const keyBytes = Uint8Array.from({ length: 32 }, (unused, index) => 0x60 + index);
+  const keyText = Buffer.from(keyBytes).toString("base64url");
+  const imageBytes = new Uint8Array(Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ));
+  const image = Object.freeze({
+    attachmentId: "image_inner_v1_compat_0001",
+    mediaType: "image/png",
+    byteLength: imageBytes.byteLength,
+    width: 1,
+    height: 1,
+  });
+  const accountDigest = createHash("sha256")
+    .update(encoder.encode("lazying-agent-update-account\u0000account-user"))
+    .digest("hex");
+  const encodeInner = (metadata) => {
+    const metadataBytes = encoder.encode(JSON.stringify(metadata));
+    const payload = new Uint8Array(4 + metadataBytes.byteLength + imageBytes.byteLength);
+    new DataView(payload.buffer).setUint32(0, metadataBytes.byteLength);
+    payload.set(metadataBytes, 4);
+    payload.set(imageBytes, 4 + metadataBytes.byteLength);
+    return payload;
+  };
+  const unsignedInner = {
+    schemaVersion: "1",
+    scope: "/",
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    accountDigest,
+    threadId,
+    draft,
+    image,
+  };
+  const inner = encodeInner({
+    ...unsignedInner,
+    digest: createHash("sha256").update(encodeInner(unsignedInner)).digest("hex"),
+  });
+  const envelope = {
+    schemaVersion: "1",
+    scope: "/",
+    handoffId,
+    sourceRelease: CURRENT_RELEASE,
+    targetRelease: NEXT_RELEASE,
+    createdAt,
+    expiresAt: createdAt + 5 * 60 * 1_000,
+  };
+  const iv = Uint8Array.from({ length: 12 }, (unused, index) => 0xd0 + index);
+  const cryptoKey = await globalThis.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt({
+    name: "AES-GCM",
+    iv,
+    additionalData: encoder.encode(JSON.stringify(envelope)),
+    tagLength: 128,
+  }, cryptoKey, inner));
+  const stored = { ...envelope, iv, ciphertext };
+  assert.equal(stored.schemaVersion, "1", "inner-v1 historically used the outer-v1 envelope");
+  assert.doesNotMatch(JSON.stringify(stored), /legacy PNG prompt|account-user|chat_inner_v1/u);
+
+  const thread = Object.freeze({
+    threadId,
+    title: "Legacy image conversation",
+    modelAlias: "local-default",
+    revision: 0,
+    ledgerHash: null,
+    messageCount: 0,
+    ledgerBytes: 0,
+    currentGenerationId: null,
+    createdAt: "2026-08-25T12:00:00.000Z",
+    updatedAt: "2026-08-25T12:00:00.000Z",
+  });
+  const mutationCalls = [];
+  const rejectMutation = (name) => {
+    mutationCalls.push(name);
+    throw new Error(`legacy handoff restore must not call ${name}`);
+  };
+  let threadReads = 0;
+  const chat = {
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread() { return rejectMutation("prepareThread"); },
+    async createThread() { return rejectMutation("createThread"); },
+    async retryCreateThread() { return rejectMutation("retryCreateThread"); },
+    async listThreads() { return { threads: [thread] }; },
+    async getThread(requestedThreadId) {
+      assert.equal(requestedThreadId, threadId);
+      threadReads += 1;
+      return { thread };
+    },
+    prepareThreadDeletion() { return rejectMutation("prepareThreadDeletion"); },
+    async deleteThread() { return rejectMutation("deleteThread"); },
+    async retryDeleteThread() { return rejectMutation("retryDeleteThread"); },
+    async listMessages({ threadId: requestedThreadId }) {
+      assert.equal(requestedThreadId, threadId);
+      return { messages: [] };
+    },
+    async getAttachment() { throw new Error("empty history has no attachment read"); },
+    prepareRun() { return rejectMutation("prepareRun"); },
+    async startRun() { return rejectMutation("startRun"); },
+    async retryRun() { return rejectMutation("retryRun"); },
+    async getRunStatus() { throw new Error("idle history has no run status"); },
+    async *streamRunEvents() {},
+    prepareCancellation() { return rejectMutation("prepareCancellation"); },
+    async cancelRun() { return rejectMutation("cancelRun"); },
+  };
+  const store = memoryUpdateHandoffStore([[`/\u0000${handoffId}`, stored]]);
+  const restoredBlobs = [];
+  const href = `https://llm.lazying.art/?v=${NEXT_RELEASE}#lazying-update-handoff=${handoffId}.${keyText}`;
+  const harness = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: href,
+    now: () => createdAt + 1,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent: idleAuthenticatedPwaClients().agent,
+    chat,
+    updateHandoffStore: store,
+    createObjectUrl(blob) {
+      restoredBlobs.push(blob);
+      return "blob:inner-v1-restored-png";
+    },
+    revokeObjectUrl() {},
+  });
+  assert.match(harness.window.location.href, /#lazying-update-handoff=/u,
+    "the one-time key remains reload-safe until authenticated decryption");
+  await harness.app.initialize();
+
+  assert.equal(harness.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
+  assert.equal(threadReads, 2, "the carried Chat thread is read before and after its empty snapshot");
+  assert.equal(harness.document.getElementById("message-input").value, draft);
+  assert.equal(harness.document.getElementById("image-preview").hidden, false);
+  assert.equal(harness.document.getElementById("image-preview-thumbnail").src, "blob:inner-v1-restored-png");
+  assert.equal(restoredBlobs.length, 1);
+  assert.equal(restoredBlobs[0].type, "image/png");
+  assert.deepEqual(new Uint8Array(await restoredBlobs[0].arrayBuffer()), imageBytes);
+  assert.deepEqual(mutationCalls, []);
+  assert.deepEqual(store.calls, { save: 1, take: 1, discard: 1 },
+    "startup re-retains the row until UI initialization, then consumes it exactly once");
+  assert.equal(store.records.size, 0);
+  assert.deepEqual(harness.historyReplacements, [`/?v=${NEXT_RELEASE}`]);
+  assert.doesNotMatch(harness.window.location.href, /lazying-update-handoff/u,
+    "successful restore consumes the one-time URL key");
 });

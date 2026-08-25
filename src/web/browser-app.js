@@ -4,6 +4,7 @@ import {
   FAIL_CLOSED_AGENT_CAPABILITIES,
   validateAgentCapabilities,
   validateAgentSearch,
+  validateThreadRunAncestry,
 } from "./aginti-protocol.js";
 import { CloudSessionClient } from "./cloud-session-client.js";
 import {
@@ -37,7 +38,12 @@ const BODY_REJECTION_CODES = new Set([
 const SAFE_CHAT_FAILURE_OPERATIONS = new Set([
   "local_thread", "local_run", "thread_dispatch", "snapshot", "run_dispatch", "before_run_dispatch",
 ]);
-const UPDATE_HANDOFF_SCHEMA_VERSION = "2";
+const UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION = "3";
+// The encrypted payload gained Agent mode ownership in v3, but the outer
+// IndexedDB envelope did not change. Keeping its schema at v2 prevents an
+// older tab on the same origin from pruning a successor tab's protected row.
+const UPDATE_HANDOFF_ENVELOPE_SCHEMA_VERSION = "2";
+const UPDATE_HANDOFF_PRIOR_PAYLOAD_SCHEMA_VERSION = "2";
 const UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION = "1";
 const UPDATE_HANDOFF_MAX_AGE_MS = 5 * 60 * 1_000;
 const UPDATE_HANDOFF_FUTURE_SKEW_MS = 30_000;
@@ -256,6 +262,9 @@ function updateHandoffMetadata(record, { digest = false } = {}) {
     accountDigest: record.accountDigest,
     threadId: record.threadId,
     draft: record.draft,
+    ...(record.schemaVersion === UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION
+      ? { mode: record.mode, search: record.search }
+      : {}),
   };
   const imageField = record.schemaVersion === UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION
     ? { image: record.image === null ? null : updateHandoffImageDescriptor(record.image) }
@@ -342,20 +351,24 @@ async function validateUpdateHandoff(value, {
   currentRelease,
   username,
   now,
+  allowChainedTargetRelease = false,
 }) {
   const legacy = value?.schemaVersion === UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION;
+  const current = value?.schemaVersion === UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION;
   const imageField = legacy ? "image" : "images";
   const record = exactObject(value, [
     "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
-    "threadId", "draft", imageField, "digest",
+    "threadId", "draft", ...(current ? ["mode", "search"] : []), imageField, "digest",
   ], [
     "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
-    "threadId", "draft", imageField, "digest",
+    "threadId", "draft", ...(current ? ["mode", "search"] : []), imageField, "digest",
   ], "update handoff");
   const instant = Number(now());
-  if (![UPDATE_HANDOFF_SCHEMA_VERSION, UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION].includes(record.schemaVersion)
+  if (![UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION, UPDATE_HANDOFF_PRIOR_PAYLOAD_SCHEMA_VERSION,
+    UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION].includes(record.schemaVersion)
       || record.scope !== scope
-      || !validAgentRelease(record.sourceRelease) || record.targetRelease !== currentRelease
+      || !validAgentRelease(record.sourceRelease)
+      || (!allowChainedTargetRelease && record.targetRelease !== currentRelease)
       || !validAgentRelease(record.targetRelease)
       || !Number.isSafeInteger(record.createdAt) || record.createdAt < 0
       || !Number.isSafeInteger(instant) || instant < 0
@@ -371,7 +384,21 @@ async function validateUpdateHandoff(value, {
   const images = legacy
     ? Object.freeze(record.image === null ? [] : [updateHandoffImage(record.image)])
     : updateHandoffImages(record.images);
-  if (!draft && images.length === 0) throw new TypeError("update handoff is empty");
+  const legacyModeAmbiguous = record.schemaVersion === UPDATE_HANDOFF_PRIOR_PAYLOAD_SCHEMA_VERSION
+    && record.threadId === null && draft.length > 0 && images.length === 0;
+  const mode = current ? record.mode : legacyModeAmbiguous ? null : "chat";
+  if (mode !== null && !["chat", "agent"].includes(mode)) {
+    throw new TypeError("update handoff mode is invalid");
+  }
+  // A current payload may also carry only an exact owned thread selection.
+  // This is needed when a release fence interrupts authenticated read recovery
+  // after the server already owns the work; it never represents a mutation.
+  if (!draft && images.length === 0 && !(current && record.threadId !== null)) {
+    throw new TypeError("update handoff is empty");
+  }
+  if (mode === "agent" && images.length !== 0) throw new TypeError("Agent update handoff cannot contain images");
+  const search = current && record.search !== null ? validateAgentSearch(record.search) : null;
+  if (search !== null && mode !== "agent") throw new TypeError("update handoff search mode is invalid");
   const accountDigest = await updateHandoffDigest(updateHandoffEncoder.encode(
     `lazying-agent-update-account\u0000${normalizedSessionUsername(username)}`,
   ));
@@ -385,6 +412,7 @@ async function validateUpdateHandoff(value, {
     accountDigest: record.accountDigest,
     threadId: record.threadId,
     draft,
+    ...(current ? { mode, search } : {}),
   };
   const signed = Object.freeze(legacy
     ? { ...common, image: images[0] ?? null }
@@ -392,7 +420,7 @@ async function validateUpdateHandoff(value, {
   if (await updateHandoffDigest(updateHandoffDigestInput(signed)) !== record.digest) {
     throw new TypeError("update handoff digest is invalid");
   }
-  return Object.freeze({ ...common, images });
+  return Object.freeze({ ...common, mode, search, images, legacyModeAmbiguous });
 }
 
 function encodeUpdateHandoffPayload(record) {
@@ -421,13 +449,14 @@ function decodeUpdateHandoffPayload(bytes) {
       || 4 + metadataLength > bytes.byteLength) throw new TypeError("update handoff metadata is invalid");
   const metadata = JSON.parse(updateHandoffDecoder.decode(bytes.subarray(4, 4 + metadataLength)));
   const legacy = metadata?.schemaVersion === UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION;
+  const current = metadata?.schemaVersion === UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION;
   const imageField = legacy ? "image" : "images";
   const envelope = exactObject(metadata, [
     "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
-    "threadId", "draft", imageField, "digest",
+    "threadId", "draft", ...(current ? ["mode", "search"] : []), imageField, "digest",
   ], [
     "schemaVersion", "scope", "sourceRelease", "targetRelease", "createdAt", "accountDigest",
-    "threadId", "draft", imageField, "digest",
+    "threadId", "draft", ...(current ? ["mode", "search"] : []), imageField, "digest",
   ], "update handoff payload");
   const rawDescriptors = legacy
     ? (envelope.image === null ? [] : [envelope.image])
@@ -476,6 +505,65 @@ function decodeUpdateHandoffKey(value) {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
+function updateHandoffChainProofInput(handoffId, newTargetRelease) {
+  return updateHandoffEncoder.encode(
+    `lazying-update-chain\u0000${handoffId}\u0000${newTargetRelease}`,
+  );
+}
+
+async function createChainedUpdateHandoffClaim(claim, oldTargetRelease, newTargetRelease) {
+  if (!claim || !UPDATE_HANDOFF_ID.test(claim.handoffId) || !UPDATE_HANDOFF_KEY.test(claim.key)
+      || !validAgentRelease(oldTargetRelease) || !validAgentRelease(newTargetRelease)
+      || oldTargetRelease === newTargetRelease) {
+    throw new TypeError("chained update handoff ownership is invalid");
+  }
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof subtle?.importKey !== "function" || typeof subtle?.sign !== "function") {
+    throw new TypeError("chained update handoff authentication is unavailable");
+  }
+  const key = await subtle.importKey(
+    "raw",
+    decodeUpdateHandoffKey(claim.key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const proof = new Uint8Array(await subtle.sign(
+    "HMAC",
+    key,
+    updateHandoffChainProofInput(claim.handoffId, newTargetRelease),
+  ));
+  return Object.freeze({
+    handoffId: claim.handoffId,
+    key: claim.key,
+    chainProof: updateHandoffBase64Url(proof),
+  });
+}
+
+async function verifyChainedUpdateHandoffClaim(claim, oldTargetRelease, newTargetRelease) {
+  if (!claim || !UPDATE_HANDOFF_ID.test(claim.handoffId) || !UPDATE_HANDOFF_KEY.test(claim.key)
+      || !UPDATE_HANDOFF_KEY.test(claim.chainProof)
+      || !validAgentRelease(oldTargetRelease) || !validAgentRelease(newTargetRelease)
+      || oldTargetRelease === newTargetRelease) return false;
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof subtle?.importKey !== "function" || typeof subtle?.verify !== "function") return false;
+  try {
+    const key = await subtle.importKey(
+      "raw",
+      decodeUpdateHandoffKey(claim.key),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    return await subtle.verify(
+      "HMAC",
+      key,
+      decodeUpdateHandoffKey(claim.chainProof),
+      updateHandoffChainProofInput(claim.handoffId, newTargetRelease),
+    );
+  } catch { return false; }
+}
+
 function createUpdateHandoffClaim() {
   if (typeof globalThis.crypto?.getRandomValues !== "function") {
     throw new TypeError("secure update handoff randomness is unavailable");
@@ -489,19 +577,51 @@ function createUpdateHandoffClaim() {
 }
 
 function updateHandoffFragment(claim) {
-  return `#lazying-update-handoff=${claim.handoffId}.${claim.key}`;
+  return `#lazying-update-handoff=${claim.handoffId}.${claim.key}${claim.chainProof ? `.${claim.chainProof}` : ""}`;
+}
+
+function scrubCapturedUpdateHandoffClaim(window) {
+  let url;
+  try { url = new URL(window?.location?.href); }
+  catch { return false; }
+  try {
+    window.history.replaceState(window.history.state ?? null, "", `${url.pathname}${url.search}`);
+    return true;
+  } catch { return false; }
 }
 
 function captureUpdateHandoffClaim(window) {
   let url;
   try { url = new URL(window?.location?.href); }
   catch { return null; }
-  const match = /^#lazying-update-handoff=([a-f0-9]{64})\.([A-Za-z0-9_-]{43})$/u.exec(url.hash);
+  const match = /^#lazying-update-handoff=([a-f0-9]{64})\.([A-Za-z0-9_-]{43})(?:\.([A-Za-z0-9_-]{43}))?$/u.exec(url.hash);
   if (!match) return null;
+  // Keep the fragment until authenticated decryption succeeds. URL fragments
+  // are not sent in HTTP requests, and retaining this one-time key prevents a
+  // reload, expired-session landing, or pre-consumption capability failure
+  // from orphaning the encrypted IndexedDB row.
+  return Object.freeze({
+    handoffId: match[1],
+    key: match[2],
+    ...(match[3] === undefined ? {} : { chainProof: match[3] }),
+  });
+}
+
+function retainCapturedUpdateHandoffClaim(window, claim) {
+  if (!claim || !UPDATE_HANDOFF_ID.test(claim.handoffId) || !UPDATE_HANDOFF_KEY.test(claim.key)
+      || (claim.chainProof !== undefined && !UPDATE_HANDOFF_KEY.test(claim.chainProof))) return false;
+  let url;
+  try { url = new URL(window?.location?.href); }
+  catch { return false; }
+  if (url.hash === updateHandoffFragment(claim)) return true;
   try {
-    window.history.replaceState(window.history.state ?? null, "", `${url.pathname}${url.search}`);
-  } catch { return null; }
-  return Object.freeze({ handoffId: match[1], key: match[2] });
+    window.history.replaceState(
+      window.history.state ?? null,
+      "",
+      `${url.pathname}${url.search}${updateHandoffFragment(claim)}`,
+    );
+    return true;
+  } catch { return false; }
 }
 
 function updateHandoffAdditionalData(envelope) {
@@ -523,7 +643,7 @@ async function encryptUpdateHandoff(record, claim) {
   const keyBytes = decodeUpdateHandoffKey(claim.key);
   const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
   const envelope = Object.freeze({
-    schemaVersion: UPDATE_HANDOFF_SCHEMA_VERSION,
+    schemaVersion: UPDATE_HANDOFF_ENVELOPE_SCHEMA_VERSION,
     scope: record.scope,
     handoffId: claim.handoffId,
     sourceRelease: record.sourceRelease,
@@ -553,11 +673,14 @@ async function decryptUpdateHandoff(value, claim, {
     "schemaVersion", "scope", "handoffId", "sourceRelease", "targetRelease", "createdAt", "expiresAt", "iv", "ciphertext",
   ], "encrypted update handoff");
   const instant = Number(now());
-  if (![UPDATE_HANDOFF_SCHEMA_VERSION, UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION].includes(envelope.schemaVersion)
+  const chainedTargetRelease = envelope.targetRelease !== currentRelease;
+  if (![UPDATE_HANDOFF_ENVELOPE_SCHEMA_VERSION,
+    UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION].includes(envelope.schemaVersion)
       || envelope.scope !== scope
       || envelope.handoffId !== claim.handoffId || !UPDATE_HANDOFF_ID.test(envelope.handoffId)
-      || !validAgentRelease(envelope.sourceRelease) || envelope.targetRelease !== currentRelease
+      || !validAgentRelease(envelope.sourceRelease)
       || !validAgentRelease(envelope.targetRelease)
+      || (chainedTargetRelease && !UPDATE_HANDOFF_KEY.test(claim.chainProof))
       || !Number.isSafeInteger(envelope.createdAt) || envelope.createdAt < 0
       || envelope.expiresAt !== envelope.createdAt + UPDATE_HANDOFF_MAX_AGE_MS
       || !Number.isSafeInteger(instant) || instant < 0 || instant > envelope.expiresAt
@@ -566,6 +689,15 @@ async function decryptUpdateHandoff(value, claim, {
       || !(envelope.ciphertext instanceof Uint8Array) || envelope.ciphertext.byteLength < 17
       || envelope.ciphertext.byteLength > UPDATE_HANDOFF_PAYLOAD_LIMIT + 16) {
     throw new TypeError("encrypted update handoff is invalid");
+  }
+  const chainedTargetVerified = chainedTargetRelease
+    && await verifyChainedUpdateHandoffClaim(
+      claim,
+      envelope.targetRelease,
+      currentRelease,
+    );
+  if (chainedTargetRelease && !chainedTargetVerified) {
+    throw new TypeError("encrypted update handoff target is invalid");
   }
   const subtle = globalThis.crypto?.subtle;
   if (typeof subtle?.importKey !== "function" || typeof subtle?.decrypt !== "function") {
@@ -583,6 +715,7 @@ async function decryptUpdateHandoff(value, claim, {
     currentRelease,
     username,
     now,
+    allowChainedTargetRelease: chainedTargetVerified,
   });
   if (record.sourceRelease !== envelope.sourceRelease || record.targetRelease !== envelope.targetRelease
       || record.createdAt !== envelope.createdAt) throw new TypeError("update handoff envelope is inconsistent");
@@ -803,25 +936,16 @@ function assertTerminalAgentReplay(run, snapshot) {
   return snapshot;
 }
 
-function persistedThreadRuns(thread) {
+function persistedThreadRunIds(thread) {
   const result = [];
   const seen = new Set();
-  const persisted = new Set(
-    (Array.isArray(thread?.messages) ? thread.messages : [])
-      .filter((message) => message?.role === "assistant")
-      .map((message) => message.runId)
-  );
   for (const message of Array.isArray(thread?.messages) ? thread.messages : []) {
     if (message?.role !== "user" && message?.role !== "assistant") continue;
     if (message.runId === thread?.lastRunId || seen.has(message.runId)) continue;
     seen.add(message.runId);
-    result.push(Object.freeze({ runId: message.runId, persisted: persisted.has(message.runId) }));
+    result.push(message.runId);
   }
-  // The thread's declared current run is always restored last even if a
-  // hostile-but-schema-valid message ordering places it earlier in history.
-  if (thread?.lastRunId) {
-    result.push(Object.freeze({ runId: thread.lastRunId, persisted: persisted.has(thread.lastRunId) }));
-  }
+  if (thread?.lastRunId) result.push(thread.lastRunId);
   return Object.freeze(result);
 }
 
@@ -1008,6 +1132,11 @@ export function createBrowserApp({
     authRecoveryUsername: null,
     authRecoveryWorkflow: null,
     authRecoveryGeneration: null,
+    authRecoveryAgent: null,
+    authRecoveryLegacyUpdatePending: false,
+    authRecoveryLegacyMode: null,
+    authRecoveryLegacyDestinationChosen: false,
+    authRecoveryLegacyDestinationThreadId: null,
     selectedImages: Object.freeze([]),
     selectedImageUrls: Object.freeze([]),
     imagePreparing: false,
@@ -1038,6 +1167,21 @@ export function createBrowserApp({
     agentPendingResume: null,
     agentPendingThreadCreate: null,
     agentSearchSelected: false,
+    agentSearchRecoveryChoicePending: false,
+    legacyUpdateRecoveryPending: false,
+    legacyUpdateRecoveryDestinationChosen: false,
+    legacyUpdateRecoveryDestinationThreadId: null,
+    unavailableAgentUpdateRecovery: false,
+    retainedUpdateRecoveryPending: false,
+    retainedUpdateRecoveryDurable: false,
+    retainedUpdateRecoveryThreadId: null,
+    retainedUpdateRecoveryRecord: null,
+    retainedUpdateRecoveryInstalled: false,
+    retainedUpdateRecoveryInstallation: null,
+    protectedComposerReplacementConfirmation: null,
+    agentAuthenticationRecoveryPending: false,
+    agentAuthenticationRecoveryThreadId: null,
+    agentAuthenticationRecoveryVerified: false,
     streamAbort: null,
     streamKind: null,
     viewEpoch: 0,
@@ -1150,9 +1294,64 @@ export function createBrowserApp({
     });
   }
 
-  function requireFreshAuthentication({ workflow = null, generationRecovery = null } = {}) {
+  function captureAgentAuthenticationRecovery() {
+    if (state.mode !== "agent") return null;
+    const retained = state.retainedUpdateRecoveryPending
+      && state.retainedUpdateRecoveryRecord?.mode === "agent"
+      ? state.retainedUpdateRecoveryRecord
+      : null;
+    if (retained !== null) {
+      return Object.freeze({
+        threadId: retained.threadId,
+        draft: retained.draft,
+        search: retained.search,
+        searchInvalid: false,
+      });
+    }
+    let search = null;
+    // An unresolved capability downgrade is not equivalent to the user
+    // choosing No Search. Preserve that ambiguity across another auth expiry.
+    let searchInvalid = state.agentSearchRecoveryChoicePending;
+    try { search = updateHandoffSearch(); }
+    catch { searchInvalid = state.agentSearchSelected; }
+    return Object.freeze({
+      threadId: typeof state.agentThreadId === "string" ? state.agentThreadId : null,
+      draft: String(elements.message_input.value ?? ""),
+      search,
+      searchInvalid,
+    });
+  }
+
+  function requireFreshAuthentication({
+    workflow = null,
+    generationRecovery = null,
+    agentRecovery = captureAgentAuthenticationRecovery(),
+  } = {}) {
     if (!state.session.authenticated) return false;
     const recoveryUsername = normalizedSessionUsername(state.session.username);
+    const legacyUpdateRecovery = state.legacyUpdateRecoveryPending;
+    const legacyRecoveryMode = legacyUpdateRecovery ? state.mode : null;
+    const legacyDestinationChosen = legacyUpdateRecovery
+      && state.legacyUpdateRecoveryDestinationChosen;
+    const legacyDestinationThreadId = legacyDestinationChosen
+      ? state.legacyUpdateRecoveryDestinationThreadId
+      : null;
+    let legacySearch = null;
+    let legacySearchInvalid = false;
+    if (legacyDestinationChosen && legacyRecoveryMode === "agent") {
+      try { legacySearch = updateHandoffSearch(); }
+      catch { legacySearchInvalid = state.agentSearchSelected; }
+    }
+    const legacyAgentRecovery = legacyDestinationChosen && legacyRecoveryMode === "agent"
+      ? Object.freeze({
+          threadId: legacyDestinationThreadId,
+          draft: state.retainedUpdateRecoveryRecord?.draft
+            ?? String(elements.message_input.value ?? ""),
+          search: legacySearch,
+          searchInvalid: legacySearchInvalid,
+        })
+      : null;
+    const exactAgentRecovery = legacyUpdateRecovery ? legacyAgentRecovery : agentRecovery;
     if (state.imagePreparing) cancelImagePreparation();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
@@ -1178,23 +1377,51 @@ export function createBrowserApp({
     state.runId = null;
     state.agentRunStatus = null;
     state.agentSearchSelected = false;
+    state.agentAuthenticationRecoveryVerified = false;
     state.mode = "chat";
     state.authRecoveryPending = true;
     state.authRecoveryUsername = recoveryUsername;
     state.authRecoveryWorkflow = workflow;
     state.authRecoveryGeneration = generationRecovery;
+    state.authRecoveryAgent = exactAgentRecovery;
+    state.authRecoveryLegacyUpdatePending = legacyUpdateRecovery;
+    state.authRecoveryLegacyMode = legacyRecoveryMode;
+    state.authRecoveryLegacyDestinationChosen = legacyDestinationChosen;
+    state.authRecoveryLegacyDestinationThreadId = legacyDestinationThreadId;
     elements.resume_run.hidden = workflow === null;
     elements.logout.disabled = true;
-    showLogin(generationRecovery !== null
+    showLogin(legacyUpdateRecovery
+      ? "Your session expired. Sign in again, then choose the exact destination for the protected prompt from the previous app version."
+      : exactAgentRecovery !== null
+      ? "Your session expired. Sign in again to verify the exact Agent conversation; your prompt remains preserved."
+      : generationRecovery !== null
       ? "Your session expired. Sign in again to reconnect to the server-owned generation; your draft and image are preserved."
       : "Your session expired. Sign in again; your unsent draft and image are preserved.");
     loginControl({ ready: true, label: "Sign in" });
     return true;
   }
 
+  function agentMutationBlocksSessionRevalidation() {
+    return state.mode === "agent" && (state.busy
+      || state.agentHistoryRestoring || state.agentReplayValidating
+      || state.agentCancelPending
+      || state.agentPendingThreadCreate !== null || state.agentPendingResume !== null);
+  }
+
+  function flushDeferredSessionRevalidation() {
+    if (!state.sessionRevalidationPending || state.sessionRevalidationInFlight
+        || agentMutationBlocksSessionRevalidation()) return;
+    state.sessionRevalidationPending = false;
+    void revalidateSessionOnResume();
+  }
+
   async function revalidateSessionOnResume() {
     if (!state.initialized || !state.session.authenticated
         || document?.visibilityState === "hidden" || state.updateReloaded) return false;
+    if (agentMutationBlocksSessionRevalidation()) {
+      state.sessionRevalidationPending = true;
+      return false;
+    }
     if (state.sessionRevalidationInFlight) {
       state.sessionRevalidationPending = true;
       return false;
@@ -1207,6 +1434,10 @@ export function createBrowserApp({
       if (!restored.authenticated
           || normalizedSessionUsername(restored.username) !== normalizedSessionUsername(ownedSession.username)
           || restored.csrfToken !== ownedSession.csrfToken) {
+        if (agentMutationBlocksSessionRevalidation()) {
+          state.sessionRevalidationPending = true;
+          return false;
+        }
         requireFreshAuthentication({
           workflow: state.mode === "chat" ? state.chatPendingSend : null,
           generationRecovery: state.mode === "chat" ? captureChatReadRecovery() : null,
@@ -1220,6 +1451,10 @@ export function createBrowserApp({
         await refreshForReleaseMismatch(targetRelease);
       } else if (state.session === ownedSession && (isChatAuthenticationRejection(error)
           || error?.code === "csrf_rejected" || error?.status === 403)) {
+        if (agentMutationBlocksSessionRevalidation()) {
+          state.sessionRevalidationPending = true;
+          return false;
+        }
         requireFreshAuthentication({
           workflow: state.mode === "chat" ? state.chatPendingSend : null,
           generationRecovery: state.mode === "chat" ? captureChatReadRecovery() : null,
@@ -1228,10 +1463,7 @@ export function createBrowserApp({
       return false;
     } finally {
       state.sessionRevalidationInFlight = false;
-      if (state.sessionRevalidationPending) {
-        state.sessionRevalidationPending = false;
-        void revalidateSessionOnResume();
-      }
+      flushDeferredSessionRevalidation();
     }
   }
 
@@ -1302,6 +1534,7 @@ export function createBrowserApp({
 
   function interactionLocked() {
     return state.busy || state.logoutPending || state.chatFinalization !== null
+      || (claimedUpdateHandoff !== null && !state.updateHandoffConsumed)
       || state.chatHistoryRestoration !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending
@@ -1347,6 +1580,16 @@ export function createBrowserApp({
     return search;
   }
 
+  function updateHandoffSearch() {
+    return state.mode === "agent" && state.agentSearchSelected ? selectedAgentSearch() : null;
+  }
+
+  function sameUpdateHandoffSearch(left, right) {
+    return left === null || right === null
+      ? left === right
+      : left.mode === right.mode && left.limit === right.limit;
+  }
+
   function updateImageControl() {
     const available = state.session.authenticated && state.mode === "chat"
       && state.chatCapabilities.visionInput === true;
@@ -1354,6 +1597,8 @@ export function createBrowserApp({
     const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
     const locked = interactionLocked();
     const pendingAgentResume = state.mode === "agent" && state.agentPendingResume !== null;
+    const agentDispatchFenced = state.mode === "agent" && state.agentReplayFailed;
+    const searchChoiceReady = agentSearchRecoveryChoiceReady();
     const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
     const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
       && state.chatPendingSend?.ambiguousMutation !== undefined
@@ -1374,10 +1619,14 @@ export function createBrowserApp({
     elements.message_input.disabled = !state.session.authenticated || (locked && !pendingAgentResume)
       || state.imagePreparing || pendingChatSend
       || pendingChatDeletion
-      || preservingAuthenticationDraft;
+      || preservingAuthenticationDraft || state.retainedUpdateRecoveryPending
+      || state.agentAuthenticationRecoveryPending;
     elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
       || pendingChatDeletion
-      || preservingAuthenticationDraft;
+      || preservingAuthenticationDraft || agentDispatchFenced
+      || (state.legacyUpdateRecoveryPending && !searchChoiceReady)
+      || (state.retainedUpdateRecoveryPending && !searchChoiceReady)
+      || (state.agentAuthenticationRecoveryPending && !searchChoiceReady);
     elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend || pendingChatDeletion
       || preservingAuthenticationDraft;
     elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
@@ -1391,6 +1640,8 @@ export function createBrowserApp({
       const buttons = row.className === "thread-row" ? row.children : [row];
       for (const button of buttons) {
         button.disabled = locked || pendingChatSend || button.dataset.threadBlocked === "true"
+          || (state.agentSearchRecoveryChoicePending
+            && !agentRecoveryThreadRetryAllowed(button.dataset.threadId))
           || (pendingChatDeletion && button.dataset.threadDeleteRetry !== "true");
       }
     }
@@ -1406,11 +1657,39 @@ export function createBrowserApp({
     return state.mode === "agent" ? state.agentThreadId : state.chatThreadId;
   }
 
-  function setMode(mode, { restoreView = true, remember = true } = {}) {
+  function agentRecoveryThreadRetryAllowed(threadId) {
+    if (state.mode !== "agent" || !state.agentSearchRecoveryChoicePending
+        || !state.agentReplayFailed) return false;
+    const recoveryThreadId = state.retainedUpdateRecoveryThreadId
+      ?? state.agentAuthenticationRecoveryThreadId;
+    return recoveryThreadId !== null && threadId === recoveryThreadId;
+  }
+
+  function setMode(mode, {
+    restoreView = true,
+    remember = true,
+    allowUnavailableAgentRecovery = false,
+    allowRetainedUpdateRecovery = false,
+    allowAgentAuthenticationRecovery = false,
+  } = {}) {
     const agentAvailable = state.capabilities.enabled === true;
-    const nextMode = mode === "agent" && agentAvailable ? "agent" : "chat";
+    const nextMode = mode === "agent" && (agentAvailable || allowUnavailableAgentRecovery) ? "agent" : "chat";
     const changed = nextMode !== state.mode;
     if (changed && interactionLocked()) return;
+    if (changed && state.agentSearchRecoveryChoicePending
+        && !allowRetainedUpdateRecovery && !allowAgentAuthenticationRecovery) {
+      showToast("Confirm Search or No Search for the recovered Agent prompt before changing modes.");
+      return;
+    }
+    if (changed && state.agentAuthenticationRecoveryPending && !allowAgentAuthenticationRecovery) {
+      showToast("Verify the recovered Agent conversation, or choose New conversation, before changing modes.");
+      return;
+    }
+    if (changed && state.retainedUpdateRecoveryPending && !state.legacyUpdateRecoveryPending
+        && !allowRetainedUpdateRecovery) {
+      showToast("Resume verification of the exact Agent conversation, or choose New conversation after Agent is available to detach the recovered prompt.");
+      return;
+    }
     if (changed && state.mode === "agent" && state.agentPendingThreadCreate !== null) {
       showToast("Retry the ready prompt to confirm its exact Agent conversation before changing modes.");
       return;
@@ -1445,7 +1724,20 @@ export function createBrowserApp({
     elements.message_input.placeholder = state.mode === "agent" ? "Ask AgInTi Agent" : "Message LocalLLM";
     updateImageControl();
     renderThreads();
-    if (changed && restoreView && state.session.authenticated) void restoreModeView({ autoOpen: true });
+    if (changed && restoreView && state.session.authenticated) {
+      void restoreModeView({ autoOpen: !state.legacyUpdateRecoveryPending }).catch(async (error) => {
+        const targetRelease = clientReleaseMismatch(error);
+        if (targetRelease !== null) {
+          try { await refreshForReleaseMismatch(targetRelease); }
+          catch { showToast("The required app update could not be opened yet; protected work remains on this page."); }
+        } else {
+          connection(state.mode === "agent" ? "Agent unavailable" : "Chat unavailable", false);
+          showToast(state.mode === "agent"
+            ? "Agent conversations could not be loaded safely."
+            : "LocalLLM conversations could not be loaded safely.");
+        }
+      });
+    }
   }
 
   function resetAttachmentRestorations({ deferQueued = false } = {}) {
@@ -1894,7 +2186,9 @@ export function createBrowserApp({
       const open = makeButton(document, title, () => { void openThread(threadId, { mode }); });
       open.className = "thread-open";
       open.disabled = interactionLocked() || (mode === "chat"
-        && (state.chatPendingSend !== null || pendingDeletion !== null));
+        && (state.chatPendingSend !== null || pendingDeletion !== null))
+        || (mode === "agent" && state.agentSearchRecoveryChoicePending
+          && !agentRecoveryThreadRetryAllowed(threadId));
       open.dataset.threadId = threadId;
       open.dataset.mode = mode;
       open.setAttribute("aria-current", threadId === selected ? "true" : "false");
@@ -2047,7 +2341,10 @@ export function createBrowserApp({
       || !state.agentReplayOfferResume
       || !state.capabilities.actions.resume
       || (visibleStatus !== "failed" && visibleStatus !== "cancelled");
-    if (releaseCancellationFence) updateImageControl();
+    if (releaseCancellationFence) {
+      updateImageControl();
+      flushDeferredSessionRevalidation();
+    }
   }
 
   function renderAgentFailure(runId, value) {
@@ -2194,6 +2491,7 @@ export function createBrowserApp({
         updateImageControl();
         connection("Agent cancellation history unavailable", false);
         showToast("Verified cancellation history could not be restored safely. Reopen this conversation to retry; no run was resumed.");
+        flushDeferredSessionRevalidation();
         return;
       }
       elements.resume_run.hidden = state.agentCancelPending || !state.capabilities.actions.resume;
@@ -2211,7 +2509,7 @@ export function createBrowserApp({
   }
 
   async function openAgentThread(threadId, { expectedEpoch = state.viewEpoch } = {}) {
-    if (!state.capabilities.enabled || state.mode !== "agent" || state.viewEpoch !== expectedEpoch) return;
+    if (!state.capabilities.enabled || state.mode !== "agent" || state.viewEpoch !== expectedEpoch) return false;
     const session = state.session;
     const agent = state.agent;
     const current = () => state.session === session
@@ -2221,20 +2519,68 @@ export function createBrowserApp({
     state.agentHistoryRestoring = true;
     updateImageControl();
     try {
-      const { thread } = await agent.getThread(threadId);
+      let { thread } = await agent.getThread(threadId);
       if (!current()) return;
       if (thread.id !== threadId) {
         throw new AgintiProtocolError("Agent thread ownership does not match the requested thread", {
           code: "LEDGER_OWNERSHIP_MISMATCH",
         });
       }
+      let ancestry = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (thread.status === "deleting") {
+          throw new AgintiProtocolError("A deleting Agent thread cannot accept more work", {
+            code: "AGENT_THREAD_DELETING",
+          });
+        }
+        const runValues = [];
+        for (const requestedRunId of persistedThreadRunIds(thread)) {
+          const { run } = await agent.runStatus(requestedRunId);
+          if (!current()) return;
+          runValues.push(run);
+        }
+        ancestry = validateThreadRunAncestry(thread, runValues);
+        if (!ancestry.requiresThreadRefresh) break;
+        if (attempt > 0) {
+          throw new AgintiProtocolError("Agent thread completion changed during verification", {
+            code: "LEDGER_SNAPSHOT_RACE",
+          });
+        }
+        const priorThread = thread;
+        const refreshed = await agent.getThread(threadId);
+        if (!current()) return;
+        thread = refreshed.thread;
+        if (thread.id !== threadId || thread.lastRunId !== priorThread.lastRunId
+            || thread.createdAt !== priorThread.createdAt
+            || thread.revision < priorThread.revision
+            || thread.updatedAt < priorThread.updatedAt) {
+          throw new AgintiProtocolError("Agent thread head changed during completion verification", {
+            code: "LEDGER_OWNERSHIP_MISMATCH",
+          });
+        }
+      }
+      if (ancestry === null) {
+        throw new AgintiProtocolError("Agent thread ancestry could not be verified", {
+          code: "LEDGER_ANCESTRY_UNAVAILABLE",
+        });
+      }
+      const listedIndex = state.agentThreads.findIndex((listed) => listed.id === thread.id);
+      if (listedIndex < 0) state.agentThreads.unshift(thread);
+      else state.agentThreads[listedIndex] = thread;
       clearConversation();
       state.agentHistoryRestoring = true;
       state.agentThreadId = thread.id;
       state.runId = null;
       state.agentRunStatus = null;
       elements.conversation_title.textContent = thread.title;
-      const runs = persistedThreadRuns(thread);
+      const persistedAssistantRuns = new Set(
+        thread.messages.filter((message) => message.role === "assistant").map((message) => message.runId),
+      );
+      const runs = ancestry.runs.map((run) => Object.freeze({
+        run,
+        runId: run.id,
+        persisted: persistedAssistantRuns.has(run.id),
+      }));
       const missingAssistantRuns = new Set(
         runs.filter((requested) => !requested.persisted).map((requested) => requested.runId)
       );
@@ -2257,8 +2603,7 @@ export function createBrowserApp({
       }
       for (const requested of runs) {
         const requestedRunId = requested.runId;
-        const { run } = await agent.runStatus(requestedRunId);
-        if (!current()) return;
+        const { run } = requested;
         correlatedAgentRun(run, { runId: requestedRunId, threadId: thread.id });
         const terminal = TERMINAL.has(run.status);
         if (!terminal && (requested.persisted || requestedRunId !== thread.lastRunId)) {
@@ -2279,17 +2624,21 @@ export function createBrowserApp({
       }
       if (thread.lastRunId === null) state.runId = null;
       state.agentReplayFailed = false;
-    } catch {
-      if (!current()) return;
+      return true;
+    } catch (error) {
+      if (clientReleaseMismatch(error) !== null) throw error;
+      if (!current()) return false;
       state.agentReplayValidating = false;
       state.agentReplayFailed = true;
       state.agentReplayOfferResume = false;
       elements.resume_run.hidden = true;
       showToast("Verified Agent history could not be restored safely. Reopen this conversation to retry; no run was resumed.");
+      return false;
     } finally {
       if (current()) {
         state.agentHistoryRestoring = false;
         updateImageControl();
+        flushDeferredSessionRevalidation();
       }
     }
   }
@@ -3033,6 +3382,206 @@ export function createBrowserApp({
     }
   }
 
+  function retainedUpdateRecoverySearchSignature() {
+    if (state.mode !== "agent" || !state.agentSearchSelected) return "off";
+    return `on:${String(elements.search_mode.value ?? "")}:${String(elements.search_limit.value ?? "")}`;
+  }
+
+  function retainedUpdateRecoveryInstallationCurrent(record = state.retainedUpdateRecoveryRecord, {
+    ignoreSearch = false,
+  } = {}) {
+    const installation = state.retainedUpdateRecoveryInstallation;
+    return state.retainedUpdateRecoveryInstalled === true
+      && record !== null && installation?.record === record
+      && installation.mode === state.mode
+      && installation.images === state.selectedImages
+      && String(elements.message_input.value ?? "") === record.draft
+      && (ignoreSearch || installation.search === retainedUpdateRecoverySearchSignature());
+  }
+
+  function invalidateRetainedUpdateRecoveryInstallation() {
+    state.retainedUpdateRecoveryInstalled = false;
+    state.retainedUpdateRecoveryInstallation = null;
+  }
+
+  function retainedUpdateRecoverySearchConflicts(record) {
+    if (record === null || state.mode !== "agent") return false;
+    if (record.schemaVersion !== UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION
+        || record.mode !== "agent") return state.agentSearchSelected;
+    if (record.search !== null) {
+      const capability = state.capabilities.search;
+      const supported = capability?.enabled === true
+        && capability.modes.includes(record.search.mode)
+        && record.search.limit <= capability.maximumSources;
+      // An unavailable former choice is resolved by the explicit Search / No
+      // Search confirmation flow, not treated as competing browser work.
+      if (!supported) return false;
+    }
+    const expected = record.search === null
+      ? "off"
+      : `on:${record.search.mode}:${String(record.search.limit)}`;
+    return retainedUpdateRecoverySearchSignature() !== expected;
+  }
+
+  function finishRetainedUpdateRecovery({ discard = false } = {}) {
+    if (!state.retainedUpdateRecoveryPending) return true;
+    // A verified destination alone does not own the browser composer. A
+    // Safari/BFCache-restored value may have raced the protected row, so normal
+    // consumption is legal only after restoreUpdateHandoff installed that exact
+    // record. Cross-account and confirmed sign-out paths explicitly discard it.
+    if (!discard && !retainedUpdateRecoveryInstallationCurrent()) {
+      invalidateRetainedUpdateRecoveryInstallation();
+      elements.resume_run.hidden = false;
+      showToast("The browser composer changed after recovery. The protected prompt was retained; press Resume twice to restore it explicitly.");
+      updateImageControl();
+      return false;
+    }
+    state.retainedUpdateRecoveryPending = false;
+    state.retainedUpdateRecoveryDurable = false;
+    state.retainedUpdateRecoveryThreadId = null;
+    state.retainedUpdateRecoveryRecord = null;
+    invalidateRetainedUpdateRecoveryInstallation();
+    state.protectedComposerReplacementConfirmation = null;
+    scrubCapturedUpdateHandoffClaim(window);
+    if (claimedUpdateHandoff !== null) {
+      void updateHandoffStore.discard(workerScope, claimedUpdateHandoff.handoffId).catch(() => {});
+    }
+    if (state.session.authenticated) updateImageControl();
+    return true;
+  }
+
+  function finishAgentAuthenticationRecovery() {
+    state.agentAuthenticationRecoveryPending = false;
+    state.agentAuthenticationRecoveryThreadId = null;
+    state.agentAuthenticationRecoveryVerified = false;
+    state.authRecoveryAgent = null;
+    if (state.authRecoveryWorkflow === null && state.authRecoveryGeneration === null) {
+      state.authRecoveryPending = false;
+      state.authRecoveryUsername = null;
+    }
+  }
+
+  function confirmProtectedComposerReplacement(record, action) {
+    const visibleDraft = String(elements.message_input.value ?? "");
+    const visibleImages = state.selectedImages;
+    const visibleSearch = retainedUpdateRecoverySearchSignature();
+    const conflicts = (visibleDraft.length > 0 && visibleDraft !== record.draft)
+      || visibleImages.length > 0 || retainedUpdateRecoverySearchConflicts(record);
+    if (!conflicts) {
+      state.protectedComposerReplacementConfirmation = null;
+      return true;
+    }
+    const pending = state.protectedComposerReplacementConfirmation;
+    if (pending?.record === record && pending.action === action
+        && pending.visibleDraft === visibleDraft && pending.visibleImages === visibleImages
+        && pending.visibleSearch === visibleSearch) {
+      state.protectedComposerReplacementConfirmation = null;
+      return true;
+    }
+    state.protectedComposerReplacementConfirmation = Object.freeze({
+      record,
+      action,
+      visibleDraft,
+      visibleImages,
+      visibleSearch,
+    });
+    showToast(`${action} again to replace the conflicting browser-restored composer with the protected update prompt. Nothing was changed yet.`);
+    return false;
+  }
+
+  function installRetainedUpdateRecovery(record, action, { acceptCurrentSearch = false } = {}) {
+    if (record === null || record === undefined || !state.retainedUpdateRecoveryPending
+        || state.retainedUpdateRecoveryRecord !== record) return true;
+    if (retainedUpdateRecoveryInstallationCurrent(record)) return true;
+    if (acceptCurrentSearch && state.agentSearchRecoveryChoicePending
+        && retainedUpdateRecoveryInstallationCurrent(record, { ignoreSearch: true })) {
+      state.retainedUpdateRecoveryInstallation = Object.freeze({
+        ...state.retainedUpdateRecoveryInstallation,
+        search: retainedUpdateRecoverySearchSignature(),
+      });
+      return true;
+    }
+    invalidateRetainedUpdateRecoveryInstallation();
+    if (!confirmProtectedComposerReplacement(record, action)) return false;
+    // The durable/account-bound record owns this explicit replacement. Clear a
+    // conflicting local image selection before restoring its exact image set.
+    elements.message_input.value = record.draft;
+    if (state.selectedImages.length > 0) clearSelectedImage();
+    if (!restoreUpdateHandoff(record)) {
+      elements.resume_run.hidden = false;
+      showToast("The protected prompt could not be installed yet. Resume or retry this action; it was not discarded.");
+      return false;
+    }
+    return true;
+  }
+
+  function agentSearchRecoveryChoiceReady() {
+    if (!state.agentSearchRecoveryChoicePending || !state.session.authenticated
+        || state.mode !== "agent" || state.capabilities.enabled !== true
+        || state.unavailableAgentUpdateRecovery
+        || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed) return false;
+    if (state.agentAuthenticationRecoveryPending) {
+      if (!state.agentAuthenticationRecoveryVerified) return false;
+      if (state.agentAuthenticationRecoveryThreadId !== null
+          && state.agentThreadId !== state.agentAuthenticationRecoveryThreadId) return false;
+    }
+    const record = state.retainedUpdateRecoveryRecord;
+    if (record?.mode === "agent" && record.threadId !== null) {
+      return state.agentThreadId === record.threadId;
+    }
+    if (state.legacyUpdateRecoveryPending) {
+      return state.legacyUpdateRecoveryDestinationChosen;
+    }
+    return true;
+  }
+
+  function confirmAgentSearchRecoveryChoice() {
+    if (!agentSearchRecoveryChoiceReady()) return false;
+    const retainedRecord = state.retainedUpdateRecoveryRecord;
+    if (!installRetainedUpdateRecovery(retainedRecord, "Press Run Agent", {
+      acceptCurrentSearch: true,
+    })) return false;
+    let selectedSearch;
+    try { selectedSearch = selectedAgentSearch(); }
+    catch {
+      showToast("Choose a valid current Search mode and source limit, or turn Search off, before confirming.");
+      return false;
+    }
+    state.agentSearchRecoveryChoicePending = false;
+    if (state.legacyUpdateRecoveryPending && state.legacyUpdateRecoveryDestinationChosen) {
+      state.legacyUpdateRecoveryPending = false;
+      state.legacyUpdateRecoveryDestinationChosen = false;
+      state.legacyUpdateRecoveryDestinationThreadId = null;
+    }
+    finishRetainedUpdateRecovery();
+    finishAgentAuthenticationRecovery();
+    updateImageControl();
+    showToast(selectedSearch === undefined
+      ? "No Search confirmed for the recovered Agent prompt. Review it, then Run Agent again."
+      : `Search ${selectedSearch.mode} (${selectedSearch.limit} sources) confirmed. Review the recovered prompt, then Run Agent.`);
+    return true;
+  }
+
+  function resolveLegacyUpdateRecovery(destination) {
+    if (!state.legacyUpdateRecoveryPending) return;
+    const retainedRecord = state.retainedUpdateRecoveryRecord;
+    if (!installRetainedUpdateRecovery(retainedRecord, `Choose ${destination}`)) return false;
+    if (state.mode === "agent") {
+      state.legacyUpdateRecoveryDestinationChosen = true;
+      state.legacyUpdateRecoveryDestinationThreadId = state.agentThreadId;
+      state.agentSearchRecoveryChoicePending = true;
+      updateImageControl();
+      showToast("Agent destination selected. Choose Search, or press Run Agent once to confirm No Search; the following press sends.");
+      return true;
+    }
+    state.legacyUpdateRecoveryPending = false;
+    state.legacyUpdateRecoveryDestinationChosen = false;
+    state.legacyUpdateRecoveryDestinationThreadId = null;
+    finishRetainedUpdateRecovery();
+    showToast(`Recovered prompt assigned to ${destination}; review it before sending.`);
+    return true;
+  }
+
   async function openThread(threadId, { mode = state.mode } = {}) {
     if (interactionLocked() || mode !== state.mode) return;
     if (mode === "agent" && state.agentPendingThreadCreate !== null) {
@@ -3047,6 +3596,25 @@ export function createBrowserApp({
       showToast("Confirm the pending durable send with Resume before opening another conversation.");
       return;
     }
+    const retainedRecord = state.retainedUpdateRecoveryPending
+      ? state.retainedUpdateRecoveryRecord
+      : null;
+    if (retainedRecord?.mode === mode && retainedRecord.threadId !== null
+        && threadId !== retainedRecord.threadId) {
+      showToast(`Retry the exact recovered ${mode === "agent" ? "Agent" : "Chat"} conversation, or choose New conversation to detach its prompt.`);
+      return;
+    }
+    if (mode === "agent" && state.agentAuthenticationRecoveryThreadId !== null
+        && threadId !== state.agentAuthenticationRecoveryThreadId) {
+      showToast("Retry the exact conversation recovered after sign-in, or choose New conversation to detach its prompt.");
+      return;
+    }
+    const assignsRetainedRecord = retainedRecord !== null
+      && (retainedRecord.mode === null
+        || (retainedRecord.mode === mode
+          && (retainedRecord.threadId === null || retainedRecord.threadId === threadId)));
+    if (assignsRetainedRecord
+        && !installRetainedUpdateRecovery(retainedRecord, "Open this conversation")) return;
     // A successful Agent restoration already owns the complete verified
     // presentation for this thread. Treat another click on that settled
     // selection as idempotent: replaying it would briefly leave the old
@@ -3055,27 +3623,54 @@ export function createBrowserApp({
     // replay must remain reopenable as promised by its recovery message.
     if (mode === "agent" && threadId === state.agentThreadId
         && state.agentReplayFailed !== true
-        && (state.runId === null || TERMINAL.has(state.agentRunStatus))) return;
+        && (state.runId === null || TERMINAL.has(state.agentRunStatus))) {
+      if (assignsRetainedRecord && retainedRecord.mode !== null
+          && !state.agentSearchRecoveryChoicePending) {
+        finishRetainedUpdateRecovery();
+      }
+      resolveLegacyUpdateRecovery("this conversation");
+      return;
+    }
     state.busy = true;
     updateImageControl();
     renderThreads();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
+    let releaseRefreshTarget = null;
     try {
       if (mode === "agent") await openAgentThread(threadId);
       else {
         const threadHint = state.chatThreads.find((thread) => thread.threadId === threadId) ?? null;
         await openChatThread(threadId, { backgroundStream: true, threadHint });
       }
-    } catch {
-      showToast(mode === "agent"
+      if (currentThreadId() === threadId && (mode !== "agent" || state.agentReplayFailed !== true)) {
+        if (retainedRecord?.mode === mode && retainedRecord.threadId === threadId
+            && !state.agentSearchRecoveryChoicePending) {
+          finishRetainedUpdateRecovery();
+        } else if (mode === "agent" && state.retainedUpdateRecoveryThreadId === threadId) {
+          if (!state.agentSearchRecoveryChoicePending) finishRetainedUpdateRecovery();
+        }
+        if (mode === "agent" && state.agentAuthenticationRecoveryThreadId === threadId) {
+          state.agentAuthenticationRecoveryVerified = true;
+          if (!state.agentSearchRecoveryChoicePending) finishAgentAuthenticationRecovery();
+        }
+        resolveLegacyUpdateRecovery("this conversation");
+      }
+    } catch (error) {
+      releaseRefreshTarget = clientReleaseMismatch(error);
+      if (releaseRefreshTarget !== null) {
+        connection("Migrating protected work to the newer app", false);
+      }
+      else showToast(mode === "agent"
         ? "This AgInTi thread could not be opened safely."
         : "This LocalLLM conversation could not be restored safely.");
     } finally {
       state.busy = false;
       updateImageControl();
       renderThreads();
+      flushDeferredSessionRevalidation();
     }
+    if (releaseRefreshTarget !== null) await refreshForReleaseMismatch(releaseRefreshTarget);
   }
 
   async function restoreModeView({ autoOpen = false, prefetchedChatThreads = null } = {}) {
@@ -3110,6 +3705,7 @@ export function createBrowserApp({
       if (mode === "agent" && epoch === state.viewEpoch && mode === state.mode) {
         state.agentHistoryRestoring = false;
         updateImageControl();
+        flushDeferredSessionRevalidation();
       }
     }
   }
@@ -3501,7 +4097,28 @@ export function createBrowserApp({
 
   async function submitMessage(event) {
     event?.preventDefault?.();
-    if (interactionLocked() || !state.session.authenticated) return;
+    if (!state.session.authenticated) return;
+    if (state.agentSearchRecoveryChoicePending) {
+      if (confirmAgentSearchRecoveryChoice()) return;
+      if (state.protectedComposerReplacementConfirmation !== null) return;
+      showToast(agentSearchRecoveryChoiceReady()
+        ? "Choose a valid current Search setting, or turn Search off, before confirming this recovered Agent prompt."
+        : "Wait for the recovered Agent conversation to finish verification before confirming Search or No Search.");
+      return;
+    }
+    if (interactionLocked()) return;
+    if (state.legacyUpdateRecoveryPending) {
+      showToast("Choose the intended conversation, or New conversation, before sending this prompt recovered from the previous app version.");
+      return;
+    }
+    if (state.retainedUpdateRecoveryPending) {
+      showToast("Verify the exact recovered Agent conversation, or choose New conversation after Agent is available, before sending this prompt.");
+      return;
+    }
+    if (state.agentAuthenticationRecoveryPending) {
+      showToast("Wait for the exact Agent conversation to finish verification, or choose New conversation to detach the prompt.");
+      return;
+    }
     if (state.mode === "chat" && state.chatPendingDeletion) {
       showToast("Retry the pending conversation deletion before sending another message.");
       return;
@@ -3676,6 +4293,7 @@ export function createBrowserApp({
       state.busy = false;
       updateImageControl();
       renderThreads();
+      flushDeferredSessionRevalidation();
       if (releaseRefreshTarget !== null) await refreshForReleaseMismatch(releaseRefreshTarget);
     }
   }
@@ -3688,6 +4306,20 @@ export function createBrowserApp({
     const recoveryUsername = state.authRecoveryUsername;
     const recoveryWorkflow = state.authRecoveryWorkflow;
     const recoveryGeneration = state.authRecoveryGeneration;
+    const recoveryAgent = state.authRecoveryAgent;
+    const recoveryLegacyUpdate = state.authRecoveryLegacyUpdatePending;
+    const recoveryLegacyMode = state.authRecoveryLegacyMode;
+    const recoveryLegacyDestinationChosen = state.authRecoveryLegacyDestinationChosen;
+    const recoveryLegacyDestinationThreadId = state.authRecoveryLegacyDestinationThreadId;
+    const recoveryRetainedUpdate = state.retainedUpdateRecoveryPending;
+    const recoveryRetainedDurable = state.retainedUpdateRecoveryDurable;
+    const recoveryRetainedThreadId = state.retainedUpdateRecoveryThreadId;
+    const recoveryRetainedRecord = state.retainedUpdateRecoveryRecord;
+    const recoveryRetainedInstalled = state.retainedUpdateRecoveryInstalled;
+    const recoveryRetainedInstallation = state.retainedUpdateRecoveryInstallation;
+    const preserveUninstalledRetainedComposer = recoveryRetainedUpdate
+      && recoveryRetainedRecord !== null
+      && !retainedUpdateRecoveryInstallationCurrent(recoveryRetainedRecord);
     state.chatPendingDeletion = null;
     purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
@@ -3695,6 +4327,7 @@ export function createBrowserApp({
     const discardedCrossAccountDraft = recoveringAuthenticationDraft
       && normalizedSessionUsername(state.session.username) !== recoveryUsername;
     if (discardedCrossAccountDraft) {
+      finishRetainedUpdateRecovery({ discard: true });
       elements.message_input.value = "";
       clearSelectedImage();
       if (recoveryWorkflow !== null) {
@@ -3711,9 +4344,20 @@ export function createBrowserApp({
       state.authRecoveryUsername = null;
       state.authRecoveryWorkflow = null;
       state.authRecoveryGeneration = null;
+      state.authRecoveryAgent = null;
+      state.authRecoveryLegacyUpdatePending = false;
+      state.authRecoveryLegacyMode = null;
+      state.authRecoveryLegacyDestinationChosen = false;
+      state.authRecoveryLegacyDestinationThreadId = null;
     }
     const sameAccountRecoveryWorkflow = discardedCrossAccountDraft ? null : recoveryWorkflow;
     const sameAccountRecoveryGeneration = discardedCrossAccountDraft ? null : recoveryGeneration;
+    const sameAccountRecoveryAgent = discardedCrossAccountDraft ? null : recoveryAgent;
+    const sameAccountRecoveryLegacy = !discardedCrossAccountDraft && recoveryLegacyUpdate;
+    const carriedProtectedUpdate = !discardedCrossAccountDraft && recoveryRetainedUpdate
+      && recoveryRetainedRecord !== null && sameAccountRecoveryWorkflow === null
+      && sameAccountRecoveryGeneration === null && sameAccountRecoveryAgent === null
+      && !sameAccountRecoveryLegacy;
     const authenticatedSession = state.session;
     if (clearPasswordOnAuthenticated) elements.password.value = "";
     elements.logout.disabled = true;
@@ -3737,8 +4381,68 @@ export function createBrowserApp({
       state.agentPendingResume = null;
       state.agentPendingThreadCreate = null;
       state.agentSearchSelected = false;
-      state.agentReplayFailed = false;
+      state.agentSearchRecoveryChoicePending = false;
+      state.authRecoveryAgent = sameAccountRecoveryAgent;
+      state.authRecoveryLegacyUpdatePending = sameAccountRecoveryLegacy;
+      state.authRecoveryLegacyMode = sameAccountRecoveryLegacy ? recoveryLegacyMode : null;
+      state.authRecoveryLegacyDestinationChosen = sameAccountRecoveryLegacy
+        && recoveryLegacyDestinationChosen;
+      state.authRecoveryLegacyDestinationThreadId = sameAccountRecoveryLegacy
+        ? recoveryLegacyDestinationThreadId
+        : null;
+      state.legacyUpdateRecoveryPending = sameAccountRecoveryLegacy;
+      state.legacyUpdateRecoveryDestinationChosen = sameAccountRecoveryLegacy
+        && recoveryLegacyDestinationChosen;
+      state.legacyUpdateRecoveryDestinationThreadId = sameAccountRecoveryLegacy
+        ? recoveryLegacyDestinationThreadId
+        : null;
+      state.unavailableAgentUpdateRecovery = sameAccountRecoveryAgent !== null;
+      state.retainedUpdateRecoveryPending = false;
+      state.retainedUpdateRecoveryDurable = false;
+      state.retainedUpdateRecoveryThreadId = null;
+      state.retainedUpdateRecoveryRecord = null;
+      invalidateRetainedUpdateRecoveryInstallation();
+      state.protectedComposerReplacementConfirmation = null;
+      state.agentAuthenticationRecoveryPending = sameAccountRecoveryAgent !== null;
+      state.agentAuthenticationRecoveryThreadId = sameAccountRecoveryAgent?.threadId ?? null;
+      state.agentAuthenticationRecoveryVerified = false;
+      state.agentReplayFailed = sameAccountRecoveryAgent !== null;
+      if (sameAccountRecoveryAgent !== null && !preserveUninstalledRetainedComposer) {
+        state.agentThreadId = sameAccountRecoveryAgent.threadId;
+        elements.message_input.value = sameAccountRecoveryAgent.draft;
+      } else if (sameAccountRecoveryAgent !== null) {
+        state.agentThreadId = sameAccountRecoveryAgent.threadId;
+      }
+      if (!discardedCrossAccountDraft && recoveryRetainedUpdate) {
+        state.retainedUpdateRecoveryPending = true;
+        state.retainedUpdateRecoveryDurable = recoveryRetainedDurable;
+        state.retainedUpdateRecoveryThreadId = recoveryRetainedThreadId;
+        state.retainedUpdateRecoveryRecord = recoveryRetainedRecord;
+        state.retainedUpdateRecoveryInstalled = recoveryRetainedInstalled;
+        state.retainedUpdateRecoveryInstallation = recoveryRetainedInstallation;
+      }
       clearConversation();
+      const updateRecovery = sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null
+          && sameAccountRecoveryAgent === null && !sameAccountRecoveryLegacy
+        ? await consumeUpdateHandoff({
+            agentCapabilities: FAIL_CLOSED_AGENT_CAPABILITIES,
+            retainUntilInitialized: true,
+          })
+        : null;
+      const updateHandoff = updateRecovery?.record
+        ?? (carriedProtectedUpdate ? recoveryRetainedRecord : null);
+      if (updateRecovery !== null) {
+        // Capability and client setup below are fallible. Keep both an
+        // in-memory ownership fence and, when possible, the encrypted local
+        // row until the recovered destination can be reconstructed safely.
+        state.retainedUpdateRecoveryPending = true;
+        state.retainedUpdateRecoveryDurable = updateRecovery.retainedForReload === true;
+        state.retainedUpdateRecoveryThreadId = updateHandoff.mode === "agent"
+          ? updateHandoff.threadId
+          : null;
+        state.retainedUpdateRecoveryRecord = updateHandoff;
+        invalidateRetainedUpdateRecoveryInstallation();
+      }
       state.agent = createAgentClient(state.session);
       state.chat = createChatClient(state.session);
       requiredMethod(state.agent, "capabilities", "agent client");
@@ -3775,53 +4479,132 @@ export function createBrowserApp({
           value: Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }),
         };
       };
-      const [rawAgentCapability, chatCapabilityProbe] = await Promise.all([
-        Promise.resolve().then(() => state.agent.capabilities()).catch((error) => {
-          if (clientReleaseMismatch(error) !== null) throw error;
-          return FAIL_CLOSED_AGENT_CAPABILITIES;
-        }),
+      const readAgentCapability = async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            return { succeeded: true, value: validateAgentCapabilities(await state.agent.capabilities()) };
+          } catch (error) {
+            if (clientReleaseMismatch(error) !== null) throw error;
+            if (attempt < 2) await wait(250 * (2 ** attempt));
+          }
+        }
+        return { succeeded: false, value: FAIL_CLOSED_AGENT_CAPABILITIES };
+      };
+      const [agentCapabilityProbe, chatCapabilityProbe] = await Promise.all([
+        readAgentCapability(),
         readChatCapability(),
       ]);
-      let capability;
-      try { capability = validateAgentCapabilities(rawAgentCapability); }
-      catch { capability = FAIL_CLOSED_AGENT_CAPABILITIES; }
+      const capability = agentCapabilityProbe.value;
       const chatCapabilityVerified = chatCapabilityProbe.succeeded;
       const chatCapability = chatCapabilityProbe.value;
       if (state.session !== authenticatedSession || !state.session.authenticated) return;
       state.capabilities = capability;
       state.chatCapabilities = chatCapability;
-      const updateHandoff = sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null
-        ? await consumeUpdateHandoff()
-        : null;
       if (state.session !== authenticatedSession || !state.session.authenticated) return;
-      if (updateHandoff !== null) state.chatThreadId = updateHandoff.threadId;
+      if (updateHandoff?.mode === "agent") state.agentThreadId = updateHandoff.threadId;
+      else if (updateHandoff?.mode === "chat") state.chatThreadId = updateHandoff.threadId;
+      const ambiguousLegacyRecovery = sameAccountRecoveryLegacy
+        || updateHandoff?.legacyModeAmbiguous === true;
+      const legacyRecoveryMode = ambiguousLegacyRecovery
+        ? capability.enabled === true
+          ? (sameAccountRecoveryLegacy ? recoveryLegacyMode : null)
+            ?? restoreWorkspaceMode() ?? selectDefaultMode(capability)
+          : "chat"
+        : null;
+      state.legacyUpdateRecoveryPending = ambiguousLegacyRecovery;
+      state.authRecoveryLegacyUpdatePending = false;
+      state.authRecoveryLegacyMode = null;
+      state.authRecoveryLegacyDestinationChosen = false;
+      state.authRecoveryLegacyDestinationThreadId = null;
+      state.agentReplayFailed = false;
+      const updateSearchAvailable = updateHandoff?.search == null
+        || (capability.search?.enabled === true
+          && capability.search.modes.includes(updateHandoff.search.mode)
+          && updateHandoff.search.limit <= capability.search.maximumSources);
+      const unavailableRecoveredAgent = updateHandoff?.mode === "agent"
+        && capability.enabled !== true;
+      const updateSearchChoiceRequired = updateHandoff?.mode === "agent"
+        && capability.enabled === true && !updateSearchAvailable;
+      const updateRequiresVerification = updateHandoff !== null
+        && (unavailableRecoveredAgent || updateSearchChoiceRequired || updateHandoff.legacyModeAmbiguous
+          || updateHandoff.threadId !== null);
+      state.unavailableAgentUpdateRecovery = unavailableRecoveredAgent;
+      if (updateHandoff !== null) {
+        if (updateRequiresVerification) {
+          state.retainedUpdateRecoveryPending = true;
+          state.retainedUpdateRecoveryThreadId = updateHandoff.mode === "agent"
+            ? updateHandoff.threadId
+            : null;
+          state.retainedUpdateRecoveryRecord = updateHandoff;
+          invalidateRetainedUpdateRecoveryInstallation();
+        }
+      }
+      const authenticationAgentSearchAvailable = sameAccountRecoveryAgent?.searchInvalid !== true
+        && (sameAccountRecoveryAgent?.search == null
+          || (capability.search?.enabled === true
+          && capability.search.modes.includes(sameAccountRecoveryAgent.search.mode)
+          && sameAccountRecoveryAgent.search.limit <= capability.search.maximumSources));
+      const authenticationSearchChoiceRequired = sameAccountRecoveryAgent !== null
+        && capability.enabled === true && !authenticationAgentSearchAvailable;
+      state.agentSearchRecoveryChoicePending = updateSearchChoiceRequired
+        || authenticationSearchChoiceRequired
+        || (ambiguousLegacyRecovery && state.legacyUpdateRecoveryDestinationChosen);
+      if (sameAccountRecoveryAgent !== null) {
+        state.agentThreadId = sameAccountRecoveryAgent.threadId;
+        state.agentAuthenticationRecoveryPending = true;
+        state.agentAuthenticationRecoveryThreadId = sameAccountRecoveryAgent.threadId;
+        state.agentAuthenticationRecoveryVerified = false;
+        if (!preserveUninstalledRetainedComposer) {
+          elements.message_input.value = sameAccountRecoveryAgent.draft;
+        }
+        if (capability.enabled !== true) {
+          state.unavailableAgentUpdateRecovery = true;
+        }
+      }
+      if (state.unavailableAgentUpdateRecovery) state.agentReplayFailed = true;
       if (sameAccountRecoveryWorkflow?.thread) {
         state.chatThread = sameAccountRecoveryWorkflow.thread;
         state.chatThreadId = sameAccountRecoveryWorkflow.thread.threadId;
       }
       showApp();
-      const forcedChatMode = updateHandoff !== null
-        || (recoveringAuthenticationDraft && !discardedCrossAccountDraft);
-      setMode(forcedChatMode
-        ? "chat"
-        : restoreWorkspaceMode() ?? selectDefaultMode(capability), {
+      const recoveryMode = (sameAccountRecoveryAgent !== null ? "agent" : null)
+        ?? updateHandoff?.mode ?? legacyRecoveryMode
+        ?? (recoveringAuthenticationDraft && !discardedCrossAccountDraft ? "chat" : null);
+      setMode(recoveryMode
+        ?? restoreWorkspaceMode() ?? selectDefaultMode(capability), {
         restoreView: false,
         remember: false,
+        allowUnavailableAgentRecovery: state.unavailableAgentUpdateRecovery,
+        allowRetainedUpdateRecovery: state.retainedUpdateRecoveryPending || sameAccountRecoveryAgent !== null,
+        allowAgentAuthenticationRecovery: sameAccountRecoveryAgent !== null,
       });
+      if (sameAccountRecoveryAgent?.search != null && authenticationAgentSearchAvailable) {
+        state.agentSearchSelected = true;
+        elements.search_mode.value = sameAccountRecoveryAgent.search.mode;
+        elements.search_limit.value = String(sameAccountRecoveryAgent.search.limit);
+      }
       const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
         && state.selectedImages.length > 0 && chatCapability.visionInput !== true
         && sameAccountRecoveryWorkflow === null;
-      state.authRecoveryPending = recoveryImageNeedsUserAction;
-      state.authRecoveryUsername = recoveryImageNeedsUserAction
+      const agentAuthenticationNeedsVerification = sameAccountRecoveryAgent !== null
+        && state.agentAuthenticationRecoveryPending;
+      state.authRecoveryPending = recoveryImageNeedsUserAction || agentAuthenticationNeedsVerification;
+      state.authRecoveryUsername = state.authRecoveryPending
         ? normalizedSessionUsername(state.session.username)
         : null;
       state.authRecoveryWorkflow = null;
       state.authRecoveryGeneration = sameAccountRecoveryGeneration;
+      state.authRecoveryAgent = agentAuthenticationNeedsVerification ? sameAccountRecoveryAgent : null;
       clearChatFailureDiagnostic();
       updateImageControl();
       const restoredUpdateHandoff = restoreUpdateHandoff(updateHandoff);
       if (updateHandoff !== null && !restoredUpdateHandoff) {
-        showToast("The saved update draft could not be restored safely and was discarded.");
+        elements.resume_run.hidden = false;
+        showToast(state.retainedUpdateRecoveryDurable
+          ? "The saved update draft could not be restored yet. Resume retries here; reload is also safe."
+          : "The saved update draft is protected on this page only. Resume retries here, or choose New conversation to detach it explicitly.");
+      } else if (updateHandoff !== null && !updateRequiresVerification) {
+        finishRetainedUpdateRecovery();
       }
       if (sameAccountRecoveryWorkflow !== null) {
         connection("Signed in · exact send ready to confirm");
@@ -3831,6 +4614,14 @@ export function createBrowserApp({
         connection(chatCapabilityVerified
           ? "Signed in · image sending unavailable"
           : "Signed in · image capability unavailable", false);
+      } else if (state.unavailableAgentUpdateRecovery) {
+        connection(sameAccountRecoveryAgent !== null
+          ? "Signed in · Agent verification waiting"
+          : "Updated · Agent recovery waiting", false);
+      } else if (state.legacyUpdateRecoveryPending) {
+        connection("Updated · choose the intended conversation", false);
+      } else if (sameAccountRecoveryAgent !== null) {
+        connection("Signed in · verifying exact Agent conversation", false);
       } else {
         connection(restoredUpdateHandoff
           ? "Updated · unsent draft ready"
@@ -3844,37 +4635,85 @@ export function createBrowserApp({
         showToast(chatCapabilityVerified
           ? "Image sending is unavailable. Your staged image remains visible; remove it to continue without the image."
           : "Image capability could not be confirmed. Your staged image remains visible and unsent; remove it only to continue without the image.");
+      } else if (state.unavailableAgentUpdateRecovery) {
+        elements.resume_run.hidden = false;
+        showToast(state.retainedUpdateRecoveryDurable
+          ? "Your Agent prompt remains protected. Resume retries Agent verification here; reload is also safe."
+          : "Your Agent prompt is preserved on this page. Resume retries Agent verification without losing it.");
+      } else if (state.legacyUpdateRecoveryPending) {
+        showToast("Your prompt came from the previous app version. Choose its exact conversation, or New conversation, before sending it.");
       }
       try {
-        await restoreModeView({
-          autoOpen: updateHandoff === null
-            && sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null,
-          prefetchedChatThreads: startupChatThreads,
-        });
-        if (restoredUpdateHandoff && updateHandoff.threadId !== null) {
-          const target = state.chatThreads.find((thread) => thread.threadId === updateHandoff.threadId);
-          if (target) {
-            await openChatThread(target.threadId, {
+        const exactAgentRecoveryThreadId = !state.unavailableAgentUpdateRecovery
+          ? sameAccountRecoveryAgent?.threadId
+            ?? (updateHandoff?.mode === "agent" ? updateHandoff.threadId : null)
+          : null;
+        if (exactAgentRecoveryThreadId !== null) {
+          try {
+            await restoreModeView({ autoOpen: false, prefetchedChatThreads: startupChatThreads });
+          } catch (error) {
+            if (clientReleaseMismatch(error) !== null) throw error;
+            // A sidebar-list outage must not prevent an exact authenticated
+            // thread read. The direct ledger replay below remains authoritative.
+            state.agentThreads = [];
+            renderThreads();
+          }
+          state.agentThreadId = exactAgentRecoveryThreadId;
+          if (!state.agentThreads.some((thread) => thread.id === exactAgentRecoveryThreadId)) {
+            state.agentThreads.unshift(Object.freeze({
+              id: exactAgentRecoveryThreadId,
+              title: "Recovered Agent conversation",
+            }));
+            renderThreads();
+          }
+          if (await openAgentThread(exactAgentRecoveryThreadId)) {
+            if (!state.agentSearchRecoveryChoicePending) finishRetainedUpdateRecovery();
+            state.agentAuthenticationRecoveryVerified = true;
+            if (!state.agentSearchRecoveryChoicePending) finishAgentAuthenticationRecovery();
+            updateImageControl();
+          }
+        } else if (!state.unavailableAgentUpdateRecovery) {
+          await restoreModeView({
+            autoOpen: updateHandoff === null
+              && sameAccountRecoveryWorkflow === null && sameAccountRecoveryGeneration === null
+              && sameAccountRecoveryAgent === null && !sameAccountRecoveryLegacy
+              && (claimedUpdateHandoff === null || state.updateHandoffConsumed),
+            prefetchedChatThreads: startupChatThreads,
+          });
+          if (sameAccountRecoveryAgent !== null && sameAccountRecoveryAgent.threadId === null) {
+            if (!state.agentSearchRecoveryChoicePending) finishRetainedUpdateRecovery();
+            state.agentAuthenticationRecoveryVerified = true;
+            if (!state.agentSearchRecoveryChoicePending) finishAgentAuthenticationRecovery();
+            updateImageControl();
+          }
+          if (restoredUpdateHandoff && updateHandoff.mode === "chat" && updateHandoff.threadId !== null) {
+            const target = state.chatThreads.find((thread) => thread.threadId === updateHandoff.threadId) ?? null;
+            await openChatThread(updateHandoff.threadId, {
               backgroundStream: true,
               threadHint: target,
               refreshThreadList: false,
             });
+            if (state.session === authenticatedSession && state.session.authenticated
+                && state.mode === "chat" && state.chatThreadId === updateHandoff.threadId) {
+              finishRetainedUpdateRecovery();
+            }
           }
-          else state.chatThreadId = null;
         }
       }
       catch (error) {
         const targetRelease = clientReleaseMismatch(error);
-        if (targetRelease !== null) {
-          await refreshForReleaseMismatch(targetRelease);
-          return;
-        }
+        // The caller owns login/resume single-flight state. Let it release
+        // that lock before a versioned navigation is attempted.
+        if (targetRelease !== null) throw error;
         if (state.mode === "chat" && isChatAuthenticationRejection(error)
             && requireFreshAuthentication({
               workflow: sameAccountRecoveryWorkflow,
               generationRecovery: sameAccountRecoveryGeneration,
             })) return;
-        if (state.mode === "agent") state.agentThreads = [];
+        if (state.mode === "agent") {
+          state.agentThreads = [];
+          if (state.agentAuthenticationRecoveryPending) state.agentReplayFailed = true;
+        }
         else {
           state.chatThreadListEpoch += 1;
           state.chatThreads = [];
@@ -3903,6 +4742,7 @@ export function createBrowserApp({
             renderThreads();
           }
         } catch (error) {
+          if (clientReleaseMismatch(error) !== null) throw error;
           if (recoverChatReadAuthentication(error, sameAccountRecoveryGeneration)) return;
           state.chatThreadId = sameAccountRecoveryGeneration.threadId;
           state.chatThread = sameAccountRecoveryGeneration.thread;
@@ -3979,6 +4819,7 @@ export function createBrowserApp({
     }
     state.viewEpoch += 1;
     state.streamAbort?.abort();
+    finishRetainedUpdateRecovery({ discard: true });
     state.imageSelectionEpoch += 1;
     state.imagePreparing = false;
     elements.message_input.value = "";
@@ -3987,6 +4828,11 @@ export function createBrowserApp({
     state.authRecoveryUsername = null;
     state.authRecoveryWorkflow = null;
     state.authRecoveryGeneration = null;
+    state.authRecoveryAgent = null;
+    state.authRecoveryLegacyUpdatePending = false;
+    state.authRecoveryLegacyMode = null;
+    state.authRecoveryLegacyDestinationChosen = false;
+    state.authRecoveryLegacyDestinationThreadId = null;
     clearChatFailureDiagnostic();
     state.agent = null;
     state.chat = null;
@@ -4009,6 +4855,19 @@ export function createBrowserApp({
     state.agentPendingResume = null;
     state.agentPendingThreadCreate = null;
     state.agentSearchSelected = false;
+    state.agentSearchRecoveryChoicePending = false;
+    state.legacyUpdateRecoveryPending = false;
+    state.legacyUpdateRecoveryDestinationChosen = false;
+    state.legacyUpdateRecoveryDestinationThreadId = null;
+    state.unavailableAgentUpdateRecovery = false;
+    state.retainedUpdateRecoveryPending = false;
+    state.retainedUpdateRecoveryDurable = false;
+    state.retainedUpdateRecoveryThreadId = null;
+    state.retainedUpdateRecoveryRecord = null;
+    invalidateRetainedUpdateRecoveryInstallation();
+    state.agentAuthenticationRecoveryPending = false;
+    state.agentAuthenticationRecoveryThreadId = null;
+    state.agentAuthenticationRecoveryVerified = false;
     state.agentReplayFailed = false;
     clearConversation();
     purgeAttachmentBlobCache();
@@ -4020,6 +4879,10 @@ export function createBrowserApp({
   }
 
   async function stop() {
+    if (claimedUpdateHandoff !== null && !state.updateHandoffConsumed) {
+      showToast("The protected update draft must be recovered before run controls can be used.");
+      return;
+    }
     if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed || state.agentCancelPending)) {
       showToast(state.agentHistoryRestoring
         ? "Wait for the read-only Agent history restoration to finish."
@@ -4060,6 +4923,7 @@ export function createBrowserApp({
           elements.stop_run.hidden = !state.capabilities.actions.cancel;
           updateImageControl();
           showToast("AgInTi cancellation could not be confirmed.");
+          flushDeferredSessionRevalidation();
         }
         return;
       }
@@ -4107,7 +4971,19 @@ export function createBrowserApp({
 
   async function resume() {
     if (state.busy || state.logoutPending) return;
-    if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed || state.agentCancelPending)) {
+    if (claimedUpdateHandoff !== null && !state.updateHandoffConsumed) {
+      showToast("The protected update draft must be recovered before run controls can be used.");
+      return;
+    }
+    const protectedRecord = state.retainedUpdateRecoveryPending
+      && !state.legacyUpdateRecoveryPending
+      ? state.retainedUpdateRecoveryRecord
+      : null;
+    const canRetryProtectedRestore = protectedRecord !== null;
+    const canRetryAgentVerification = state.mode === "agent" && state.unavailableAgentUpdateRecovery
+      && state.authRecoveryAgent !== null;
+    if (!canRetryProtectedRestore && !canRetryAgentVerification && state.mode === "agent"
+        && (state.agentHistoryRestoring || state.agentReplayFailed || state.agentCancelPending)) {
       elements.resume_run.hidden = true;
       showToast(state.agentHistoryRestoring
         ? "Wait for the read-only Agent history restoration to finish; no run was resumed."
@@ -4116,7 +4992,8 @@ export function createBrowserApp({
           : "Reopen this conversation to retry its read-only Agent history restoration; no run was resumed.");
       return;
     }
-    if (state.mode === "agent" && state.runId
+    if (!canRetryProtectedRestore && !canRetryAgentVerification
+        && state.mode === "agent" && state.runId
         && (!state.agentReplayOfferResume || state.agentRunStatus === "completed")) {
       elements.resume_run.hidden = true;
       showToast("This verified Agent run is not resumable.");
@@ -4126,8 +5003,55 @@ export function createBrowserApp({
     elements.resume_run.disabled = true;
     updateImageControl();
     let ownsAgentResume = null;
+    let releaseRefreshTarget = null;
     try {
-      if (state.mode === "chat") {
+      if (canRetryProtectedRestore) {
+        if (!installRetainedUpdateRecovery(protectedRecord, "Press Resume")) return;
+        connection("Retrying protected draft restoration", false);
+        if (protectedRecord.mode === "agent") {
+          if (state.capabilities.enabled !== true) {
+            state.authRecoveryPending = true;
+            state.authRecoveryUsername = normalizedSessionUsername(state.session.username);
+            state.authRecoveryAgent = Object.freeze({
+              threadId: protectedRecord.threadId,
+              draft: protectedRecord.draft,
+              search: protectedRecord.search,
+              searchInvalid: state.agentSearchRecoveryChoicePending,
+            });
+            state.authRecoveryLegacyUpdatePending = false;
+            state.authRecoveryLegacyMode = null;
+            state.authRecoveryLegacyDestinationChosen = false;
+            state.authRecoveryLegacyDestinationThreadId = null;
+            await authenticated(state.session);
+          } else if (protectedRecord.threadId !== null) {
+            state.agentThreadId = protectedRecord.threadId;
+            if (await openAgentThread(protectedRecord.threadId)) {
+              state.agentAuthenticationRecoveryVerified = true;
+              if (!state.agentSearchRecoveryChoicePending) {
+                finishRetainedUpdateRecovery();
+                finishAgentAuthenticationRecovery();
+              }
+            }
+          } else if (!state.agentSearchRecoveryChoicePending) {
+            state.agentReplayFailed = false;
+            finishRetainedUpdateRecovery();
+            finishAgentAuthenticationRecovery();
+          }
+        } else if (protectedRecord.mode === "chat" && protectedRecord.threadId !== null) {
+          const target = state.chatThreads.find((thread) => thread.threadId === protectedRecord.threadId) ?? null;
+          await openChatThread(protectedRecord.threadId, {
+            backgroundStream: true,
+            threadHint: target,
+            refreshThreadList: false,
+          });
+          if (state.chatThreadId === protectedRecord.threadId) finishRetainedUpdateRecovery();
+        } else {
+          finishRetainedUpdateRecovery();
+        }
+      } else if (canRetryAgentVerification) {
+        connection("Retrying Agent verification", false);
+        await authenticated(state.session);
+      } else if (state.mode === "chat") {
         if (state.authRecoveryGeneration) {
           const recovery = state.authRecoveryGeneration;
           await reconnectRecoveredChat(recovery);
@@ -4238,51 +5162,90 @@ export function createBrowserApp({
       }
     } catch (error) {
       if (ownsAgentResume !== null && !ownsAgentResume()) return;
-      if (state.agentPendingResume !== null && error?.retryable === false
+      releaseRefreshTarget = clientReleaseMismatch(error);
+      if (releaseRefreshTarget !== null) {
+        // The release fence is an authoritative pre-mutation rejection. The
+        // same draft/search remain in the composer and will be encrypted into
+        // the successor handoff, so this obsolete resume ticket must not block
+        // the version hop.
+        state.agentPendingResume = null;
+        connection("Migrating protected work to the newer app", false);
+      } else if (state.agentPendingResume !== null && error?.retryable === false
           && Number.isSafeInteger(error?.status) && error.status >= 400 && error.status < 499
           && error?.code !== "AGINTI_ABORTED") {
         state.agentPendingResume = null;
-      }
-      const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;
-      const ambiguousAuthenticationWorkflow = state.mode === "chat"
-        && state.chatPendingSend?.ambiguousMutation !== null
-        && state.chatPendingSend?.ambiguousMutation !== undefined
-        && isChatAuthenticationAfterAmbiguousDispatch(error)
-        ? state.chatPendingSend
-        : null;
-      if (authenticatedReadRecovery !== null
-          && recoverChatReadAuthentication(error, authenticatedReadRecovery)) {
-        /* The exact server-owned read descriptor remains available after same-account sign-in. */
-      } else if (ambiguousAuthenticationWorkflow !== null) {
-        const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
-          ambiguousAuthenticationWorkflow.ambiguousMutation,
-          error,
-        ));
-        connection(`Send confirmation paused · ${diagnostic.label}`, false);
-        showToast("Sign in again, then Resume the same exact send. No new request was created.");
-        requireFreshAuthentication({ workflow: ambiguousAuthenticationWorkflow });
-      } else if (state.mode === "chat" && state.chatPendingSend && isAuthoritativeChatRejection(error)) {
-        releaseRejectedChatWorkflow(state.chatPendingSend, error);
       } else {
-        showToast(state.mode === "chat"
-          ? "The durable LocalLLM request could not reconnect yet."
-          : "AgInTi could not resume this run.");
+        const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;
+        const ambiguousAuthenticationWorkflow = state.mode === "chat"
+          && state.chatPendingSend?.ambiguousMutation !== null
+          && state.chatPendingSend?.ambiguousMutation !== undefined
+          && isChatAuthenticationAfterAmbiguousDispatch(error)
+          ? state.chatPendingSend
+          : null;
+        if (authenticatedReadRecovery !== null
+            && recoverChatReadAuthentication(error, authenticatedReadRecovery)) {
+          /* The exact server-owned read descriptor remains available after same-account sign-in. */
+        } else if (ambiguousAuthenticationWorkflow !== null) {
+          const diagnostic = applyChatFailureDiagnostic(new LocalChatNotSentError(
+            ambiguousAuthenticationWorkflow.ambiguousMutation,
+            error,
+          ));
+          connection(`Send confirmation paused · ${diagnostic.label}`, false);
+          showToast("Sign in again, then Resume the same exact send. No new request was created.");
+          requireFreshAuthentication({ workflow: ambiguousAuthenticationWorkflow });
+        } else if (state.mode === "chat" && state.chatPendingSend && isAuthoritativeChatRejection(error)) {
+          releaseRejectedChatWorkflow(state.chatPendingSend, error);
+        } else {
+          showToast(state.mode === "chat"
+            ? "The durable LocalLLM request could not reconnect yet."
+            : "AgInTi could not resume this run.");
+        }
       }
     } finally {
       state.busy = false;
       elements.resume_run.disabled = false;
       updateImageControl();
       renderThreads();
+      flushDeferredSessionRevalidation();
     }
+    if (releaseRefreshTarget !== null) await refreshForReleaseMismatch(releaseRefreshTarget);
   }
 
   function newConversation() {
     if (interactionLocked()) return;
+    if (state.unavailableAgentUpdateRecovery) {
+      showToast("Agent is unavailable. Use Resume to retry protected verification before assigning this prompt.");
+      return;
+    }
+    const detachingRetainedAgentRecovery = state.mode === "agent"
+      && state.retainedUpdateRecoveryPending && state.agentReplayFailed
+      && !state.legacyUpdateRecoveryPending;
+    const detachingAuthenticationAgentRecovery = state.mode === "agent"
+      && state.agentAuthenticationRecoveryPending && state.agentReplayFailed;
+    const detachingSearchChoiceRecovery = state.mode === "agent"
+      && state.agentSearchRecoveryChoicePending && !state.legacyUpdateRecoveryPending
+      && state.capabilities.enabled === true;
+    const detachingProtectedComposer = state.retainedUpdateRecoveryPending
+      && !state.legacyUpdateRecoveryPending && !state.unavailableAgentUpdateRecovery
+      && state.retainedUpdateRecoveryRecord !== null;
+    const protectedRecord = state.retainedUpdateRecoveryPending
+      && !state.unavailableAgentUpdateRecovery
+      ? state.retainedUpdateRecoveryRecord
+      : null;
+    const protectedImagesUnavailable = protectedRecord?.images?.length > 0
+      && (state.mode !== "chat" || state.chatCapabilities.visionInput !== true);
+    if (protectedImagesUnavailable) {
+      elements.resume_run.hidden = false;
+      showToast("This protected prompt includes images that are not restored yet. Use Resume or reload; New conversation will not discard them.");
+      return;
+    }
     if (state.mode === "agent" && state.agentPendingThreadCreate !== null) {
       showToast("Retry the ready prompt to confirm its exact Agent conversation before creating another one.");
       return;
     }
-    if (state.mode === "agent" && state.agentReplayFailed) {
+    if (state.mode === "agent" && state.agentReplayFailed
+        && !detachingRetainedAgentRecovery && !detachingAuthenticationAgentRecovery
+        && !state.legacyUpdateRecoveryPending) {
       showToast("Reopen an Agent conversation and restore its verified history before creating new work.");
       return;
     }
@@ -4294,6 +5257,13 @@ export function createBrowserApp({
       showToast("Retry the pending conversation deletion before starting another conversation.");
       return;
     }
+    if (protectedRecord !== null) {
+      if (!installRetainedUpdateRecovery(protectedRecord, "Choose New conversation")) return;
+      // Explicit detachment owns the exact installed record. Consume it before
+      // changing thread or Search presentation so the final ownership check
+      // cannot be invalidated by our own authorized UI transition.
+      if (detachingProtectedComposer && !finishRetainedUpdateRecovery()) return;
+    }
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     if (state.mode === "agent") {
@@ -4301,7 +5271,38 @@ export function createBrowserApp({
       state.runId = null;
       state.agentRunStatus = null;
       state.agentPendingResume = null;
+      if (detachingRetainedAgentRecovery) {
+        state.agentReplayFailed = false;
+        state.agentSearchSelected = false;
+        state.agentSearchRecoveryChoicePending = false;
+        finishAgentAuthenticationRecovery();
+        showToast("Recovered prompt detached to a new Agent conversation with Search off.");
+      }
+      if (detachingProtectedComposer && !detachingRetainedAgentRecovery) {
+        state.agentSearchSelected = false;
+        state.agentSearchRecoveryChoicePending = false;
+        finishAgentAuthenticationRecovery();
+        showToast("Protected prompt assigned explicitly to a new Agent conversation with Search off.");
+      }
+      if (detachingAuthenticationAgentRecovery) {
+        state.agentReplayFailed = false;
+        state.agentSearchSelected = false;
+        state.agentSearchRecoveryChoicePending = false;
+        finishAgentAuthenticationRecovery();
+        showToast("Recovered prompt detached to a new Agent conversation with Search off.");
+      }
+      if (detachingSearchChoiceRecovery && !detachingProtectedComposer
+          && !detachingAuthenticationAgentRecovery) {
+        state.agentSearchSelected = false;
+        state.agentSearchRecoveryChoicePending = false;
+        finishRetainedUpdateRecovery();
+        finishAgentAuthenticationRecovery();
+        showToast("Recovered prompt assigned to a new Agent conversation with Search off.");
+      }
     } else {
+      if (detachingProtectedComposer) {
+        showToast("Protected prompt assigned explicitly to a new Direct Chat conversation.");
+      }
       state.chatThreadId = null;
       state.chatThread = null;
       state.chatGeneration = null;
@@ -4310,7 +5311,8 @@ export function createBrowserApp({
       state.chatAfterSequence = 0;
       state.chatOutput = "";
     }
-    clearSelectedImage();
+    resolveLegacyUpdateRecovery("a new conversation");
+    if (protectedRecord === null) clearSelectedImage();
     clearChatFailureDiagnostic();
     updateImageControl();
     elements.conversation_title.textContent = "New conversation";
@@ -4320,11 +5322,16 @@ export function createBrowserApp({
 
   function updateHasUnsafeActivity() {
     return state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null
+      || (claimedUpdateHandoff !== null && !state.updateHandoffConsumed)
       || state.chatHistoryRestoration !== null
       || state.imagePreparing || state.chatPendingSend !== null || state.chatPendingDeletion !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
       || state.agentPendingResume !== null || state.agentPendingThreadCreate !== null
+      || state.legacyUpdateRecoveryPending || state.unavailableAgentUpdateRecovery
+      || state.agentSearchRecoveryChoicePending
+      || state.retainedUpdateRecoveryPending
+      || state.agentAuthenticationRecoveryPending
       || (state.chatGeneration && !TERMINAL.has(state.chatGeneration.status))
       || (state.runId && !TERMINAL.has(state.agentRunStatus)) || state.streamAbort !== null;
   }
@@ -4337,7 +5344,7 @@ export function createBrowserApp({
   }
 
   function updateHandoffThreadId() {
-    return state.mode === "chat" ? state.chatThreadId : null;
+    return state.mode === "agent" ? state.agentThreadId : state.chatThreadId;
   }
 
   function invalidatePreparedUpdateHandoff() {
@@ -4350,13 +5357,20 @@ export function createBrowserApp({
   function updateHandoffMatchesComposer(targetRelease = state.updateTargetRelease) {
     const prepared = state.updatePreparedHandoff;
     const work = updateComposerWork();
+    let search;
+    try { search = updateHandoffSearch(); }
+    catch { return false; }
     return prepared !== null && prepared.targetRelease === targetRelease
-      && prepared.session === state.session && prepared.threadId === updateHandoffThreadId()
-      && prepared.draft === work.draft && prepared.images === work.images;
+      && prepared.session === state.session && prepared.mode === state.mode
+      && prepared.threadId === updateHandoffThreadId()
+      && prepared.draft === work.draft && prepared.images === work.images
+      && sameUpdateHandoffSearch(prepared.search, search);
   }
 
   function updateHandoffEligible(targetRelease) {
     const work = updateComposerWork();
+    try { updateHandoffSearch(); }
+    catch { return false; }
     return !updateHasUnsafeActivity() && state.session.authenticated
       && (state.mode === "chat" || (state.mode === "agent" && work.images.length === 0))
       && !state.authRecoveryPending && validAgentRelease(currentRelease) && validAgentRelease(targetRelease)
@@ -4377,8 +5391,10 @@ export function createBrowserApp({
     elements.defer_update.disabled = true;
     const epoch = state.updateHandoffEpoch;
     const session = state.session;
+    const mode = state.mode;
     const threadId = updateHandoffThreadId();
     const { draft, images: selectedImages } = updateComposerWork();
+    const search = updateHandoffSearch();
     try {
       claim = createUpdateHandoffClaim();
       state.updateHandoffStagingClaim = claim;
@@ -4396,12 +5412,14 @@ export function createBrowserApp({
         `lazying-agent-update-account\u0000${normalizedSessionUsername(session.username)}`,
       ));
       const unsigned = Object.freeze({
-        schemaVersion: UPDATE_HANDOFF_SCHEMA_VERSION,
+        schemaVersion: UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION,
         scope: workerScope,
         sourceRelease: currentRelease,
         targetRelease,
         createdAt: instant,
         accountDigest,
+        mode,
+        search,
         threadId,
         draft: updateHandoffDraft(draft),
         images,
@@ -4411,15 +5429,18 @@ export function createBrowserApp({
         digest: await updateHandoffDigest(updateHandoffDigestInput(unsigned)),
       });
       await updateHandoffStore.save(await encryptUpdateHandoff(record, claim));
-      if (epoch !== state.updateHandoffEpoch || state.session !== session
+      if (epoch !== state.updateHandoffEpoch || state.session !== session || state.mode !== mode
           || updateHandoffThreadId() !== threadId || !updateHandoffEligible(targetRelease)
-          || elements.message_input.value !== draft || state.selectedImages !== selectedImages) {
+          || elements.message_input.value !== draft || state.selectedImages !== selectedImages
+          || !sameUpdateHandoffSearch(search, updateHandoffSearch())) {
         await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
         return false;
       }
       state.updatePreparedHandoff = Object.freeze({
         targetRelease,
         session,
+        mode,
+        search,
         threadId,
         draft,
         images: selectedImages,
@@ -4442,38 +5463,81 @@ export function createBrowserApp({
     }
   }
 
-  async function consumeUpdateHandoff() {
+  async function consumeUpdateHandoff({ agentCapabilities, retainUntilInitialized = false }) {
     if (state.updateHandoffConsumed || claimedUpdateHandoff === null
         || !state.session.authenticated || !validAgentRelease(currentRelease)) return null;
-    state.updateHandoffConsumed = true;
     let value;
     try { value = await updateHandoffStore.take(workerScope, claimedUpdateHandoff.handoffId); }
     catch {
-      showToast("The saved update draft could not be read safely and was not restored.");
+      showToast("The saved update draft could not be read yet. Its local recovery key remains available; reload or sign in again to retry.");
       return null;
     }
+    state.updateHandoffConsumed = true;
     if (value === null || value === undefined) {
+      scrubCapturedUpdateHandoffClaim(window);
       showToast("The saved update draft was no longer available and was not restored.");
       return null;
     }
     try {
-      return await decryptUpdateHandoff(value, claimedUpdateHandoff, {
+      const record = await decryptUpdateHandoff(value, claimedUpdateHandoff, {
         scope: workerScope,
         currentRelease,
         username: state.session.username,
         now,
       });
+      const searchAvailable = record.search === null || (agentCapabilities?.search?.enabled === true
+        && agentCapabilities.search.modes.includes(record.search.mode)
+        && record.search.limit <= agentCapabilities.search.maximumSources);
+      const unavailableAgentRecovery = record.mode === "agent"
+        && (agentCapabilities?.enabled !== true || !searchAvailable);
+      const requiresVerification = unavailableAgentRecovery || record.legacyModeAmbiguous
+        || record.threadId !== null;
+      const retainUntilVerified = retainUntilInitialized || requiresVerification;
+      let retainedForReload = false;
+      if (retainUntilVerified) {
+        try {
+          await updateHandoffStore.save(value);
+          retainedForReload = retainCapturedUpdateHandoffClaim(window, claimedUpdateHandoff);
+          if (!retainedForReload) {
+            await updateHandoffStore.discard(workerScope, claimedUpdateHandoff.handoffId).catch(() => {});
+          }
+        } catch { retainedForReload = false; }
+      }
+      if (!retainedForReload) scrubCapturedUpdateHandoffClaim(window);
+      return Object.freeze({
+        record,
+        unavailableAgentRecovery,
+        requiresVerification,
+        retainedForReload,
+      });
     } catch {
+      scrubCapturedUpdateHandoffClaim(window);
       showToast("A saved update draft failed its safety checks and was discarded.");
       return null;
     }
   }
 
   function restoreUpdateHandoff(record) {
-    if (record === null || !state.session.authenticated || state.mode !== "chat"
-        || state.chatPendingSend !== null || elements.message_input.value || state.selectedImages.length > 0) return false;
+    if (record === null || !state.session.authenticated || (record.mode !== null && state.mode !== record.mode)
+        || state.chatPendingSend !== null
+        || (elements.message_input.value && elements.message_input.value !== record.draft)
+        || state.selectedImages.length > 0) return false;
     let detached = null;
     try {
+      let restoredSearch = false;
+      if (record.search !== null) {
+        const capability = state.capabilities.search;
+        const supported = state.mode === "agent" && capability?.enabled === true
+          && capability.modes.includes(record.search.mode)
+          && record.search.limit <= capability.maximumSources;
+        if (!supported && !state.unavailableAgentUpdateRecovery
+            && !state.agentSearchRecoveryChoicePending) return false;
+        if (supported) {
+          elements.search_mode.value = record.search.mode;
+          elements.search_limit.value = String(record.search.limit);
+          restoredSearch = true;
+        }
+      }
       if (record.images.length > 0) {
         if (state.chatCapabilities.visionInput !== true) return false;
         const selected = Object.freeze(record.images.map((image) => {
@@ -4494,7 +5558,17 @@ export function createBrowserApp({
         if (!restoreDetachedImage(detached)) return false;
         detached = null;
       }
+      if (state.mode === "agent") state.agentSearchSelected = restoredSearch;
       elements.message_input.value = record.draft;
+      if (state.retainedUpdateRecoveryRecord === record) {
+        state.retainedUpdateRecoveryInstalled = true;
+        state.retainedUpdateRecoveryInstallation = Object.freeze({
+          record,
+          mode: state.mode,
+          images: state.selectedImages,
+          search: retainedUpdateRecoverySearchSignature(),
+        });
+      }
       updateImageControl();
       showToast(record.images.length === 0
         ? "Updated app loaded. Your unsent prompt was restored; review it before sending."
@@ -4528,25 +5602,295 @@ export function createBrowserApp({
     return replaceWithRelease(releaseId);
   }
 
-  function replaceWithRelease(releaseId) {
+  function replaceWithRelease(releaseId, {
+    handoffClaim = state.updatePreparedHandoff?.claim ?? null,
+  } = {}) {
     if (state.updateReloaded || !validAgentRelease(releaseId)) return false;
     state.updateReloaded = true;
     clearUpdateReloadTimers();
     const target = new URL(workerScope, window.location.href);
     target.search = `?v=${encodeURIComponent(releaseId)}`;
-    target.hash = state.updatePreparedHandoff === null
-      ? ""
-      : updateHandoffFragment(state.updatePreparedHandoff.claim);
+    target.hash = handoffClaim === null ? "" : updateHandoffFragment(handoffClaim);
     purgeAttachmentMemory();
     if (typeof window?.location?.replace === "function") window.location.replace(target.href);
     else if (window?.location) window.location.href = target.href;
     return true;
   }
 
+  function authenticationRecoveryUpdateDescriptor() {
+    if (!state.session.authenticated || state.retainedUpdateRecoveryPending
+        || state.chatPendingSend !== null || state.authRecoveryWorkflow !== null) return null;
+    const session = state.session;
+    if (state.authRecoveryUsername !== null
+        && normalizedSessionUsername(session.username) !== state.authRecoveryUsername) return null;
+    const selectedImages = state.selectedImages;
+    const recoveryAgent = state.authRecoveryAgent;
+    if (recoveryAgent !== null) {
+      if (recoveryAgent.searchInvalid === true || selectedImages.length !== 0
+          || String(elements.message_input.value ?? "") !== recoveryAgent.draft) return null;
+      return Object.freeze({
+        session,
+        owner: recoveryAgent,
+        mode: "agent",
+        threadId: recoveryAgent.threadId,
+        draft: recoveryAgent.draft,
+        images: selectedImages,
+        search: recoveryAgent.search,
+        current: () => state.session === session && state.authRecoveryAgent === recoveryAgent
+          && state.selectedImages === selectedImages
+          && String(elements.message_input.value ?? "") === recoveryAgent.draft,
+      });
+    }
+    const recoveryGeneration = state.authRecoveryGeneration;
+    if (recoveryGeneration !== null) {
+      const draft = String(elements.message_input.value ?? "");
+      return Object.freeze({
+        session,
+        owner: recoveryGeneration,
+        mode: "chat",
+        threadId: recoveryGeneration.threadId,
+        draft,
+        images: selectedImages,
+        search: null,
+        current: () => state.session === session
+          && state.authRecoveryGeneration === recoveryGeneration
+          && state.selectedImages === selectedImages
+          && String(elements.message_input.value ?? "") === draft,
+      });
+    }
+    if (!state.authRecoveryPending || state.mode !== "chat") return null;
+    const draft = String(elements.message_input.value ?? "");
+    const threadId = state.chatThreadId;
+    if (draft.length === 0 && selectedImages.length === 0 && threadId === null) return null;
+    return Object.freeze({
+      session,
+      owner: null,
+      mode: "chat",
+      threadId,
+      draft,
+      images: selectedImages,
+      search: null,
+      current: () => state.session === session && state.authRecoveryPending
+        && state.authRecoveryAgent === null && state.authRecoveryGeneration === null
+        && state.selectedImages === selectedImages
+        && String(elements.message_input.value ?? "") === draft,
+    });
+  }
+
+  async function carryAuthenticationRecoveryToRelease(targetRelease, descriptor) {
+    if (descriptor === null || state.updateHandoffInFlight || state.updateReloaded
+        || !validAgentRelease(currentRelease) || !validAgentRelease(targetRelease)
+        || targetRelease === currentRelease) return false;
+    state.updateHandoffInFlight = true;
+    elements.apply_update.disabled = true;
+    elements.defer_update.disabled = true;
+    let claim = null;
+    try {
+      const mode = descriptor.mode;
+      const threadId = descriptor.threadId;
+      if (!descriptor.current() || !["chat", "agent"].includes(mode)
+          || (threadId !== null && (typeof threadId !== "string"
+            || !UPDATE_HANDOFF_IDENTIFIER.test(threadId)))
+          || (mode === "agent" && descriptor.images.length !== 0)) return false;
+      const draft = updateHandoffDraft(descriptor.draft);
+      const images = updateHandoffImages(descriptor.images.map((selectedImage) => ({
+        attachmentId: selectedImage.attachmentId,
+        mediaType: selectedImage.mediaType,
+        byteLength: selectedImage.byteLength,
+        width: selectedImage.width,
+        height: selectedImage.height,
+        bytes: selectedImage.bytes,
+      })));
+      const search = descriptor.search === null ? null : validateAgentSearch(descriptor.search);
+      if ((search !== null && mode !== "agent")
+          || (draft.length === 0 && images.length === 0 && threadId === null)) return false;
+      const instant = Number(now());
+      if (!Number.isSafeInteger(instant) || instant < 0) return false;
+      claim = createUpdateHandoffClaim();
+      state.updateHandoffStagingClaim = claim;
+      const accountDigest = await updateHandoffDigest(updateHandoffEncoder.encode(
+        `lazying-agent-update-account\u0000${normalizedSessionUsername(descriptor.session.username)}`,
+      ));
+      const unsigned = Object.freeze({
+        schemaVersion: UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION,
+        scope: workerScope,
+        sourceRelease: currentRelease,
+        targetRelease,
+        createdAt: instant,
+        accountDigest,
+        mode,
+        search,
+        threadId,
+        draft,
+        images,
+      });
+      const record = Object.freeze({
+        ...unsigned,
+        digest: await updateHandoffDigest(updateHandoffDigestInput(unsigned)),
+      });
+      await updateHandoffStore.save(await encryptUpdateHandoff(record, claim));
+      if (!descriptor.current()) {
+        await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+        return false;
+      }
+      if (replaceWithRelease(targetRelease, { handoffClaim: claim })) return true;
+      await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+      return false;
+    } catch {
+      if (claim !== null) await updateHandoffStore.discard(workerScope, claim.handoffId).catch(() => {});
+      showToast("The newer app is ready, but authenticated recovery could not be carried safely yet. This page kept the exact work for retry.");
+      return false;
+    } finally {
+      state.updateHandoffInFlight = false;
+      state.updateHandoffStagingClaim = null;
+      if (!state.updateReloaded && !state.updateConfirmed) {
+        elements.apply_update.disabled = false;
+        elements.defer_update.disabled = false;
+      }
+    }
+  }
+
+  async function migrateRetainedUpdateHandoff(targetRelease) {
+    const record = state.retainedUpdateRecoveryRecord;
+    if (record === null || claimedUpdateHandoff === null || !state.session.authenticated
+        || !validAgentRelease(targetRelease) || targetRelease === currentRelease) return false;
+    const instant = Number(now());
+    if (!Number.isSafeInteger(instant) || instant < 0) return false;
+    const common = {
+      schemaVersion: record.schemaVersion,
+      scope: workerScope,
+      sourceRelease: currentRelease,
+      targetRelease,
+      createdAt: instant,
+      accountDigest: record.accountDigest,
+      threadId: record.threadId,
+      draft: record.draft,
+      ...(record.schemaVersion === UPDATE_HANDOFF_PAYLOAD_SCHEMA_VERSION
+        ? { mode: record.mode, search: record.search }
+        : {}),
+    };
+    const unsigned = Object.freeze(record.schemaVersion === UPDATE_HANDOFF_LEGACY_SCHEMA_VERSION
+      ? { ...common, image: record.images[0] ?? null }
+      : { ...common, images: record.images });
+    const migrated = Object.freeze({
+      ...unsigned,
+      digest: await updateHandoffDigest(updateHandoffDigestInput(unsigned)),
+    });
+    const migrationClaim = Object.freeze({
+      handoffId: claimedUpdateHandoff.handoffId,
+      key: claimedUpdateHandoff.key,
+    });
+    await updateHandoffStore.save(await encryptUpdateHandoff(migrated, migrationClaim));
+    state.retainedUpdateRecoveryDurable = true;
+    return replaceWithRelease(targetRelease, { handoffClaim: migrationClaim });
+  }
+
+  function retainedUpdateMigrationHasCompetingComposer(record = state.retainedUpdateRecoveryRecord) {
+    if (record !== null && retainedUpdateRecoveryInstallationCurrent(record)) return false;
+    const visibleDraft = String(elements.message_input.value ?? "");
+    const installationSearchChanged = record !== null
+      && state.retainedUpdateRecoveryInstallation?.record === record
+      && state.retainedUpdateRecoveryInstallation.search !== retainedUpdateRecoverySearchSignature();
+    return installationSearchChanged || retainedUpdateRecoverySearchConflicts(record)
+      || (record !== null && visibleDraft.length > 0 && visibleDraft !== record.draft)
+      || (record === null && visibleDraft.length > 0)
+      || state.selectedImages.length > 0;
+  }
+
+  function signedOutRetainedUpdateHasCompetingComposer(record) {
+    const visibleDraft = String(elements.message_input.value ?? "");
+    if (visibleDraft.length > 0 && visibleDraft !== record.draft) return true;
+    if (state.selectedImages.length === 0) return false;
+    const installation = state.retainedUpdateRecoveryInstallation;
+    return installation?.record !== record || installation.images !== state.selectedImages;
+  }
+
+  function exposeReleaseRecoveryControls(mode = state.retainedUpdateRecoveryRecord?.mode) {
+    if (!state.session.authenticated || !elements.app_view.hidden) return;
+    if (mode === "agent" || mode === "chat") {
+      setMode(mode, {
+        restoreView: false,
+        remember: false,
+        allowUnavailableAgentRecovery: true,
+        allowRetainedUpdateRecovery: true,
+        allowAgentAuthenticationRecovery: true,
+      });
+    }
+    showApp();
+    elements.logout.disabled = true;
+    elements.resume_run.hidden = false;
+    connection("Update recovery needs confirmation", false);
+    updateImageControl();
+  }
+
   async function refreshForReleaseMismatch(targetRelease) {
     if (!validAgentRelease(targetRelease) || targetRelease === currentRelease || state.updateReloaded) return false;
     state.updateTargetRelease = targetRelease;
     elements.update_banner.hidden = false;
+    if (claimedUpdateHandoff !== null && !state.updateHandoffConsumed) {
+      if (retainedUpdateMigrationHasCompetingComposer(null)) {
+        showToast("A newer app is required, but different browser-restored work is also present. It stayed on this page; clear it explicitly before retrying the protected refresh.");
+        return false;
+      }
+      // Session restore itself may be release-fenced before account-bound
+      // decryption is possible. Carry the untouched local row and fragment to
+      // the exact successor; the successor still must authenticate the account
+      // digest before displaying any plaintext.
+      try {
+        const chainedClaim = await createChainedUpdateHandoffClaim(
+          claimedUpdateHandoff,
+          currentRelease,
+          targetRelease,
+        );
+        return replaceWithRelease(targetRelease, { handoffClaim: chainedClaim });
+      } catch {
+        showToast("A newer app is ready, but the unread protected prompt could not be carried safely yet.");
+        return false;
+      }
+    }
+    if (state.retainedUpdateRecoveryRecord !== null && claimedUpdateHandoff !== null) {
+      if (!state.session.authenticated && state.retainedUpdateRecoveryDurable) {
+        // Signing out intentionally resets the visible mode and Search controls.
+        // The ciphertext still owns their exact values, so compare only real
+        // browser composer divergence before carrying that row opaquely.
+        if (signedOutRetainedUpdateHasCompetingComposer(state.retainedUpdateRecoveryRecord)) {
+          showLogin("A different browser-restored draft is also present. Sign in to choose which protected work to keep.", {
+            preservePassword: true,
+          });
+          return false;
+        }
+        try {
+          const chainedClaim = await createChainedUpdateHandoffClaim(
+            claimedUpdateHandoff,
+            currentRelease,
+            targetRelease,
+          );
+          return replaceWithRelease(targetRelease, { handoffClaim: chainedClaim });
+        } catch {
+          showToast("A newer app is ready, but the signed-out protected prompt could not be carried safely yet.");
+          return false;
+        }
+      }
+      if (retainedUpdateMigrationHasCompetingComposer()) {
+        invalidateRetainedUpdateRecoveryInstallation();
+        exposeReleaseRecoveryControls();
+        elements.resume_run.hidden = false;
+        showToast("A newer app is required, but a different browser-restored composer is also present. It and the protected prompt were both retained; press Resume twice to choose the protected prompt before refreshing.");
+        updateImageControl();
+        return false;
+      }
+      try {
+        if (await migrateRetainedUpdateHandoff(targetRelease)) return true;
+      } catch { /* The current in-memory and encrypted recovery remain authoritative. */ }
+      showToast("A newer app is ready, but the protected recovered prompt could not be migrated yet. Retry without re-sending it.");
+      return false;
+    }
+    const authenticationRecovery = authenticationRecoveryUpdateDescriptor();
+    if (authenticationRecovery !== null) {
+      if (await carryAuthenticationRecoveryToRelease(targetRelease, authenticationRecovery)) return true;
+      exposeReleaseRecoveryControls(authenticationRecovery.mode);
+      return false;
+    }
     if (updateHasUnsafeActivity()) return false;
     const work = updateComposerWork();
     if (work.draft.length > 0 || work.images.length > 0) {
@@ -4688,6 +6032,9 @@ export function createBrowserApp({
       if (elements.search_toggle.disabled || elements.search_controls.hidden) return;
       state.agentSearchSelected = !state.agentSearchSelected;
       updateSearchControl();
+      if (state.agentSearchSelected && agentSearchRecoveryChoiceReady()) {
+        confirmAgentSearchRecoveryChoice();
+      }
     });
     elements.agent_mode.addEventListener("click", () => setMode("agent"));
     elements.chat_mode.addEventListener("click", () => setMode("chat"));
@@ -4732,7 +6079,13 @@ export function createBrowserApp({
     });
     for (const input of [elements.username, elements.password, elements.message_input]) {
       input.addEventListener("input", () => {
-        if (input === elements.message_input) invalidatePreparedUpdateHandoff();
+        if (input === elements.message_input) {
+          invalidatePreparedUpdateHandoff();
+          if (state.retainedUpdateRecoveryPending) {
+            invalidateRetainedUpdateRecoveryInstallation();
+            state.protectedComposerReplacementConfirmation = null;
+          }
+        }
         if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
         state.updateSafetyTimer = null;
         scheduleSafeUpdateReload();

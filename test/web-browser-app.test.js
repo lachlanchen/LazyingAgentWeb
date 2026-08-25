@@ -562,11 +562,24 @@ async function verifiedEvents(entries, { runId = RUN_ID } = {}) {
 }
 
 function run(status = "running", overrides = {}) {
+  const id = overrides.id ?? RUN_ID;
+  const defaultPreviousRunId = id === SECOND_RUN_ID
+    ? RUN_ID
+    : (id === THIRD_RUN_ID ? SECOND_RUN_ID : null);
   return {
-    id: RUN_ID,
+    id,
     threadId: THREAD_ID,
+    previousRunId: Object.hasOwn(overrides, "previousRunId")
+      ? overrides.previousRunId
+      : defaultPreviousRunId,
     status,
+    createdAt: NOW,
+    startedAt: NOW,
+    completedAt: ["completed", "failed", "cancelled"].includes(status) ? NOW : null,
+    cancelRequestedAt: null,
     output: status === "completed" ? "Done" : "",
+    error: null,
+    authority: { kind: "aginti", snapshotHash: null, runtimeRevision: null, contextDigest: null },
     eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: ZERO_HASH, prunedThroughSeq: 0 },
     ...overrides,
   };
@@ -586,13 +599,32 @@ function terminalRun(status, events, overrides = {}) {
 }
 
 function agentThread(overrides = {}) {
+  const messages = (overrides.messages ?? []).map((message) => ({
+    ...message,
+    id: /^msg_[A-Za-z0-9_-]{16,96}$/u.test(message.id)
+      ? message.id
+      : `${message.id}${"_".repeat(Math.max(0, 20 - message.id.length))}`,
+    createdAt: message.createdAt ?? NOW,
+    digest: message.digest ?? digest(message.content),
+  }));
   return {
     id: THREAD_ID,
     title: "Agent calculation",
+    status: "idle",
+    revision: 1,
+    createdAt: NOW,
+    updatedAt: NOW,
     lastRunId: null,
-    authority: { lastCompaction: null },
-    messages: [],
+    authority: {
+      kind: "aginti",
+      mapped: false,
+      runtimeRevision: null,
+      contextDigest: null,
+      lastCompaction: null,
+    },
+    replay: { prunedMessageCount: 0, anchorDigest: ZERO_HASH },
     ...overrides,
+    messages,
   };
 }
 
@@ -1587,7 +1619,11 @@ test("a persisted assistant run cannot bypass exact terminal replay by also bein
   await browser.app.initialize();
 
   assert.equal(streams, 0, "persisted assistant content requires a terminal cursor-bound replay");
-  assert.match(browser.document.getElementById("messages").textContent, /Stored fallback/u);
+  assert.doesNotMatch(
+    browser.document.getElementById("messages").textContent,
+    /Stored fallback/u,
+    "an ancestry-invalid thread fails closed before projecting unverified replay content",
+  );
   assert.match(browser.document.getElementById("toast").textContent, /could not be restored safely/u);
   assert.equal(browser.document.getElementById("resume-run").hidden, true);
   await browser.app.resume();
@@ -2304,6 +2340,7 @@ test("a buffered event from an abandoned Agent view cannot mutate the successor 
   const streamEntered = Promise.withResolvers();
   const releaseStale = Promise.withResolvers();
   const thread = agentThread({
+    status: "running",
     lastRunId: RUN_ID,
     messages: [{ id: "msg_user_stale_0001", role: "user", content: "Old work", runId: RUN_ID }],
   });

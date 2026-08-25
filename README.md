@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.27 candidate; v0.1.25 production):** production is promoted
+> **Deployment status (v0.1.28 candidate; v0.1.27 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -12,7 +12,7 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > separate and does not enable or authorize Agent. Current accepted Agent
 > requests can execute one exact fenced `python` block without model planning,
 > retain public failure reasons across reload, and follow exact idempotent Resume
-> successor runs with an optional corrected prompt. The accepted v0.1.25 release makes
+> successor runs with an optional corrected prompt. The accepted production release makes
 > completed Agent conversations truly multi-turn: later prompts resume the exact
 > terminal predecessor, retry an uncertain mutation once with the same idempotency
 > key, and keep any rejected prompt editable without an optimistic duplicate.
@@ -24,7 +24,7 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > The baseline accepted artifacts remain declarative plot, table, and Markdown
 > schemas. Responsive plot artifacts in v0.1.25 use the available message width,
 > retain readable axes on DPR3 phones, wrap legends, and cannot be reflowed into
-> the sidebar column by privacy masking. The v0.1.27 candidate also makes an
+> the sidebar column by privacy masking. The accepted v0.1.27 release also makes an
 > already-restored Agent-thread selection idempotent: clicking it cannot launch
 > a redundant ledger replay that detaches and rebuilds messages or figures, while
 > an invalid replay or unconfirmed mutation remains explicitly reopenable for
@@ -32,7 +32,12 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > lost retains its exact idempotency ticket for the next Send instead of
 > deadlocking or minting a duplicate. Numeric plot axes choose the shortest
 > distinguishing visible tick labels while retaining exact
-> values in accessible plot metadata. v0.1.24 preserves the v0.1.23
+> values in accessible plot metadata. The v0.1.28 candidate also preserves an
+> unsent Agent follow-up across a release-fenced full reload: the encrypted
+> handoff retains its mode and owned thread, replays that thread after reload,
+> derives the authoritative terminal predecessor, and only then enables the
+> restored draft. The next Send therefore resumes the same Agent run instead of
+> silently changing to Direct Chat. v0.1.24 preserves the v0.1.23
 > backward-compatible, default-disabled grounded-search extension: only an exact
 > AgInTi capability may reveal the explicit Search
 > controls, bind `{mode: web|papers|both, limit: 1..20}` to one Agent input, and
@@ -124,15 +129,32 @@ only after the new worker controls the tab. Activation retains the current and
 immediately previous verified shell. An offline or failed update leaves the
 current app usable.
 
-If Update is confirmed while a definitively unsent Direct Chat prompt or up to
-four bounded images are still in the composer, the page stores one bounded
-AES-GCM ciphertext in a dedicated IndexedDB store. Its random key exists only in the replacement
-navigation fragment, which is scrubbed before asynchronous startup. The exact
-account, scope, source/target releases, expiry, digest, and canonical image
-contract are revalidated; the record is atomically consumed once and is never
-auto-sent. Expired, malformed, and excess orphan records are pruned. Passwords,
-active sends, generations, Agent runs, and ambiguous mutations cannot use this
-handoff.
+If Update is confirmed while a definitively unsent Direct Chat composer is
+eligible, or while an exact Agent composer is idle or follows an authoritative
+terminal run, the page stores one bounded AES-GCM ciphertext in a dedicated
+IndexedDB store. The v0.1.28 inner payload schema v3 preserves the exact mode,
+owned Agent thread when present, explicit Search settings or No Search, draft,
+and bounded images. Its random key exists only in the replacement navigation
+fragment, which browsers never send in HTTP requests. The fragment deliberately
+remains while authenticated take and decryption are pending; only a bounded
+recovery retry or verified release hop reattaches it, and successful recovery
+then scrubs it. The exact account, scope, source/target releases, expiry, digest,
+and canonical image contract are revalidated; restoration never dispatches the
+draft. Expired, malformed, and excess orphan records are pruned. Passwords,
+active sends or generations, nonterminal Agent work, and ambiguous mutations
+remain reload blockers.
+
+If a release fence is discovered while same-account sign-in is only restoring
+an already server-owned Agent or Direct Chat conversation, v3 may carry an
+empty exact thread selection as read-recovery metadata. It never carries or
+replays a mutation ticket. A durable ciphertext can also cross a signed-out
+release fence through a key-authenticated opaque hop; account verification
+still happens only in the successor before any plaintext is shown.
+
+A v0.1.27 handoff has an inner schema-v2 payload that cannot prove its original
+conversation mode or Search choice. v0.1.28 therefore keeps that recovered
+composer read-only until the user explicitly chooses its destination and then
+confirms **Search** or **No Search**; it never guesses and never auto-sends.
 
 The handoff accepts at most four canonical images and 16 MiB in aggregate. Any
 larger, active, ambiguous, malformed, expired, or ownership-mismatched draft is

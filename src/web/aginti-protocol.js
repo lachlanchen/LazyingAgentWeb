@@ -840,11 +840,27 @@ export function validateThread(value) {
   }
   const replay = exact(thread.replay, ["prunedMessageCount", "anchorDigest"], "thread replay");
   if (!DIGEST.test(replay.anchorDigest)) invalid("thread replay anchorDigest is invalid");
+  const prunedMessageCount = boundedInteger(replay.prunedMessageCount, "thread prunedMessageCount", {
+    maximum: 10_000_000,
+  });
+  if ((prunedMessageCount === 0) !== (replay.anchorDigest === ZERO_HASH)) {
+    invalid("thread replay anchor is inconsistent");
+  }
   const messages = thread.messages ?? [];
   if (!Array.isArray(messages) || messages.length > 256) invalid("thread replay exceeds 256 messages");
   const checkedMessages = messages.map(publicMessage);
   if (checkedMessages.reduce((sum, message) => sum + message.content.length, 0) > 256_000) {
     invalid("thread replay exceeds 256000 characters");
+  }
+  const lastRunId = thread.lastRunId === null ? null : validateRunId(thread.lastRunId);
+  if (lastRunId === null && checkedMessages.length !== 0) {
+    invalid("thread replay messages require a lastRunId");
+  }
+  if (lastRunId === null && thread.status === "running") {
+    invalid("a running thread requires a lastRunId");
+  }
+  if (lastRunId === null && prunedMessageCount !== 0) {
+    invalid("a pristine thread cannot declare a pruned replay prefix");
   }
   return Object.freeze({
     id: validateThreadId(thread.id),
@@ -853,7 +869,7 @@ export function validateThread(value) {
     revision: boundedInteger(thread.revision, "thread revision", { minimum: 1 }),
     createdAt: timestamp(thread.createdAt, "thread createdAt"),
     updatedAt: timestamp(thread.updatedAt, "thread updatedAt"),
-    lastRunId: thread.lastRunId === null ? null : validateRunId(thread.lastRunId),
+    lastRunId,
     authority: Object.freeze({
       kind: "aginti",
       mapped: authority.mapped,
@@ -862,7 +878,7 @@ export function validateThread(value) {
       lastCompaction,
     }),
     replay: Object.freeze({
-      prunedMessageCount: boundedInteger(replay.prunedMessageCount, "thread prunedMessageCount", { maximum: 10_000_000 }),
+      prunedMessageCount,
       anchorDigest: replay.anchorDigest,
     }),
     messages: Object.freeze(checkedMessages),
@@ -914,6 +930,111 @@ export function validateRun(value) {
       contextDigest: authority.contextDigest,
     }),
     eventCursor: Object.freeze({ firstSeq, lastSeq, lastHash: cursor.lastHash, prunedThroughSeq }),
+  });
+}
+
+// This validator accepts a full threads/get replay projection plus the exact
+// runs/status records named by its messages and lastRunId. Retained-native
+// threads may expose an empty optional message projection even when their head
+// extends older durable runs; in that case the exact head remains authoritative
+// but the unseen prefix is deliberately opaque.
+export function validateThreadRunAncestry(threadValue, runValues) {
+  const thread = validateThread(threadValue);
+  if (thread.status === "deleting") invalid("a deleting thread cannot unlock Agent follow-up");
+  denseDataArray(runValues, "thread replay runs", { maximum: 257 });
+  const runs = runValues.map(validateRun);
+  const expectedRunIds = new Set(thread.messages.map((message) => message.runId));
+  if (thread.lastRunId !== null) expectedRunIds.add(thread.lastRunId);
+  const runsById = new Map();
+  for (const run of runs) {
+    if (run.threadId !== thread.id) invalid("thread replay run belongs to a different thread");
+    if (runsById.has(run.id)) invalid("thread replay contains a duplicate run");
+    if (!expectedRunIds.has(run.id)) invalid("thread replay contains an unexpected run");
+    runsById.set(run.id, run);
+  }
+  if (runsById.size !== expectedRunIds.size) invalid("thread replay is missing a run status");
+  if (thread.lastRunId === null) {
+    return Object.freeze({
+      runs: Object.freeze([]),
+      headRun: null,
+      omittedPrefix: false,
+      requiresThreadRefresh: false,
+    });
+  }
+
+  const headRun = runsById.get(thread.lastRunId);
+  if (!headRun) invalid("thread replay is missing its declared run head");
+  const active = (run) => run.status === "starting" || run.status === "running";
+  const headIsActive = active(headRun);
+  // Thread and run snapshots come from separate RPCs. A run may atomically
+  // finish between them, but a terminal head can never become active again.
+  if (thread.status !== "running" && headIsActive) {
+    invalid("thread status does not match its replayed run head");
+  }
+  const requiresThreadRefresh = thread.status === "running" && !headIsActive;
+  for (const run of runs) {
+    if (run.id !== headRun.id && active(run)) invalid("a historical replay run is not terminal");
+  }
+  const assistantRuns = new Set(
+    thread.messages.filter((message) => message.role === "assistant").map((message) => message.runId),
+  );
+  for (const runId of assistantRuns) {
+    if (active(runsById.get(runId))) invalid("a persisted assistant replay run is not terminal");
+  }
+
+  const successorCounts = new Map();
+  for (const run of runs) {
+    if (run.previousRunId === null) continue;
+    const successors = (successorCounts.get(run.previousRunId) ?? 0) + 1;
+    if (successors > 1) invalid("thread replay run ancestry branches");
+    successorCounts.set(run.previousRunId, successors);
+    const previous = runsById.get(run.previousRunId);
+    if (previous && previous.createdAt > run.createdAt) invalid("thread replay predecessor is newer than its successor");
+  }
+  const completed = new Set();
+  for (const origin of runs) {
+    if (completed.has(origin.id)) continue;
+    const path = new Set();
+    let ancestor = origin;
+    while (ancestor && !completed.has(ancestor.id)) {
+      if (path.has(ancestor.id)) invalid("thread replay run ancestry contains a cycle");
+      path.add(ancestor.id);
+      ancestor = ancestor.previousRunId === null ? null : runsById.get(ancestor.previousRunId);
+    }
+    for (const runId of path) completed.add(runId);
+  }
+  const newestFirst = [];
+  const visited = new Set();
+  let omittedPrefix = false;
+  let cursor = headRun;
+  while (cursor) {
+    if (visited.has(cursor.id)) invalid("thread replay run ancestry contains a cycle");
+    visited.add(cursor.id);
+    newestFirst.push(cursor);
+    if (cursor.previousRunId === null) break;
+    const previous = runsById.get(cursor.previousRunId);
+    if (!previous) {
+      if (thread.messages.length === 0) {
+        omittedPrefix = true;
+        break;
+      }
+      if (thread.replay.prunedMessageCount === 0 || thread.replay.anchorDigest === ZERO_HASH) {
+        invalid("thread replay predecessor is missing without a pruned-prefix proof");
+      }
+      omittedPrefix = true;
+      break;
+    }
+    cursor = previous;
+  }
+  if ((successorCounts.get(headRun.id) ?? 0) !== 0) {
+    invalid("thread replay declared head has a successor");
+  }
+  if (visited.size !== runsById.size) invalid("thread replay contains a disconnected run ancestry");
+  return Object.freeze({
+    runs: Object.freeze(newestFirst.reverse()),
+    headRun,
+    omittedPrefix,
+    requiresThreadRefresh,
   });
 }
 

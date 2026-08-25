@@ -709,6 +709,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-source-title { margin: 0; font-size: 1rem; }
 .artifact-source-snippet { margin: .45rem 0; }
 .artifact-source-metadata { margin: .35rem 0 0; color: var(--muted); font-size: .78rem; }
+.artifact-file-metadata { margin: 0 0 .6rem; overflow-wrap: anywhere; font-weight: 650; }
+.artifact-file-controls { display: flex; min-width: 0; flex-wrap: wrap; gap: .55rem; }
+.artifact-file-action { min-width: min(100%, 7.5rem); min-height: 44px; display: inline-flex; align-items: center; justify-content: center; padding: .65rem .9rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--accent-strong); font-weight: 700; text-decoration: none; touch-action: manipulation; }
+.artifact-file-action:hover { border-color: var(--accent); background: var(--accent-soft); }
+.artifact-file-download { background: var(--accent); color: white; }
+.artifact-file-privacy { margin: .55rem 0 0; color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
 .image-button { min-height: 48px; }
 .image-preview { display: flex; max-width: 190px; align-items: center; gap: .45rem; padding: .35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .image-preview img { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; }

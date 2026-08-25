@@ -249,6 +249,11 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
   assert.deepEqual(validateAgentCapabilities(explicitlyDisabledSearch), enabled);
   assert.equal(Object.hasOwn(validateAgentCapabilities(explicitlyDisabledSearch), "search"), false);
   assert.equal(selectDefaultMode(enabled), "agent");
+  const fileEnabled = {
+    ...enabled,
+    artifacts: { kinds: ["plot", "table", "markdown", "file"], schemaVersion: "1" },
+  };
+  assert.deepEqual(validateAgentCapabilities(fileEnabled).artifacts.kinds, ["plot", "table", "markdown", "file"]);
   const searchEnabled = capabilities({
     enabled: true,
     actions: { cancel: true, resume: true, retry: false },
@@ -260,6 +265,13 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     modes: ["web", "papers", "both"],
     maximumSources: 20,
   });
+  const searchAndFiles = {
+    ...searchEnabled,
+    artifacts: { kinds: ["plot", "table", "markdown", "sources", "file"], schemaVersion: "1" },
+  };
+  assert.deepEqual(validateAgentCapabilities(searchAndFiles).artifacts.kinds, [
+    "plot", "table", "markdown", "sources", "file",
+  ]);
   for (const invalid of [
     { ...searchEnabled, search: { enabled: true, modes: ["web", "both", "papers"], maximumSources: 20 } },
     { ...searchEnabled, search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 21 } },
@@ -351,6 +363,42 @@ test("sources artifacts are exact, bounded, credential-free HTTPS presentation d
     snippet: "e".repeat(4_000),
   }));
   assert.throws(() => validateArtifact(oversized), /48 KiB/u);
+});
+
+test("file artifacts expose only bounded PDF or TeX metadata and never local bytes or paths", () => {
+  const file = {
+    id: ARTIFACT_ID,
+    title: "Compiled paper",
+    kind: "file",
+    spec: {
+      schemaVersion: "1",
+      filename: "paper.pdf",
+      mime: "application/pdf",
+      bytes: 32_768,
+      sha256: "c".repeat(64),
+    },
+  };
+  const normalized = validateArtifact(file);
+  assert.equal(normalized.kind, "file");
+  assert.deepEqual(normalized.spec, file.spec);
+  assert.equal(Object.isFrozen(normalized.spec), true);
+  assert.equal(JSON.stringify(normalized).includes("/home/"), false);
+  for (const candidate of [
+    { ...file, spec: { ...file.spec, filename: "../paper.pdf" } },
+    { ...file, spec: { ...file.spec, filename: "/home/private/paper.pdf" } },
+    { ...file, spec: { ...file.spec, filename: "paper.html" } },
+    { ...file, spec: { ...file.spec, filename: "paper.tex" } },
+    { ...file, spec: { ...file.spec, mime: "text/html" } },
+    { ...file, spec: { ...file.spec, bytes: 0 } },
+    { ...file, spec: { ...file.spec, bytes: 16 * 1024 * 1024 + 1 } },
+    { ...file, spec: { ...file.spec, sha256: "C".repeat(64) } },
+    { ...file, spec: { ...file.spec, localPath: "/tmp/paper.pdf" } },
+    { ...file, content: "%PDF-1.7" },
+  ]) assert.throws(() => validateArtifact(candidate));
+  assert.equal(validateArtifact({
+    ...file,
+    spec: { ...file.spec, filename: "source.tex", mime: "application/x-tex" },
+  }).spec.mime, "application/x-tex");
 });
 
 test("public responses and artifacts reject private state, active content, URLs, and oversized data", () => {

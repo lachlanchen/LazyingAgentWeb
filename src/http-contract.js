@@ -105,6 +105,7 @@ export const CHAT_MUTATION_ROUTES = Object.freeze([
 ]);
 
 export const AGENT_TRANSPORT_PREFIX = '/api/transport';
+export const AGENT_ARTIFACT_CONTENT_PREFIX = '/api/agent/artifacts/';
 export const AGENT_ROUTE_MAP = Object.freeze(Object.fromEntries(
   Object.values(AGINTI_RPC_PATHS).map((nativePath) => [`${AGENT_TRANSPORT_PREFIX}${nativePath}`, nativePath])
 ));
@@ -389,6 +390,15 @@ export function classifyRequestTarget(rawTarget, assets) {
       || rawTarget.split('/').some((part) => part === '.' || part === '..') || rawTarget.includes('%')) {
     return Object.freeze({ kind: 'invalid' });
   }
+  const artifactContent = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content$/u.exec(rawTarget);
+  if (artifactContent) {
+    return Object.freeze({
+      kind: 'agent_artifact',
+      pathname: rawTarget,
+      artifactId: artifactContent[1]
+    });
+  }
+  if (rawTarget.startsWith(AGENT_ARTIFACT_CONTENT_PREFIX)) return Object.freeze({ kind: 'invalid' });
   if (DYNAMIC_POST_ROUTES.has(rawTarget)) {
     return Object.freeze({
       kind: Object.hasOwn(AGENT_ROUTE_MAP, rawTarget) ? 'agent' : (rawTarget.startsWith('/api/chat/') ? 'chat' : 'session'),

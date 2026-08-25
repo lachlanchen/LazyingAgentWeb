@@ -8,6 +8,7 @@
  */
 
 export const AGINTI_SCHEMA_VERSION = "1";
+export const AGINTI_MAX_FILE_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 export const AGINTI_RPC_PATHS = Object.freeze({
   capabilities: "/agent/v1/capabilities",
@@ -79,6 +80,7 @@ const THREAD_ID = /^thr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const RUN_ID = /^run_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const ARTIFACT_ID = /^art_[A-Za-z0-9_-]{32,86}$/u;
 const DIGEST = /^[a-f0-9]{64}$/u;
+const FILE_ARTIFACT_MIMES = new Set(["application/pdf", "application/x-tex", "text/x-tex"]);
 const PRIVATE_PATH = /(?:^|[\s("'`])\/(?:workspace|home|users|root|etc|usr|var|opt|srv|run|tmp|proc|sys|dev|mnt|media|aginti-(?:home|cache|env))(?:\/|\b)|(?:^|[\s("'`])[A-Za-z]:\\/iu;
 const UNSAFE_PRESENTATION = /[<>]|(?:javascript\s*:|(?:https?|data|file)\s*:\/\/)/iu;
 const CONTROL = /\u0000|[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
@@ -542,10 +544,41 @@ export function validateSourcesSpec(value) {
   return Object.freeze({ schemaVersion: AGINTI_SCHEMA_VERSION, sources: Object.freeze(sources) });
 }
 
+export function validateFileSpec(value) {
+  const spec = exact(value, ["schemaVersion", "filename", "mime", "bytes", "sha256"], "file spec");
+  if (spec.schemaVersion !== AGINTI_SCHEMA_VERSION) invalid("file spec schemaVersion must be 1");
+  const filename = boundedText(spec.filename, "file filename", 240, { minimum: 1, presentation: true });
+  if (filename === "." || filename === ".." || filename.trim() !== filename
+      || filename.includes("/") || filename.includes("\\")) {
+    invalid("file filename must be a safe single basename");
+  }
+  if (typeof spec.mime !== "string" || !FILE_ARTIFACT_MIMES.has(spec.mime)) {
+    invalid("file mime is unsupported");
+  }
+  const extension = filename.toLowerCase().endsWith(".pdf")
+    ? "pdf"
+    : (filename.toLowerCase().endsWith(".tex") ? "tex" : null);
+  if ((spec.mime === "application/pdf" && extension !== "pdf")
+      || (spec.mime !== "application/pdf" && extension !== "tex")) {
+    invalid("file filename extension does not match its mime");
+  }
+  const bytes = boundedInteger(spec.bytes, "file bytes", { minimum: 1, maximum: AGINTI_MAX_FILE_ARTIFACT_BYTES });
+  if (typeof spec.sha256 !== "string" || !DIGEST.test(spec.sha256)) {
+    invalid("file sha256 must be a lowercase SHA-256 digest");
+  }
+  return Object.freeze({
+    schemaVersion: AGINTI_SCHEMA_VERSION,
+    filename,
+    mime: spec.mime,
+    bytes,
+    sha256: spec.sha256,
+  });
+}
+
 export function validateArtifact(value) {
   const artifact = exact(value, ["id", "title", "kind", "spec"], "artifact");
   const kind = artifact.kind;
-  if (!["plot", "table", "markdown", "sources"].includes(kind)) invalid("artifact kind is unsupported");
+  if (!["plot", "table", "markdown", "sources", "file"].includes(kind)) invalid("artifact kind is unsupported");
   const normalized = Object.freeze({
     id: validateArtifactId(artifact.id),
     title: title(artifact.title),
@@ -554,7 +587,9 @@ export function validateArtifact(value) {
       ? validatePlotSpec(artifact.spec)
       : (kind === "table"
         ? validateTableSpec(artifact.spec)
-        : (kind === "markdown" ? validateMarkdownSpec(artifact.spec) : validateSourcesSpec(artifact.spec))),
+        : (kind === "markdown"
+          ? validateMarkdownSpec(artifact.spec)
+          : (kind === "sources" ? validateSourcesSpec(artifact.spec) : validateFileSpec(artifact.spec)))),
   });
   if (utf8.encode(JSON.stringify(normalized)).byteLength > 48 * 1024) {
     invalid("artifact exceeds its 48 KiB public contract", "ARTIFACT_TOO_LARGE");
@@ -769,9 +804,13 @@ export function validateAgentCapabilities(value) {
     invalid("agent search capabilities are invalid");
   }
   if (search.enabled && !response.enabled) invalid("disabled capabilities may not advertise search");
-  const artifactKinds = search.enabled
+  const legacyArtifactKinds = search.enabled
     ? ["plot", "table", "markdown", "sources"]
     : ["plot", "table", "markdown"];
+  const fileArtifactKinds = Object.freeze([...legacyArtifactKinds, "file"]);
+  const artifactKinds = canonicalJson(artifacts.kinds) === canonicalJson(fileArtifactKinds)
+    ? fileArtifactKinds
+    : legacyArtifactKinds;
   if (artifacts.schemaVersion !== AGINTI_SCHEMA_VERSION
       || !Array.isArray(artifacts.kinds)
       || canonicalJson(artifacts.kinds) !== canonicalJson(artifactKinds)) {

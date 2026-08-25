@@ -30,8 +30,10 @@ import {
 import { ControlPlaneError } from './errors.js';
 import { VISION_MODEL_ALIAS } from './vision-attachment.js';
 import {
+  AGINTI_MAX_FILE_ARTIFACT_BYTES,
   AGINTI_RPC_PATHS,
   FAIL_CLOSED_AGENT_CAPABILITIES,
+  validateFileSpec,
   validateAgentResponse,
   validateEventEnvelope
 } from './web/aginti-protocol.js';
@@ -573,6 +575,18 @@ function fetchMetadataState(req) {
   return present === 3 ? 'complete' : 'partial';
 }
 
+function artifactFetchMetadataState(req) {
+  const site = req.headers['sec-fetch-site'];
+  const mode = req.headers['sec-fetch-mode'];
+  const destination = req.headers['sec-fetch-dest'];
+  const present = [site, mode, destination].filter((value) => value !== undefined).length;
+  if (present === 0) return 'missing';
+  if ((site !== undefined && site !== 'same-origin')
+      || (mode !== undefined && !['cors', 'same-origin', 'navigate'].includes(mode))
+      || (destination !== undefined && !['empty', 'document'].includes(destination))) return 'invalid';
+  return present === 3 ? 'complete' : 'partial';
+}
+
 function rejectFetchMetadata() {
   throw new CloudHttpError(403, 'fetch_metadata_rejected', 'The request fetch metadata is not allowed.');
 }
@@ -616,6 +630,35 @@ function csrfFromRequest(req) {
 function requestIdempotency(req, agent = false) {
   const value = req.headers[IDEMPOTENCY_HEADER_NAME];
   return agent ? validateAgentIdempotencyKey(value) : validateRequestIdempotencyKey(value);
+}
+
+function artifactByteRange(req) {
+  const values = rawHeaderValues(req, 'range');
+  if (values.length === 0) return undefined;
+  if (values.length !== 1 || typeof values[0] !== 'string') {
+    throw new CloudHttpError(400, 'invalid_range', 'The artifact byte range is invalid.');
+  }
+  const match = /^bytes=(0|[1-9]\d*)-(?:(0|[1-9]\d*))?$/u.exec(values[0]);
+  if (!match) throw new CloudHttpError(400, 'invalid_range', 'Only one start-based byte range is supported.');
+  const start = Number(match[1]);
+  const end = match[2] === undefined ? undefined : Number(match[2]);
+  if (!Number.isSafeInteger(start)
+      || (end !== undefined && (!Number.isSafeInteger(end) || end < start))) {
+    throw new CloudHttpError(400, 'invalid_range', 'The artifact byte range is outside its supported bound.');
+  }
+  return Object.freeze({ start, ...(end === undefined ? {} : { end }) });
+}
+
+function artifactContentDisposition(filename) {
+  const fallback = filename.normalize('NFKD')
+    .replace(/\p{M}+/gu, '')
+    .replace(/[^A-Za-z0-9._-]+/gu, '_')
+    .replace(/^\.+/u, '')
+    .slice(0, 120) || 'artifact';
+  const encoded = encodeURIComponent(filename).replace(/['()*]/gu, (value) => (
+    `%${value.codePointAt(0).toString(16).toUpperCase()}`
+  ));
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function sessionCookie(value, maximumAge) {
@@ -802,6 +845,115 @@ async function writeSse(res, value, signal) {
     res.once('drain', onDrain);
     res.once('close', onClose);
     signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function waitForResponseDrain(res, signal) {
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      signal.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onDrain = () => finish(resolve);
+    const onClose = () => finish(reject, new DOMException('response closed', 'AbortError'));
+    const onAbort = () => finish(reject, signal.reason ?? new DOMException('aborted', 'AbortError'));
+    if (signal.aborted || res.destroyed || res.writableEnded) {
+      onAbort();
+      return;
+    }
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function streamArtifactBytes(res, body, expectedBytes, signal) {
+  if (!body || typeof body.getReader !== 'function'
+      || !Number.isSafeInteger(expectedBytes) || expectedBytes < 1
+      || expectedBytes > AGINTI_MAX_FILE_ARTIFACT_BYTES) {
+    throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid artifact stream.');
+  }
+  const reader = body.getReader();
+  let received = 0;
+  let ended = false;
+  try {
+    for (;;) {
+      const item = await valueWithAbort(reader.read(), signal);
+      if (item.done) {
+        ended = true;
+        break;
+      }
+      if (!(item.value instanceof Uint8Array) || item.value.byteLength < 1) {
+        throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid artifact stream.');
+      }
+      received += item.value.byteLength;
+      if (received > expectedBytes || received > AGINTI_MAX_FILE_ARTIFACT_BYTES) {
+        throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned too many artifact bytes.');
+      }
+      if (!res.write(Buffer.from(item.value))) await waitForResponseDrain(res, signal);
+    }
+    if (received !== expectedBytes) {
+      throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an incomplete artifact stream.');
+    }
+    res.end();
+  } finally {
+    if (!ended) await reader.cancel().catch(() => {});
+    reader.releaseLock?.();
+  }
+}
+
+function validateArtifactContentResult(value, request, metadataOnly) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || ![200, 206].includes(value.status)) {
+    throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned invalid artifact metadata.');
+  }
+  try {
+    validateFileSpec({
+      schemaVersion: '1',
+      filename: value.filename,
+      mime: value.mime,
+      bytes: value.totalBytes,
+      sha256: value.sha256
+    });
+  } catch (error) {
+    throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned invalid artifact metadata.', { cause: error });
+  }
+  if (!Number.isSafeInteger(value.selectedBytes) || value.selectedBytes < 1
+      || value.selectedBytes > value.totalBytes
+      || (metadataOnly ? value.body !== null : (!value.body || typeof value.body.getReader !== 'function'))) {
+    throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned invalid artifact byte metadata.');
+  }
+  let contentRange;
+  if (request.range === undefined) {
+    if (value.status !== 200 || value.range !== null || value.selectedBytes !== value.totalBytes) {
+      throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an unsolicited artifact range.');
+    }
+  } else {
+    const range = value.range;
+    if (value.status !== 206 || !range || !Number.isSafeInteger(range.start)
+        || !Number.isSafeInteger(range.end) || !Number.isSafeInteger(range.total)
+        || range.start !== request.range.start || range.total !== value.totalBytes
+        || range.end < range.start || range.end >= range.total
+        || value.selectedBytes !== range.end - range.start + 1
+        || (request.range.end !== undefined && range.end > request.range.end)) {
+      throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid artifact range.');
+    }
+    contentRange = `bytes ${range.start}-${range.end}/${range.total}`;
+  }
+  return Object.freeze({
+    status: value.status,
+    filename: value.filename,
+    mime: value.mime,
+    totalBytes: value.totalBytes,
+    selectedBytes: value.selectedBytes,
+    sha256: value.sha256,
+    body: value.body,
+    contentRange
   });
 }
 
@@ -1542,6 +1694,75 @@ export function createCloudRequestHandler({
     }
   }
 
+  async function handleAgentArtifactContent(req, res, route, session, requestSignal) {
+    if (!agintiAdapter || typeof agintiAdapter.artifactContent !== 'function') {
+      throw new CloudHttpError(503, 'agent_unavailable', 'AgInTi Agent file artifacts are unavailable.');
+    }
+    const range = artifactByteRange(req);
+    const metadataOnly = req.method === 'HEAD';
+    const input = Object.freeze({
+      artifactId: route.artifactId,
+      ...(metadataOnly ? { metadataOnly: true } : {}),
+      ...(range === undefined ? {} : { range })
+    });
+    const contextFor = (signal) => Object.freeze({
+      principalId: configuredAccount.principalId,
+      browserSession: session.browserSession,
+      signal
+    });
+    const raw = await withTimeout(
+      (signal) => agintiAdapter.artifactContent(input, contextFor(signal)),
+      { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi artifact request timed out' }
+    );
+    if (raw?.status === 404) {
+      sendJson(req, res, 404, { error: { code: 'not_found', message: 'The requested artifact does not exist.' } }, {
+        'cache-control': 'no-store, private'
+      });
+      return;
+    }
+    if (raw?.status === 410) {
+      sendJson(req, res, 410, {
+        error: { code: 'artifact_content_gone', message: 'This local artifact file has been removed.' }
+      }, { 'cache-control': 'no-store, private' });
+      return;
+    }
+    if (raw?.status === 416) {
+      sendJson(req, res, 416, {
+        error: { code: 'range_not_satisfiable', message: 'The requested artifact byte range is not available.' }
+      }, { 'cache-control': 'no-store, private' });
+      return;
+    }
+    const result = validateArtifactContentResult(raw, input, metadataOnly);
+    writeHead(res, result.status, dynamicHeaders({
+      'accept-ranges': 'bytes',
+      'cache-control': 'no-store, private',
+      pragma: 'no-cache',
+      expires: '0',
+      'content-type': result.mime,
+      'content-length': String(result.selectedBytes),
+      'content-disposition': artifactContentDisposition(result.filename),
+      etag: `"${result.sha256}"`,
+      'x-artifact-content-length': String(result.selectedBytes),
+      'content-security-policy': "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      'referrer-policy': 'no-referrer',
+      ...(result.contentRange === undefined ? {} : { 'content-range': result.contentRange })
+    }, res[RESPONSE_RELEASE_ID]));
+    if (metadataOnly) {
+      res.end();
+      return;
+    }
+    const streamDeadline = deadlineSignal(
+      requestSignal,
+      limits.visionBodyTimeoutMs,
+      'Agent artifact stream exceeded its delivery deadline'
+    );
+    try {
+      await streamArtifactBytes(res, result.body, result.selectedBytes, streamDeadline.signal);
+    } finally {
+      streamDeadline.cleanup();
+    }
+  }
+
   const handler = async (req, res) => {
     const disconnect = requestAbortController(req, res);
     res[RESPONSE_RELEASE_ID] = assets.releaseId;
@@ -1558,10 +1779,11 @@ export function createCloudRequestHandler({
       const route = classifyRequestTarget(req.url, assets);
       outcomeRoute = route.kind === 'chat' ? 'chat'
         : (route.kind === 'agent' ? 'agent'
+          : (route.kind === 'agent_artifact' ? 'agent_artifact'
           : (route.pathname === CLOUD_ROUTES.login ? 'login'
             : (route.pathname === CLOUD_ROUTES.session ? 'session'
               : (route.pathname === CLOUD_ROUTES.logout ? 'logout'
-                : (route.kind === 'asset' ? 'asset' : 'unknown')))));
+                : (route.kind === 'asset' ? 'asset' : 'unknown'))))));
       if (route.kind === 'invalid' || route.kind === 'not_found') {
         if (req.method === 'POST' && hasRequestBodyFraming(req)) req.shouldKeepAlive = false;
         if (route.kind === 'invalid') throw new CloudHttpError(400, 'invalid_target', 'The request target is not normalized.');
@@ -1587,6 +1809,24 @@ export function createCloudRequestHandler({
           } : {}),
           ...(route.target === '/sw.js' ? { pragma: 'no-cache', expires: '0', 'service-worker-allowed': '/' } : {})
         });
+        return;
+      }
+      if (route.kind === 'agent_artifact') {
+        if (!['GET', 'HEAD'].includes(req.method)) {
+          if (hasRequestBodyFraming(req)) req.shouldKeepAlive = false;
+          methodNotAllowed(req, res, 'GET, HEAD');
+          return;
+        }
+        outcomeFetchMetadata = artifactFetchMetadataState(req);
+        if (outcomeFetchMetadata === 'invalid') rejectFetchMetadata();
+        outcomeRelease = clientReleaseState(req, assets.releaseId);
+        if (outcomeRelease === 'mismatch') rejectClientRelease();
+        const authenticated = requireAuthentication(await authenticate(req, { csrf: false }));
+        releaseStream = streamGate.enter(authenticated.browserSession);
+        if (!releaseStream) {
+          throw new CloudHttpError(429, 'stream_rate_limited', 'Too many artifact streams are active.', { retryAfter: 2 });
+        }
+        await handleAgentArtifactContent(req, res, route, authenticated, disconnect.controller.signal);
         return;
       }
       if (req.method !== 'POST') {

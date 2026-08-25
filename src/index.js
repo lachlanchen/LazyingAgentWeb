@@ -51,9 +51,11 @@ export {
 export { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from './direct-chat-contract.js';
 export { createDeterministicContextSummarizer } from './deterministic-context-summarizer.js';
 export {
+  AGINTI_ARTIFACT_CONTENT_PATH,
   AGINTI_INTERNAL_HEADERS,
   AgintiAdapterError,
   createAgintiAgentAdapter,
+  validateArtifactContentRequest,
   validateAgintiTransportCredential
 } from './aginti-adapter.js';
 export {
@@ -67,6 +69,7 @@ export {
   resolveTrustedClientAddress
 } from './cloud-server.js';
 export {
+  AGENT_ARTIFACT_CONTENT_PREFIX,
   AGENT_ROUTE_MAP,
   AGENT_TRANSPORT_PREFIX,
   CHAT_MUTATION_ROUTES,

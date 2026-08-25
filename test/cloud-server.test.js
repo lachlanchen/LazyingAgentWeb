@@ -241,6 +241,32 @@ async function post(baseUrl, pathname, body, {
   });
 }
 
+async function artifactRequest(baseUrl, artifactId, {
+  method = 'GET',
+  cookie,
+  range,
+  release,
+  headers = {},
+  fetchMetadataPresent = true
+} = {}) {
+  return fetch(`${baseUrl}/api/agent/artifacts/${artifactId}/content`, {
+    method,
+    redirect: 'error',
+    headers: {
+      ...publicBoundary(baseUrl),
+      ...(fetchMetadataPresent ? {
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty'
+      } : {}),
+      ...(cookie ? { cookie } : {}),
+      ...(range ? { range } : {}),
+      ...(release ? { [CLIENT_RELEASE_HEADER_NAME]: release } : {}),
+      ...headers
+    }
+  });
+}
+
 function responseCookies(response) {
   const values = response.headers.getSetCookie?.() ?? [];
   return values.length > 0 ? values : [response.headers.get('set-cookie')].filter(Boolean);
@@ -1104,6 +1130,171 @@ test('uses its own AgInTi adapter contract over application-neutral LazyEdge tra
   assert.equal(upstreamRequests[3].headers.get('idempotency-key'), IDEMPOTENCY);
   assert.equal(upstreamRequests[3].headers.get('x-aginti-principal-id'), PRINCIPAL_ID);
   assert.equal(upstreamRequests[3].headers.get('x-lazyedge-idempotency-key'), null);
+});
+
+test('streams owner-bound local Agent files through authenticated no-cache GET, HEAD, and ranges', async (t) => {
+  const artifactId = `art_${'a'.repeat(64)}`;
+  const goneArtifactId = `art_${'b'.repeat(64)}`;
+  const content = Buffer.from('%PDF-1.7\nlocal artifact\n', 'utf8');
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  const calls = [];
+  let ownerSession = null;
+  const adapter = {
+    async rpc() { throw new Error('unexpected Agent RPC'); },
+    async capabilities() { throw new Error('unexpected capability RPC'); },
+    async artifactContent(input, context) {
+      calls.push({ input, context });
+      if (ownerSession === null) ownerSession = context.browserSession;
+      if (context.browserSession !== ownerSession) return Object.freeze({ status: 404 });
+      if (input.artifactId === goneArtifactId) return Object.freeze({ status: 410 });
+      let start = input.range?.start ?? 0;
+      let end = input.range?.end === undefined ? content.byteLength - 1 : Math.min(input.range.end, content.byteLength - 1);
+      if (start >= content.byteLength) return Object.freeze({ status: 416 });
+      const selected = content.subarray(start, end + 1);
+      return Object.freeze({
+        status: input.range === undefined ? 200 : 206,
+        filename: 'résumé.pdf',
+        mime: 'application/pdf',
+        totalBytes: content.byteLength,
+        selectedBytes: selected.byteLength,
+        sha256,
+        range: input.range === undefined ? null : Object.freeze({ start, end, total: content.byteLength }),
+        body: input.metadataOnly === true ? null : new Response(selected).body
+      });
+    }
+  };
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start();
+  const first = await login(baseUrl);
+
+  const full = await artifactRequest(baseUrl, artifactId, {
+    cookie: first.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(full.status, 200);
+  assert.deepEqual(Buffer.from(await full.arrayBuffer()), content);
+  assert.equal(full.headers.get('content-type'), 'application/pdf');
+  assert.equal(full.headers.get('content-length'), String(content.byteLength));
+  assert.equal(full.headers.get('cache-control'), 'no-store, private');
+  assert.equal(full.headers.get('pragma'), 'no-cache');
+  assert.equal(full.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(full.headers.get('accept-ranges'), 'bytes');
+  assert.equal(full.headers.get('etag'), `"${sha256}"`);
+  assert.match(full.headers.get('content-disposition'), /^attachment; filename="resume\.pdf"; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf$/u);
+  assert.match(full.headers.get('content-security-policy'), /^sandbox;/u);
+  assert.equal(calls[0].context.principalId, PRINCIPAL_ID);
+  assert.match(calls[0].context.browserSession, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(Object.keys(calls[0].context).sort(), ['browserSession', 'principalId', 'signal']);
+  assert.deepEqual(calls[0].input, { artifactId });
+
+  const mobileHead = await artifactRequest(baseUrl, artifactId, {
+    method: 'HEAD',
+    cookie: first.cookie,
+    fetchMetadataPresent: false
+  });
+  assert.equal(mobileHead.status, 200, 'iOS/PWA may omit Fetch Metadata on a local attachment request');
+  assert.equal(mobileHead.headers.get('content-length'), String(content.byteLength));
+  assert.deepEqual(calls.at(-1).input, { artifactId, metadataOnly: true });
+
+  const navigation = await artifactRequest(baseUrl, artifactId, {
+    cookie: first.cookie,
+    headers: { 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' }
+  });
+  assert.equal(navigation.status, 200, 'the rendered same-origin Open link is admitted as a navigation');
+  assert.deepEqual(Buffer.from(await navigation.arrayBuffer()), content);
+
+  const partial = await artifactRequest(baseUrl, artifactId, {
+    cookie: first.cookie,
+    range: 'bytes=5-10'
+  });
+  assert.equal(partial.status, 206);
+  assert.equal(partial.headers.get('content-range'), `bytes 5-10/${content.byteLength}`);
+  assert.deepEqual(Buffer.from(await partial.arrayBuffer()), content.subarray(5, 11));
+  assert.deepEqual(calls.at(-1).input, { artifactId, range: { start: 5, end: 10 } });
+
+  const head = await artifactRequest(baseUrl, artifactId, {
+    method: 'HEAD',
+    cookie: first.cookie,
+    range: 'bytes=2-'
+  });
+  assert.equal(head.status, 206);
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+  assert.equal(head.headers.get('content-length'), String(content.byteLength - 2));
+  assert.equal(head.headers.get('x-artifact-content-length'), String(content.byteLength - 2));
+  assert.equal(head.headers.get('content-range'), `bytes 2-${content.byteLength - 1}/${content.byteLength}`);
+  assert.deepEqual(calls.at(-1).input, { artifactId, metadataOnly: true, range: { start: 2 } });
+
+  const unsatisfied = await artifactRequest(baseUrl, artifactId, {
+    cookie: first.cookie,
+    range: `bytes=${content.byteLength}-`
+  });
+  assert.equal(unsatisfied.status, 416);
+  assert.equal((await unsatisfied.json()).error.code, 'range_not_satisfiable');
+
+  const gone = await artifactRequest(baseUrl, goneArtifactId, { cookie: first.cookie });
+  assert.equal(gone.status, 410);
+  assert.equal((await gone.json()).error.code, 'artifact_content_gone');
+  assert.equal(gone.headers.get('cache-control'), 'no-store, private');
+
+  const second = await login(baseUrl);
+  const foreignSession = await artifactRequest(baseUrl, artifactId, { cookie: second.cookie });
+  assert.equal(foreignSession.status, 404);
+  assert.equal((await foreignSession.json()).error.code, 'not_found');
+  assert.notEqual(calls.at(-1).context.browserSession, ownerSession);
+});
+
+test('file artifact ingress rejects auth, release, method, path, and range confusion before streaming', async (t) => {
+  const artifactId = `art_${'c'.repeat(64)}`;
+  let calls = 0;
+  const adapter = {
+    async rpc() { throw new Error('unexpected Agent RPC'); },
+    async capabilities() { throw new Error('unexpected capability RPC'); },
+    async artifactContent() { calls += 1; return Object.freeze({ status: 404 }); }
+  };
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+
+  const unauthenticated = await artifactRequest(baseUrl, artifactId);
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(calls, 0);
+
+  const stale = await artifactRequest(baseUrl, artifactId, {
+    cookie: auth.cookie,
+    release: `release-${'f'.repeat(64)}`
+  });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error.code, 'client_release_mismatch');
+  assert.equal(calls, 0);
+
+  for (const range of ['bytes=-4', 'bytes=0-1,4-5', 'items=0-1', 'bytes=8-2']) {
+    const invalidRange = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie, range });
+    assert.equal(invalidRange.status, 400, range);
+  }
+  assert.equal(calls, 0);
+
+  const malformed = await artifactRequest(baseUrl, 'art_short', { cookie: auth.cookie });
+  assert.equal(malformed.status, 400);
+  const encoded = await fetch(`${baseUrl}/api/agent/artifacts/${artifactId}%2fextra/content`, {
+    headers: { ...publicBoundary(baseUrl), cookie: auth.cookie }
+  });
+  assert.equal(encoded.status, 400);
+  assert.equal(calls, 0);
+
+  const wrongMethod = await post(baseUrl, `/api/agent/artifacts/${artifactId}/content`, {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(wrongMethod.headers.get('allow'), 'GET, HEAD');
+  assert.equal(calls, 0);
+
+  const crossSite = await artifactRequest(baseUrl, artifactId, {
+    cookie: auth.cookie,
+    headers: { 'sec-fetch-site': 'cross-site' }
+  });
+  assert.equal(crossSite.status, 403);
+  assert.equal(calls, 0);
 });
 
 test('logout revokes only its browser session and reports native Agent cancellation as a release gate', async (t) => {

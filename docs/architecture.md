@@ -7,13 +7,17 @@ is fail-closed. The v0.1.29 candidate remains compatible with current v0.1.27
 production, preserving its capability-gated Search UI and enabling Agent only through the
 accepted native AgInTi capability proof; without that proof, Agent remains
 unavailable while Direct Chat continues as a separate LocalLLM data plane.
-Voice messages and general artifact file upload/download remain unavailable.
+Voice messages and general artifact uploads remain unavailable. The file
+artifact extension is limited to capability-gated, local-only PDF/TeX output;
+AgInTi owns its bytes and deletion lifecycle, while the BFF is a non-caching
+authenticated streaming surface.
 Grounded search is a backward-compatible, default-disabled protocol extension:
 the UI remains absent
 unless AgInTi proves the exact Search capability, and current production makes
 no claim that it does. The baseline Agent artifact surface is declarative plot,
 table, and Markdown; the negotiated extension adds only bounded text/HTTPS
-`sources` artifacts.
+`sources` artifacts. A separately advertised `file` kind adds only bounded
+filename/MIME/size/digest metadata to that public envelope.
 Exact requests containing one canonical fenced `python` block take a
 deterministic bounded-execution path, bypass model planning, and preserve
 failure and successor-run state for durable reload and exact idempotent Resume
@@ -427,10 +431,20 @@ nullable canonical publication date and DOI, and a credential-free HTTPS URL.
 Source cards create text nodes and `noopener noreferrer` anchors only; they do
 not issue fetches, previews, preloads, or image requests. Plot data is finite,
 URL-free and expression-free; the browser builds DOM/SVG with text nodes.
-Active HTML, SVG and PDF are never
-served inline on the authenticated origin. File downloads, uploads and vision
-inputs remain disabled until their independent byte, MIME, decompression,
-ownership and sandbox acceptance matrices pass. Direct Chat's bounded multi-image
+File artifacts accept only a safe basename, `application/pdf`,
+`application/x-tex`, or `text/x-tex`, a 1-16 MiB byte count, and a lowercase
+SHA-256 digest. `GET`/`HEAD /api/agent/artifacts/<opaque-id>/content` derives
+AgInTi principal and browser-session authority from the authenticated cookie,
+converts at most one validated start-based Range into structured internal JSON,
+and streams the raw response with backpressure and a hard delivery deadline.
+The BFF reconstructs attachment disposition and security headers; it never
+forwards browser cookies, tokens, or Range, buffers the complete file, writes
+artifact bytes to cloud storage, or permits the service worker to cache them.
+Unknown or foreign ownership is indistinguishable at 404, locally removed bytes
+return 410 while metadata may remain, and stale releases fail before transport.
+Active HTML and SVG are never served on the authenticated origin, while PDF/TeX
+files remain attachment-only. General file uploads and voice inputs remain
+disabled. Direct Chat's bounded multi-image
 input is the narrow exception: it is descriptor-bound, owner-private,
 metadata-stripped, independently revalidated, and has no Agent or artifact
 authority.
@@ -482,4 +496,5 @@ alone neither authorizes nor implies Agent enablement, and Direct Chat remains a
 separate LocalLLM path. Search-bearing Agent start/resume requests are
 preflighted against AgInTi's current capability before the mutation is
 forwarded; there is no Web-to-LocalLLM search route. Voice messages and general
-artifact file upload/download remain outside the accepted capability.
+artifact uploads remain outside the accepted capability; local PDF/TeX output
+requires AgInTi's exact `file` capability and the independent content route.

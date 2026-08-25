@@ -47,7 +47,10 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > retained mobile CSRF state, release-pinned requests with encrypted draft/image
 > refresh handoff, resume-time session validation, and secret-free rejection telemetry.
 > The browser has no direct LocalLLM search route.
-> Voice messages and general artifact file upload/download remain unavailable.
+> Voice messages and general artifact uploads remain unavailable. The next
+> capability-gated artifact extension adds local-only PDF/TeX downloads: AgInTi
+> retains the bytes, while the cloud BFF only streams an authenticated bounded
+> response and never stores or caches it.
 
 The ownership model, Chat/Agent data planes, recovery semantics, artifact
 boundary, and replaceable-node contract are specified in
@@ -59,7 +62,8 @@ boundary, and replaceable-node contract are specified in
   browser-password-manager integration, durable thread restoration, resumable
   streaming, explicit cancellation, optional one-to-four-image Direct Chat input,
   Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering,
-  plus capability-gated text-only source cards that never fetch automatically.
+  plus capability-gated text-only source cards that never fetch automatically
+  and safe Open/Download controls for AgInTi-owned PDF/TeX files.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
   admission, owner-safe response projections, and graceful job draining.
@@ -89,7 +93,10 @@ boundary, and replaceable-node contract are specified in
   `Idempotency-Key` authority to AgInTi. LazyEdge remains an opaque transport;
   Agent state and decisions never move into this package. Search-bearing run
   inputs receive a fresh server-side capability preflight, so a disabled or
-  legacy AgInTi never receives the extension field.
+  legacy AgInTi never receives the extension field. File bytes use a separate
+  authenticated GET/HEAD BFF route that converts one validated browser range
+  into structured AgInTi input, streams with backpressure, and never forwards
+  browser credentials or headers to the local service.
 
 ## Component boundaries
 

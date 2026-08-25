@@ -251,3 +251,113 @@ test("fails closed on a corrupt ledger, an oversized JSON response, and credenti
   });
   assert.equal((await unavailable.capabilities(CONTEXT)).enabled, false);
 });
+
+test("streams exact bounded PDF and TeX artifact responses without forwarding a browser Range header", async () => {
+  const artifactId = `art_${"a".repeat(64)}`;
+  const pdf = new TextEncoder().encode("%PDF-1.7\nprivate local file\n");
+  const sha256 = createHash("sha256").update(pdf).digest("hex");
+  const calls = [];
+  const adapter = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async (url, init) => {
+      const input = JSON.parse(init.body);
+      const headers = new Headers(init.headers);
+      calls.push({ url, input, headers, init });
+      const start = input.range?.start ?? 0;
+      const end = input.range?.end === undefined ? pdf.byteLength - 1 : Math.min(input.range.end, pdf.byteLength - 1);
+      const selected = pdf.slice(start, end + 1);
+      const metadataOnly = input.metadataOnly === true;
+      return new Response(metadataOnly ? null : selected, {
+        status: input.range === undefined ? 200 : 206,
+        headers: {
+          "accept-ranges": "bytes",
+          "cache-control": "no-store, private",
+          "content-disposition": "attachment; filename=\"paper_final.pdf\"; filename*=UTF-8''paper%20%28final%27s%2A!%29.pdf",
+          "content-length": metadataOnly ? "0" : String(selected.byteLength),
+          "content-type": "application/pdf",
+          etag: `"${sha256}"`,
+          "x-content-type-options": "nosniff",
+          ...(metadataOnly ? { "x-artifact-content-length": String(selected.byteLength) } : {}),
+          ...(input.range === undefined ? {} : { "content-range": `bytes ${start}-${end}/${pdf.byteLength}` }),
+        },
+      });
+    },
+  });
+
+  const full = await adapter.artifactContent({ artifactId }, CONTEXT);
+  assert.equal(full.status, 200);
+  assert.equal(full.filename, "paper (final's*!).pdf");
+  assert.equal(full.mime, "application/pdf");
+  assert.equal(full.totalBytes, pdf.byteLength);
+  assert.equal(full.selectedBytes, pdf.byteLength);
+  assert.deepEqual(new Uint8Array(await new Response(full.body).arrayBuffer()), pdf);
+  assert.equal(calls[0].url, "http://127.0.0.1:18009/agent/v1/artifacts/content");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.cache, "no-store");
+  assert.equal(calls[0].headers.get("range"), null);
+  assert.equal(calls[0].headers.get(AGINTI_INTERNAL_HEADERS.principal), CONTEXT.principalId);
+  assert.equal(calls[0].headers.get(AGINTI_INTERNAL_HEADERS.browserSession), CONTEXT.browserSession);
+  assert.deepEqual(calls[0].input, { artifactId });
+
+  const metadata = await adapter.artifactContent({
+    artifactId,
+    metadataOnly: true,
+    range: { start: 3, end: 9 },
+  }, CONTEXT);
+  assert.equal(metadata.status, 206);
+  assert.equal(metadata.body, null);
+  assert.equal(metadata.selectedBytes, 7);
+  assert.deepEqual(metadata.range, { start: 3, end: 9, total: pdf.byteLength, value: `bytes 3-9/${pdf.byteLength}` });
+  assert.equal(calls[1].headers.get("range"), null);
+  assert.deepEqual(calls[1].input, { artifactId, metadataOnly: true, range: { start: 3, end: 9 } });
+});
+
+test("artifact content adapter preserves private absence semantics and rejects malformed upstream metadata", async () => {
+  const artifactId = `art_${"b".repeat(64)}`;
+  let status = 404;
+  const adapter = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async () => new Response(JSON.stringify({ error: { code: "NOT_FOUND" } }), {
+      status,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    }),
+  });
+  for (const expected of [404, 410, 416]) {
+    status = expected;
+    assert.deepEqual(await adapter.artifactContent({ artifactId }, CONTEXT), { status: expected });
+  }
+
+  let calls = 0;
+  const invalid = createAgintiAgentAdapter({
+    upstream: "http://127.0.0.1:18009",
+    credentialProvider: async () => TOKEN,
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(new Uint8Array([1]), {
+        headers: {
+          "accept-ranges": "bytes",
+          "cache-control": "public, max-age=3600",
+          "content-disposition": "inline; filename=paper.pdf",
+          "content-length": "1",
+          "content-type": "application/pdf",
+          etag: `"${"a".repeat(64)}"`,
+          "x-content-type-options": "nosniff",
+        },
+      });
+    },
+  });
+  await assert.rejects(
+    invalid.artifactContent({ artifactId }, CONTEXT),
+    (error) => error instanceof AgintiAdapterError && error.code === "AGINTI_RESPONSE_INVALID" && error.statusCode === 502,
+  );
+  await assert.rejects(invalid.artifactContent({ artifactId, range: { start: 4, end: 3 } }, CONTEXT), TypeError);
+  await assert.rejects(invalid.artifactContent({ artifactId, metadataOnly: "yes" }, CONTEXT), TypeError);
+  await assert.rejects(invalid.artifactContent({ artifactId, range: { start: 0 }, extra: true }, CONTEXT), TypeError);
+  assert.equal(calls, 1, "invalid browser input is rejected before transport");
+});

@@ -719,6 +719,44 @@ function renderSources(document, target, artifact) {
   target.appendChild(list);
 }
 
+function formatFileBytes(value) {
+  if (value < 1_024) return `${value} B`;
+  if (value < 1_024 * 1_024) return `${(value / 1_024).toFixed(value < 10 * 1_024 ? 1 : 0)} KB`;
+  return `${(value / (1_024 * 1_024)).toFixed(value < 10 * 1_024 * 1_024 ? 1 : 0)} MB`;
+}
+
+function renderFile(runtime, target, artifact) {
+  const { document, locationHref } = runtime;
+  const base = new URL(locationHref);
+  const href = new URL(`/api/agent/artifacts/${artifact.id}/content`, base);
+  if (!['http:', 'https:'].includes(base.protocol) || href.origin !== base.origin
+      || href.username || href.password || href.search || href.hash) {
+    throw new TypeError('file artifact URL is not same-origin');
+  }
+  const metadata = createNode(document, 'p', 'artifact-file-metadata');
+  appendText(document, metadata, `${artifact.spec.filename} · ${formatFileBytes(artifact.spec.bytes)}`);
+  target.appendChild(metadata);
+  const controls = createNode(document, 'div', 'artifact-file-controls');
+  const open = createNode(document, 'a', 'artifact-file-action artifact-file-open');
+  open.setAttribute('href', href.href);
+  open.setAttribute('target', '_blank');
+  open.setAttribute('rel', 'noopener noreferrer');
+  open.setAttribute('aria-label', `Open ${artifact.spec.filename}`);
+  appendText(document, open, 'Open');
+  controls.appendChild(open);
+  const download = createNode(document, 'a', 'artifact-file-action artifact-file-download');
+  download.setAttribute('href', href.href);
+  download.setAttribute('download', artifact.spec.filename);
+  download.setAttribute('rel', 'noopener');
+  download.setAttribute('aria-label', `Download ${artifact.spec.filename}`);
+  appendText(document, download, 'Download');
+  controls.appendChild(download);
+  target.appendChild(controls);
+  const privacy = createNode(document, 'p', 'artifact-file-privacy');
+  appendText(document, privacy, 'Served from your local Agent session. Not stored or cached by the web edge.');
+  target.appendChild(privacy);
+}
+
 export function createSafeRenderer({
   document = globalThis.document,
   katex,
@@ -764,7 +802,8 @@ export function createSafeRenderer({
           const markdown = createNode(document, "div", "artifact-markdown");
           renderMarkdown(markdown, artifact.spec.markdown);
           target.appendChild(markdown);
-        } else renderSources(document, target, artifact);
+        } else if (artifact.kind === "sources") renderSources(document, target, artifact);
+        else renderFile(runtime, target, artifact);
       } catch {
         target.replaceChildren();
         target.dataset.status = "rejected";

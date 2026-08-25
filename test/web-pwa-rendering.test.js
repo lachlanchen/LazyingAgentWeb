@@ -1375,6 +1375,12 @@ test("inline Agent artifacts contain wide tables inside the assistant message", 
   assert.match(BRIGHT_APP_CSS, /\.table-scroll, \.artifact-table-scroll \{[^}]*overflow-x: auto;/u);
 });
 
+test("file artifact controls remain tappable and wrap instead of overflowing an iPhone viewport", () => {
+  assert.match(BRIGHT_APP_CSS, /\.artifact-file-controls \{[^}]*flex-wrap:\s*wrap;[^}]*gap:/u);
+  assert.match(BRIGHT_APP_CSS, /\.artifact-file-action \{[^}]*min-width:\s*min\(100%, 7\.5rem\);[^}]*min-height:\s*44px;/u);
+  assert.match(BRIGHT_APP_CSS, /\.artifact-file-privacy \{[^}]*overflow-wrap:\s*anywhere;/u);
+});
+
 test("content digest deterministically owns release, cache, routes, and final-map verification", async () => {
   const first = await productionMap({ label: "stable", marker: "same" });
   const repeated = await productionMap({ label: "stable", marker: "same" });
@@ -1774,6 +1780,7 @@ test("worker never intercepts or caches auth, Agent, LocalLLM, artifacts, POST, 
     ["/api/logout", {}],
     ["/api/transport/agent/v1/runs/events", {}],
     ["/api/transport/agent/v1/artifacts/get", {}],
+    [`/api/agent/artifacts/${ARTIFACT_ID}/content`, {}],
     ["/artifacts/private-result", {}],
     ["/api/localllm/v1/chat/completions", {}],
     ["/api/chat/runs/start", { method: "POST" }],
@@ -5954,6 +5961,31 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.match(target.textContent, /Evidence rendered only as literal text/u);
   assert.match(target.textContent, /Paper · provider-one, provider-two · 2026-08-20 · DOI 10\.1234\/example\.1/u);
   assert.equal(sourceNodes.some((node) => ["img", "iframe", "script", "link"].includes(node.tagName)), false);
+
+  const fileTarget = document.createElement("section");
+  const fileRenderer = createSafeRenderer({ document, locationHref: "https://llm.lazying.art/conversation" });
+  assert.equal(fileRenderer.renderArtifact(fileTarget, artifact("file", {
+    schemaVersion: "1",
+    filename: "paper.pdf",
+    mime: "application/pdf",
+    bytes: 2_500_000,
+    sha256: "a".repeat(64),
+  })), true);
+  const fileNodes = fileTarget.walk();
+  const fileLinks = fileNodes.filter((node) => node.tagName === "a");
+  assert.equal(fileLinks.length, 2);
+  assert.deepEqual(fileLinks.map((node) => node.getAttribute("href")), [
+    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content`,
+    `https://llm.lazying.art/api/agent/artifacts/${ARTIFACT_ID}/content`,
+  ]);
+  assert.equal(fileLinks[0].textContent, "Open");
+  assert.equal(fileLinks[0].getAttribute("target"), "_blank");
+  assert.equal(fileLinks[0].getAttribute("rel"), "noopener noreferrer");
+  assert.equal(fileLinks[1].textContent, "Download");
+  assert.equal(fileLinks[1].getAttribute("download"), "paper.pdf");
+  assert.match(fileTarget.textContent, /paper\.pdf · 2\.4 MB/u);
+  assert.match(fileTarget.textContent, /Not stored or cached by the web edge/u);
+  assert.equal(fileNodes.some((node) => ["img", "iframe", "script", "object", "embed"].includes(node.tagName)), false);
 
   assert.equal(renderer.renderArtifact(target, {
     ...artifact("markdown", { schemaVersion: "1", markdown: "safe" }),

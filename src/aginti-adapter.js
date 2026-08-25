@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 
 import {
+  AGINTI_MAX_FILE_ARTIFACT_BYTES,
   AGINTI_RPC_PATHS,
   FAIL_CLOSED_AGENT_CAPABILITIES,
   canonicalJson,
   rpcPathIsMutation,
+  validateArtifactId,
+  validateFileSpec,
   validateAgentRequest,
   validateAgentResponse,
   validateEventEnvelope,
@@ -16,6 +19,10 @@ const SSE_BLOCK_LIMIT = 64 * 1024;
 const PRINCIPAL_ID = /^[A-Za-z0-9._~-]{16,128}$/u;
 const BROWSER_SESSION = /^[a-f0-9]{64}$/u;
 const TOKEN = /^[A-Za-z0-9._~+/=-]{32,4096}$/u;
+const DIGEST = /^[a-f0-9]{64}$/u;
+const DECIMAL = /^(?:0|[1-9]\d*)$/u;
+
+export const AGINTI_ARTIFACT_CONTENT_PATH = "/agent/v1/artifacts/content";
 
 export const AGINTI_INTERNAL_HEADERS = Object.freeze({
   principal: "x-aginti-principal-id",
@@ -86,6 +93,47 @@ function normalizeContext(value, mutation) {
   return context;
 }
 
+function safeInteger(value, label, { minimum = 0, maximum = Number.MAX_SAFE_INTEGER } = {}) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
+}
+
+export function validateArtifactContentRequest(value) {
+  const input = exactDataObject(
+    value,
+    ["artifactId", "metadataOnly", "range"],
+    "artifact content request",
+    ["artifactId"],
+  );
+  const artifactId = validateArtifactId(input.artifactId);
+  if (input.metadataOnly !== undefined && typeof input.metadataOnly !== "boolean") {
+    throw new TypeError("artifact content request.metadataOnly is invalid");
+  }
+  let range;
+  if (input.range !== undefined) {
+    const requested = exactDataObject(
+      input.range,
+      ["start", "end"],
+      "artifact content request.range",
+      ["start"],
+    );
+    const start = safeInteger(requested.start, "artifact content request.range.start");
+    const end = requested.end === undefined
+      ? undefined
+      : safeInteger(requested.end, "artifact content request.range.end", {
+          minimum: start,
+        });
+    range = Object.freeze({ start, ...(end === undefined ? {} : { end }) });
+  }
+  return Object.freeze({
+    artifactId,
+    ...(input.metadataOnly === undefined ? {} : { metadataOnly: input.metadataOnly }),
+    ...(range === undefined ? {} : { range }),
+  });
+}
+
 async function credential(provider) {
   let value;
   try { value = await provider(); }
@@ -104,6 +152,141 @@ export function validateAgintiTransportCredential(value) {
 
 function mediaType(response) {
   return String(response.headers.get("content-type") ?? "").split(";", 1)[0].trim().toLowerCase();
+}
+
+function exactDecimalHeader(response, name, { maximum = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = response.headers.get(name);
+  if (raw === null || !DECIMAL.test(raw)) {
+    fail(`AgInTi artifact ${name} header was invalid`, {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    fail(`AgInTi artifact ${name} header was outside its bound`, {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  return value;
+}
+
+function artifactFilename(response) {
+  const disposition = response.headers.get("content-disposition");
+  const matched = /^attachment; filename="([A-Za-z0-9._-]{1,120})"; filename\*=UTF-8''([^\s;\r\n]{1,3000})$/u.exec(disposition ?? "");
+  if (!matched) {
+    fail("AgInTi artifact content disposition was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  let filename;
+  try { filename = decodeURIComponent(matched[2]); }
+  catch {
+    fail("AgInTi artifact filename encoding was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const canonical = encodeURIComponent(filename).replace(/['()*]/gu, (character) => (
+    `%${character.codePointAt(0).toString(16).toUpperCase()}`
+  ));
+  if (canonical !== matched[2]) {
+    fail("AgInTi artifact filename encoding was not canonical", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  return filename;
+}
+
+function parseArtifactContentRange(response, requestedRange) {
+  const raw = response.headers.get("content-range");
+  if (requestedRange === undefined) {
+    if (raw !== null) {
+      fail("AgInTi returned an unsolicited artifact content range", {
+        code: "AGINTI_RESPONSE_INVALID",
+        statusCode: 502,
+        retryable: false,
+      });
+    }
+    return null;
+  }
+  const match = /^bytes (0|[1-9]\d*)-(0|[1-9]\d*)\/(0|[1-9]\d*)$/u.exec(raw ?? "");
+  if (!match) {
+    fail("AgInTi artifact content range was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = Number(match[3]);
+  if (![start, end, total].every(Number.isSafeInteger)
+      || start !== requestedRange.start || start > end || end >= total
+      || total < 1 || total > AGINTI_MAX_FILE_ARTIFACT_BYTES
+      || (requestedRange.end !== undefined && end > requestedRange.end)) {
+    fail("AgInTi artifact content range disagreed with the request", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  return Object.freeze({ start, end, total, value: `bytes ${start}-${end}/${total}` });
+}
+
+function requireArtifactResponseHeaders(response, request) {
+  if (response.headers.get("cache-control") !== "no-store, private"
+      || response.headers.get("accept-ranges") !== "bytes"
+      || response.headers.get("x-content-type-options") !== "nosniff") {
+    fail("AgInTi artifact response security headers were invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const range = parseArtifactContentRange(response, request.range);
+  const selectedBytes = request.metadataOnly === true
+    ? exactDecimalHeader(response, "x-artifact-content-length", { maximum: AGINTI_MAX_FILE_ARTIFACT_BYTES })
+    : exactDecimalHeader(response, "content-length", { maximum: AGINTI_MAX_FILE_ARTIFACT_BYTES });
+  const responseBytes = exactDecimalHeader(response, "content-length", { maximum: AGINTI_MAX_FILE_ARTIFACT_BYTES });
+  if ((request.metadataOnly === true && responseBytes !== 0)
+      || (request.metadataOnly !== true && response.headers.get("x-artifact-content-length") !== null)
+      || selectedBytes < 1 || selectedBytes !== (range === null ? selectedBytes : range.end - range.start + 1)) {
+    fail("AgInTi artifact response byte metadata was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const totalBytes = range?.total ?? selectedBytes;
+  const sha256 = String(response.headers.get("etag") ?? "").replace(/^"|"$/gu, "");
+  if (!DIGEST.test(sha256) || response.headers.get("etag") !== `"${sha256}"`) {
+    fail("AgInTi artifact ETag was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  const mime = String(response.headers.get("content-type") ?? "").toLowerCase();
+  const filename = artifactFilename(response);
+  try {
+    validateFileSpec({ schemaVersion: "1", filename, mime, bytes: totalBytes, sha256 });
+  } catch {
+    fail("AgInTi artifact metadata was invalid", {
+      code: "AGINTI_RESPONSE_INVALID",
+      statusCode: 502,
+      retryable: false,
+    });
+  }
+  return Object.freeze({ filename, mime, totalBytes, selectedBytes, sha256, range });
 }
 
 function assertUnencoded(response) {
@@ -282,6 +465,59 @@ export function createAgintiAgentAdapter({ upstream, credentialProvider, fetchIm
   if (typeof credentialProvider !== "function") throw new TypeError("credentialProvider must be a function");
   if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
 
+  async function artifactContent(body, context) {
+    const input = validateArtifactContentRequest(body);
+    const safeContext = normalizeContext(context, false);
+    const token = await credential(credentialProvider);
+    let response;
+    try {
+      response = await fetchImpl(`${origin}${AGINTI_ARTIFACT_CONTENT_PATH}`, {
+        method: "POST",
+        cache: "no-store",
+        redirect: "error",
+        headers: requestHeaders(
+          token,
+          safeContext,
+          false,
+          "application/pdf, application/x-tex, text/x-tex, application/json",
+        ),
+        body: JSON.stringify(input),
+        signal: safeContext.signal,
+      });
+    } catch (error) { throw responseFailure(error); }
+    assertUnencoded(response);
+    if ([404, 410, 416].includes(response.status)) {
+      if (mediaType(response) !== "application/json"
+          || response.headers.get("cache-control") !== "no-store"
+          || response.headers.get("x-content-type-options") !== "nosniff") {
+        await response.body?.cancel?.().catch(() => {});
+        fail("AgInTi artifact error response was invalid", {
+          code: "AGINTI_RESPONSE_INVALID",
+          statusCode: 502,
+          retryable: false,
+        });
+      }
+      await response.body?.cancel?.().catch(() => {});
+      return Object.freeze({ status: response.status });
+    }
+    const expectedStatus = input.range === undefined ? 200 : 206;
+    if (response.status !== expectedStatus) throw upstreamError(response);
+    const metadata = requireArtifactResponseHeaders(response, input);
+    if (input.metadataOnly === true) {
+      await response.body?.cancel?.().catch(() => {});
+      return Object.freeze({ status: response.status, ...metadata, body: null });
+    }
+    if (!response.body || typeof response.body.getReader !== "function") {
+      await response.body?.cancel?.().catch(() => {});
+      fail("AgInTi artifact byte stream was unavailable", {
+        code: "AGINTI_RESPONSE_INVALID",
+        statusCode: 502,
+        retryable: false,
+      });
+    }
+    return Object.freeze({ status: response.status, ...metadata, body: response.body });
+  }
+
   async function request(pathname, body, context) {
     if (!Object.values(AGINTI_RPC_PATHS).includes(pathname)) throw new TypeError("unknown AgInTi RPC path");
     const mutation = rpcPathIsMutation(pathname);
@@ -357,6 +593,7 @@ export function createAgintiAgentAdapter({ upstream, credentialProvider, fetchIm
 
   return Object.freeze({
     rpc: request,
+    artifactContent,
     async capabilities(context) {
       try { return await request(AGINTI_RPC_PATHS.capabilities, {}, context); }
       catch { return FAIL_CLOSED_AGENT_CAPABILITIES; }

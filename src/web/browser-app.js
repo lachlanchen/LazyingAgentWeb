@@ -222,13 +222,25 @@ function requestsAgentDocumentCreation(value) {
     return false;
   }
   const action = normalizedExecutionAction(text);
-  const createsDocument = /^(?:make|create|generate|write|rewrite|revise|update|edit|modify|correct|fix|regenerate|recompile|produce|prepare|compile|typeset|render|export|build|deliver|provide|save)\b/iu.test(action)
-    || /^(?:use|using)\s+(?:latex|tex)\s+to\s+(?:make|create|generate|write|produce|prepare|compile|typeset|render|export|build|deliver|provide|save)\b/iu.test(action)
-    || /^i\s+(?:need|want|would\s+like)\s+(?=[^.?!]{0,200}\b(?:latex|tex)(?:\s+(?:source|file|document))?\b)(?=[^.?!]{0,200}\b(?:compiled\s+)?pdf\b)(?=[^.?!]{0,200}\b(?:(?:latex|tex)\s+(?:source|file|document)|compiled\s+pdf)\b)/iu.test(text)
-    || /^(?:创建|建立|生成|撰写|撰寫|重写|重寫|修改|修订|修訂|更新|重新生成|重新编译|重新編譯|编译|編譯|导出|導出|准备|準備|制作|製作|交付|排版)/u.test(action);
+  const creationExcluded = /\b(?:do\s+not|don't|dont|never|avoid)\b[^.!?;\r\n]{0,160}\b(?:make|create|generate|write|compile|typeset|render|export|build|deliver|provide|send|give|return|output|share|save|download|files?|artifacts?|outputs?|deliverables?)\b|\bwithout\b[^.!?;\r\n]{0,100}\b(?:making|creating|generating|writing|compiling|rendering|exporting|saving|downloading|files?|artifacts?)\b|\bneither\b[^.!?;\r\n]{0,160}\b(?:latex|tex)\b[^.!?;\r\n]{0,160}\b(?:nor|or|and)\b[^.!?;\r\n]{0,100}\bpdf\b|\b(?:just|only)\s+(?:explain|describe|discuss|compare|review)\b|(?:不要|不用|无需|無需|不需要|禁止|避免)[^。！？；\r\n]{0,120}(?:创建|建立|生成|撰写|撰寫|编译|編譯|导出|導出|制作|製作|文件|文档|文檔|输出|輸出)/iu.test(text);
+  const discussionTarget = /^(?:make|create|generate|write|produce|prepare|provide|give|return|output|share|deliver)\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:tutorial|explanation|advice|comparison|overview|discussion|review|article|essay|prose|example|guide)\b|^(?:make|create|generate|write|produce|prepare)\s+(?:something\s+)?(?:about|on)\b|^(?:make|create|generate|write|produce|prepare|provide)\b[^.!?;\r\n]{0,120}\b(?:latex|tex)\s+source[- ]code\s+example\b/iu.test(action);
+  if (creationExcluded || discussionTarget) return false;
+  const needDeliverable = /(?:\.tex\b|\.pdf\b|\b(?:source(?:\s+files?)?|compiled\s+pdf|files?|documents?|reports?|papers?|manuscripts?|artifacts?|outputs?|deliverables?|versions?|formats?)\b|(?:源文件|源檔案|源檔|文件|文档|文檔|报告|報告|论文|論文|输出|輸出|格式|版本|编译后|編譯後))/iu.test(action);
+  const createsDocument = /^(?:make|create|generate|write|rewrite|revise|update|edit|modify|correct|fix|regenerate|recompile|produce|prepare|compile|typeset|render|export|build|deliver|provide|send|give|return|output|share|save)\b/iu.test(action)
+    || /^(?:(?:i|we)\s+)?(?:need|want|require|would\s+like)\b/iu.test(action) && needDeliverable
+    || /^(?:(?:我|我们|我們)\s*)?(?:需要|想要|要)(?:\s|$)/u.test(action) && needDeliverable
+    || /^(?:use|using)\s+(?:latex|tex)\b/iu.test(action)
+    || /^(?:创建|建立|生成|撰写|撰寫|重写|重寫|修改|修订|修訂|更新|重新生成|重新编译|重新編譯|编译|編譯|导出|導出|准备|準備|制作|製作|交付|提供|给我|給我|输出|輸出|返回|排版)/u.test(action);
   const hasTex = /(?:\.tex\b|\b(?:latex|tex)(?:\s+(?:source|file|document|format))?\b)/iu.test(text);
   const hasPdf = /(?:\.pdf\b|\b(?:compiled\s+)?pdf\b)/iu.test(text);
-  return createsDocument && hasTex && hasPdf;
+  const topicComparison = /\b(?:about|compare|comparing|comparison|differences?\s+between|explain|explaining|explanation|discussion|overview|tutorial|advice|prose|source[- ]code\s+example)\b[^.!?\r\n]{0,180}\b(?:latex|tex)\b[^.!?\r\n]{0,120}\bpdf\b/iu.test(text);
+  const artifactFraming = /\b(?:both|source|files?|documents?|reports?|papers?|manuscripts?|artifacts?|outputs?|versions?|formats?|deliverables?|compiled)\b|(?:源文件|源码|源碼|文件|文档|文檔|报告|報告|论文|論文|输出|輸出|格式|编译后|編譯後)/iu.test(text);
+  const coordinated = /\b(?:both\s+)?(?:latex|tex)(?:\s+(?:source|file|document|format|manuscript))?\b[^.!?\r\n]{0,100}\b(?:and|plus|along\s+with|together\s+with|as\s+well\s+as|with)\b[^.!?\r\n]{0,100}\b(?:compiled\s+)?pdf\b|\bpdf\b[^.!?\r\n]{0,100}\b(?:and|plus|along\s+with|together\s+with|as\s+well\s+as)\b[^.!?\r\n]{0,100}\b(?:latex|tex)\s+(?:source|file|document|format|manuscript)\b/iu.test(text);
+  const explicitExtensions = /\.tex\b[\s\S]{0,240}\.pdf\b|\.pdf\b[\s\S]{0,240}\.tex\b/iu.test(text);
+  const production = /\b(?:compile|typeset|render|export|build|convert)\b[^.!?\r\n]{0,180}\b(?:latex|tex|\.tex)\b[^.!?\r\n]{0,120}\b(?:to|into|as)\b[^.!?\r\n]{0,60}\bpdf\b|\b(?:make|create|generate|produce|prepare|render|export)\b[^.!?\r\n]{0,160}\bpdf\b[^.!?\r\n]{0,100}\b(?:using|with|from)\b[^.!?\r\n]{0,60}\b(?:latex|tex)\b|\buse\s+(?:latex|tex)\b[^.!?\r\n]{0,120}\b(?:make|create|generate|produce|prepare|render|export)\b[^.!?\r\n]{0,80}\bpdf\b|\b(?:latex|tex)\b[^.!?\r\n]{0,160}\b(?:compile|typeset|render|export|build|give|return|send|provide)\b[^.!?\r\n]{0,100}\bpdf\b/iu.test(text);
+  const chinesePair = /(?:latex|tex|\.tex)[^。！？\r\n]{0,100}(?:和|及|与|與|以及|连同|連同|并(?:编译成)?|並(?:編譯成)?)[^。！？\r\n]{0,100}(?:pdf|\.pdf)|(?:pdf|\.pdf)[^。！？\r\n]{0,100}(?:和|及|与|與|以及|连同|連同)[^。！？\r\n]{0,100}(?:latex|tex|\.tex)/iu.test(text);
+  return createsDocument && hasTex && hasPdf
+    && (explicitExtensions || (coordinated && artifactFraming && !topicComparison) || production || chinesePair);
 }
 
 function requestedAvailableAgentTool(value, capabilities) {
@@ -236,6 +248,20 @@ function requestedAvailableAgentTool(value, capabilities) {
   if (capabilities?.artifacts?.kinds?.includes?.("file") === true
       && requestsAgentDocumentCreation(value)) return "document";
   return null;
+}
+
+function agentHandoffNeedsChatContext(value) {
+  const text = String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
+  if (!text) return false;
+  if (/\b(?:above|previous|prior|earlier|preceding|last|same|existing)\s+(?:article|text|code|plot|chart|graph|document|report|paper|data|result|answer|response|content|file|source)\b|\b(?:article|text|code|plot|chart|graph|document|report|paper|data|result|answer|response|content|file|source)\s+(?:above|previous|prior|earlier)\b|\b(?:from|using|based\s+on)\s+(?:the\s+)?(?:above|previous|prior|earlier|preceding|last|same|existing)\b/iu.test(text)) {
+    return true;
+  }
+  const action = normalizedExecutionAction(text);
+  if (/^(?:continue|redo|revise|modify|update|change|fix|regenerate|recompile|plot|chart|graph|compile|render|export|rewrite|summari[sz]e|use|run|execute)\s+(?:it|that|this)\b/iu.test(action)
+      || /\b(?:from|using|based\s+on)\s+(?:it|this|that)\b/iu.test(text)) {
+    return !/(?:```|~~~)[^\r\n]*[\s\S]+(?:```|~~~)/u.test(String(value || ""));
+  }
+  return false;
 }
 
 function updateHandoffDraft(value) {
@@ -4198,6 +4224,10 @@ export function createBrowserApp({
       ? requestedAvailableAgentTool(text, state.capabilities)
       : null;
     if (requestedTool !== null) {
+      if (agentHandoffNeedsChatContext(text)) {
+        showToast("This request depends on Direct Chat context that Agent cannot receive automatically. Switch to Agent and include the needed text, data, or code in this prompt; nothing was sent.");
+        return;
+      }
       setMode("agent", { restoreView: false, remember: false });
       if (state.mode === "agent") {
         newConversation();

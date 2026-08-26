@@ -1233,8 +1233,20 @@ test("advertised TeX/PDF file creation requests hand off from Chat to Agent", as
     "Write a latex of qaoa compile and give me link of pdf with figures",
     "I need a LaTeX source and compiled PDF.",
     "I want the TeX file and the compiled PDF.",
+    "Create the report in LaTeX and give me the PDF.",
+    "Generate a QAOA paper using LaTeX and return a PDF.",
+    "Prepare the TeX manuscript and PDF.",
+    "Write the LaTeX and PDF files.",
+    "Produce both LaTeX and PDF versions.",
+    "Please send me the TeX source and compiled PDF.",
+    "I need the .tex and .pdf files.",
+    "Give me a LaTeX source and compiled PDF.",
+    "Output a TeX source plus compiled PDF.",
     "Use LaTeX to make a PDF with a self-contained figure.",
     "请生成 LaTeX 源文件并编译成 PDF。",
+    "请提供 LaTeX 源文件和编译后的 PDF。",
+    "我需要 TeX 文件和 PDF 文件。",
+    "制作 LaTeX 和 PDF 两种格式。",
   ]) {
     const started = [];
     const agent = {
@@ -1272,6 +1284,15 @@ test("TeX/PDF wording stays in Chat when file creation is not advertised or not 
     "Do not create a LaTeX or PDF file.",
     "I need an explanation of LaTeX and PDF.",
     "How do I use LaTeX to make a PDF?",
+    "Provide an explanation of LaTeX and PDF.",
+    "Write about LaTeX and PDF.",
+    "Write a tutorial about LaTeX and PDF.",
+    "Give me advice about LaTeX and PDF.",
+    "Compare LaTeX and PDF.",
+    "Write prose explaining LaTeX and PDF.",
+    "Provide a LaTeX source-code example and explain PDF output.",
+    "Do not create files; explain LaTeX and PDF.",
+    "Create neither LaTeX nor PDF files.",
   ];
   for (const [index, prompt] of prompts.entries()) {
     const fileCapability = index !== 0;
@@ -1299,7 +1320,45 @@ test("TeX/PDF wording stays in Chat when file creation is not advertised or not 
 
     assert.deepEqual(chatRuns, [prompt]);
     assert.equal(agentStarts, 0);
-    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat", prompt);
+  }
+});
+
+test("context-dependent Chat requests are not silently handed to a fresh Agent thread", async () => {
+  for (const prompt of [
+    "Plot it.",
+    "Plot the above data.",
+    "Run the previous code.",
+    "Create a LaTeX source and PDF from the article above.",
+    "Revise it and return the TeX and PDF files.",
+  ]) {
+    const chatRuns = [];
+    let agentThreads = 0;
+    let agentStarts = 0;
+    const browser = harness({
+      agent: {
+        ...baseAgent(capabilities({
+          enabled: true,
+          actions: { cancel: true, resume: true, retry: false },
+          artifacts: { kinds: ["plot", "table", "markdown", "file"], schemaVersion: "1" },
+        })),
+        async createThread() { agentThreads += 1; throw new Error("context guard must not create Agent thread"); },
+        async startRun() { agentStarts += 1; throw new Error("context guard must not start Agent"); },
+      },
+      chat: terminalTextChat({ onRun(ticket) { chatRuns.push(ticket.content); } }),
+    });
+    await browser.app.initialize();
+    browser.app.setMode("chat", { restoreView: false });
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat", `mode selection: ${prompt}`);
+    browser.document.getElementById("message-input").value = prompt;
+    await browser.app.submitMessage({ preventDefault() {} });
+
+    assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat", `after submit: ${prompt}`);
+    assert.equal(browser.document.getElementById("message-input").value, prompt);
+    assert.equal(agentThreads, 0);
+    assert.equal(agentStarts, 0);
+    assert.deepEqual(chatRuns, []);
+    assert.match(browser.document.getElementById("toast").textContent, /depends on Direct Chat context[\s\S]*nothing was sent/iu);
   }
 });
 

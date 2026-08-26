@@ -172,7 +172,8 @@ const APP_IDS = [
   "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
-  "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
+  "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
+  "activity-panel", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
@@ -909,6 +910,7 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.match(html, /<summary><strong>Agent activity<\/strong><span id="run-state">Idle<\/span><\/summary>/u);
   assert.doesNotMatch(html, /<details id="activity-disclosure"[^>]*\sopen(?:\s|>)/u);
   assert.match(html, /<button id="send-message"[^>]*aria-label="Send Chat"[^>]*>Send Chat<\/button>/u);
+  assert.match(html, /<div id="chat-bottom"[^>]*aria-hidden="true"><\/div>[\s\S]*<button id="go-to-bottom"[^>]*aria-label="Go to newest message"[^>]*hidden>↓<\/button>/u);
   assert.match(html, /id="capability-note"[^>]*>Chat · LocalLLM text only · no tools, file creation, or web search\.<\/p>/u);
   assert.match(html, /<details class="topbar-info">[\s\S]*<summary aria-label="Show app and capability information">Info<\/summary>[\s\S]*id="capability-note"[\s\S]*<\/details>[\s\S]*<\/header>/u);
   assert.doesNotMatch(html, /class="footer-note"/u);
@@ -968,6 +970,17 @@ test("Agent activity is a collapsed in-flow disclosure that cannot overlay chat 
   assert.match(BRIGHT_APP_CSS, /\.activity-disclosure > summary::after \{[^}]*content:\s*"Show details ⌄";/u);
   assert.match(BRIGHT_APP_CSS, /\.activity-disclosure\[open\] > summary::after \{ content: "Hide details ⌃"; \}/u);
   assert.match(BRIGHT_APP_CSS, /@media \(max-width: 760px\) \{[\s\S]*\.activity-details \{ max-height: min\(24dvh, 14rem\); \}/u);
+});
+
+test("the newest-message control is an accessible touch target over only the chat grid row", () => {
+  const controlRule = /\.go-to-bottom \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(controlRule);
+  assert.match(controlRule[1], /grid-area:\s*chat;/u);
+  assert.match(controlRule[1], /align-self:\s*end;/u);
+  assert.match(controlRule[1], /justify-self:\s*end;/u);
+  assert.match(controlRule[1], /min-width:\s*46px;/u);
+  assert.match(controlRule[1], /min-height:\s*46px;/u);
+  assert.match(BRIGHT_APP_CSS, /\.chat-scroll \{[^}]*scroll-padding-block-end:\s*4rem;/u);
 });
 
 test("the compact topbar is one row with an ellipsized title and collapsed capability Info", () => {

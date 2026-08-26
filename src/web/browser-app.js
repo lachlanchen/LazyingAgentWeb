@@ -59,6 +59,7 @@ const DEFAULT_ATTACHMENT_MEMORY_LIMIT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
 const ATTACHMENT_RENDERED_PREVIEW_LIMIT = 4;
 const ATTACHMENT_RESTORE_CONCURRENCY = 1;
+const NEWEST_MESSAGE_PROXIMITY_PX = 96;
 const COMPOSER_IMAGE_COUNT_LIMIT = 4;
 const COMPOSER_IMAGE_BYTES_LIMIT = 16 * 1024 * 1024;
 const COMPOSER_MESSAGE_BYTES_LIMIT = 32 * 1024;
@@ -1054,7 +1055,8 @@ function elementMap(document) {
     "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
     "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
     "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
-    "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
+    "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
+    "activity-panel", "run-state", "agent-plan",
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
     "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
@@ -1104,6 +1106,7 @@ export function createBrowserApp({
   attachmentDecodedMemoryLimitBytes = DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES,
   now = Date.now,
   maxStreamBackoffSteps = 5,
+  maxAutomaticAgentReconnects = 3,
   wait = (milliseconds, signal) => new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, milliseconds);
     signal?.addEventListener("abort", () => {
@@ -1189,6 +1192,10 @@ export function createBrowserApp({
   if (!Number.isSafeInteger(maxStreamBackoffSteps) || maxStreamBackoffSteps < 0 || maxStreamBackoffSteps > 20) {
     throw new TypeError("maxStreamBackoffSteps must be an integer from 0 through 20");
   }
+  if (!Number.isSafeInteger(maxAutomaticAgentReconnects)
+      || maxAutomaticAgentReconnects < 0 || maxAutomaticAgentReconnects > 20) {
+    throw new TypeError("maxAutomaticAgentReconnects must be an integer from 0 through 20");
+  }
   if (typeof wait !== "function") throw new TypeError("wait must be a function");
   const elements = elementMap(document);
   const state = {
@@ -1252,6 +1259,7 @@ export function createBrowserApp({
     agentReplayFailed: false,
     agentReplayOfferResume: true,
     agentCancelPending: false,
+    agentReconnect: null,
     agentPendingResume: null,
     agentPendingThreadCreate: null,
     agentSearchSelected: false,
@@ -1308,6 +1316,7 @@ export function createBrowserApp({
     updateCheckPendingOnlineTransition: false,
     sessionRevalidationInFlight: false,
     sessionRevalidationPending: false,
+    followNewest: true,
   };
 
   function showToast(message) {
@@ -1319,6 +1328,77 @@ export function createBrowserApp({
   function connection(label, online = true) {
     elements.connection_state.textContent = label;
     elements.connection_state.dataset.online = online ? "true" : "false";
+  }
+
+  function sameCursor(left, right) {
+    return left !== null && right !== null
+      && typeof left === "object" && typeof right === "object"
+      && left.seq === right.seq && left.hash === right.hash;
+  }
+
+  function chatIsNearBottom() {
+    const scrollTop = Number(elements.chat_scroll.scrollTop);
+    const scrollHeight = Number(elements.chat_scroll.scrollHeight);
+    const clientHeight = Number(elements.chat_scroll.clientHeight);
+    if (![scrollTop, scrollHeight, clientHeight].every(Number.isFinite)) return true;
+    return scrollHeight - clientHeight - scrollTop <= NEWEST_MESSAGE_PROXIMITY_PX;
+  }
+
+  function updateGoToBottom() {
+    const hasMessages = (elements.messages.children?.length ?? 0) > 0;
+    elements.go_to_bottom.hidden = !hasMessages || chatIsNearBottom();
+  }
+
+  function scheduleNewestMessage({
+    force = false,
+    follow = state.followNewest,
+    expectedEpoch = state.viewEpoch,
+    behavior = "auto",
+  } = {}) {
+    if (!force && !follow) {
+      updateGoToBottom();
+      return false;
+    }
+    const frame = typeof window?.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : (callback) => queueMicrotask(callback);
+    frame(() => {
+      if (state.viewEpoch !== expectedEpoch || (!force && !state.followNewest)) return;
+      const top = Number(elements.chat_scroll.scrollHeight);
+      if (typeof elements.chat_scroll.scrollTo === "function") {
+        elements.chat_scroll.scrollTo({ top: Number.isFinite(top) ? top : 0, behavior });
+      } else {
+        elements.chat_scroll.scrollTop = Number.isFinite(top) ? top : 0;
+      }
+      state.followNewest = true;
+      updateGoToBottom();
+    });
+    return true;
+  }
+
+  function clearAgentReconnect() {
+    state.agentReconnect = null;
+    elements.resume_run.textContent = "Resume";
+  }
+
+  function currentAgentReconnect(descriptor = state.agentReconnect) {
+    if (descriptor === null || descriptor !== state.agentReconnect) return false;
+    let snapshot;
+    try { snapshot = descriptor.presentation.snapshot(); }
+    catch { return false; }
+    return descriptor.session === state.session
+      && descriptor.agent === state.agent
+      && state.session.authenticated
+      && state.mode === "agent"
+      && descriptor.epoch === state.viewEpoch
+      && descriptor.threadId === state.agentThreadId
+      && descriptor.runId === state.runId
+      && descriptor.presentation === state.presentation
+      && !TERMINAL.has(state.agentRunStatus)
+      && snapshot.runId === descriptor.runId
+      && snapshot.threadId === descriptor.threadId
+      && snapshot.terminalStatus === null
+      && sameCursor(snapshot.cursor, descriptor.cursor);
   }
 
   function clearChatFailureDiagnostic() {
@@ -1817,6 +1897,7 @@ export function createBrowserApp({
       return;
     }
     if (changed) {
+      clearAgentReconnect();
       state.viewEpoch += 1;
       state.streamAbort?.abort();
       state.agentSearchSelected = false;
@@ -2051,6 +2132,7 @@ export function createBrowserApp({
     resetAttachmentRestorations();
     state.imageRenderEpoch += 1;
     revokeRenderedAttachmentUrls();
+    clearAgentReconnect();
     elements.messages.replaceChildren();
     elements.agent_plan.replaceChildren();
     elements.agent_timeline.replaceChildren();
@@ -2062,6 +2144,7 @@ export function createBrowserApp({
     elements.workspace.dataset.status = "idle";
     elements.stop_run.hidden = true;
     elements.resume_run.hidden = true;
+    elements.go_to_bottom.hidden = true;
     state.presentation = null;
     state.assistantNode = null;
     state.agentRunMessages.clear();
@@ -2136,6 +2219,7 @@ export function createBrowserApp({
     chat = state.chat,
     signal,
   }) {
+    const followNewest = state.followNewest;
     const current = () => restoredImageIsCurrent({ chat, expectedEpoch, expectedImageEpoch });
     const cacheKey = attachmentBlobCacheKey(threadId, attachment);
     const unavailable = () => {
@@ -2194,6 +2278,7 @@ export function createBrowserApp({
       status.hidden = true;
       status.disabled = true;
       article.dataset.attachmentState = "ready";
+      scheduleNewestMessage({ follow: followNewest, expectedEpoch });
       return "ready";
     } catch (error) {
       if (url !== null) forgetRenderedAttachmentPreview(cacheKey, { defer: false, expectedUrl: url });
@@ -2208,6 +2293,8 @@ export function createBrowserApp({
   function messageNode(role, content, {
     runId, attachment, attachments, threadId, localAttachment, localAttachments, attachmentReadyTasks,
   } = {}) {
+    const followNewest = state.followNewest;
+    const messageEpoch = state.viewEpoch;
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.role = role;
@@ -2245,6 +2332,9 @@ export function createBrowserApp({
           image.src = url;
           image.dataset.previewState = "local";
           article.dataset.attachmentState = "local";
+          image.addEventListener("load", () => {
+            scheduleNewestMessage({ follow: followNewest, expectedEpoch: messageEpoch });
+          }, { once: true });
         } else {
           image.hidden = true;
           image.alt = "Attached image preview not loaded";
@@ -2298,6 +2388,7 @@ export function createBrowserApp({
     }
     elements.messages.appendChild(article);
     elements.welcome.hidden = true;
+    scheduleNewestMessage({ follow: followNewest, expectedEpoch: messageEpoch });
     return body;
   }
 
@@ -2422,6 +2513,7 @@ export function createBrowserApp({
   }
 
   function renderPresentation(snapshot) {
+    const followNewest = state.followNewest;
     const releaseCancellationFence = snapshot.terminalStatus !== null && state.agentCancelPending;
     if (releaseCancellationFence) state.agentCancelPending = false;
     const projectedStatus = safeRunStatus(snapshot.status);
@@ -2461,6 +2553,7 @@ export function createBrowserApp({
     elements.agent_artifacts.replaceChildren();
     elements.agent_artifacts.hidden = true;
     const isTerminal = TERMINAL.has(visibleStatus);
+    if (isTerminal) clearAgentReconnect();
     elements.stop_run.hidden = isTerminal || state.agentCancelPending || !state.capabilities.actions.cancel;
     elements.resume_run.hidden = state.agentReplayValidating
       || state.agentReplayFailed
@@ -2471,6 +2564,7 @@ export function createBrowserApp({
       updateImageControl();
       flushDeferredSessionRevalidation();
     }
+    scheduleNewestMessage({ follow: followNewest });
   }
 
   function renderAgentFailure(runId, value) {
@@ -2488,6 +2582,7 @@ export function createBrowserApp({
 
   async function streamAgentRun(run, {
     cursor,
+    recoveryPresentation,
     expectedRunId = run?.id,
     expectedThreadId = run?.threadId,
     replayTerminal = false,
@@ -2496,6 +2591,17 @@ export function createBrowserApp({
   } = {}) {
     correlatedAgentRun(run, { runId: expectedRunId, threadId: expectedThreadId });
     if (replayTerminal && cursor !== undefined) throw new TypeError("terminal Agent replay must start from cursor zero");
+    if (recoveryPresentation !== undefined) {
+      const recoverySnapshot = recoveryPresentation?.snapshot?.();
+      if (replayTerminal || cancelPending || cursor === undefined
+          || recoverySnapshot?.runId !== run.id || recoverySnapshot?.threadId !== run.threadId
+          || recoverySnapshot.terminalStatus !== null || !sameCursor(recoverySnapshot.cursor, cursor)) {
+        throw new AgintiProtocolError("Agent reconnect presentation does not own the requested cursor", {
+          code: "LEDGER_OWNERSHIP_MISMATCH",
+        });
+      }
+    }
+    clearAgentReconnect();
     state.agentReplayValidating = replayTerminal;
     state.agentReplayFailed = false;
     state.agentReplayOfferResume = offerResume;
@@ -2503,11 +2609,14 @@ export function createBrowserApp({
     state.runId = run.id;
     // RPC response statuses can help project progress, but terminal authority
     // belongs only to a verified hash-chained terminal event.
-    const initialStatus = replayTerminal ? "running" : eventAwaitingRunStatus(run.status);
+    const initialStatus = replayTerminal
+      ? "running"
+      : recoveryPresentation?.snapshot?.().status ?? eventAwaitingRunStatus(run.status);
     state.agentRunStatus = initialStatus;
     const agent = state.agent;
     const streamEpoch = state.viewEpoch;
-    const presentation = createRunPresentation({ runId: run.id, threadId: run.threadId, cursor });
+    const presentation = recoveryPresentation
+      ?? createRunPresentation({ runId: run.id, threadId: run.threadId, cursor });
     state.presentation = presentation;
     state.assistantNode = state.agentRunMessages.get(run.id)?.body ?? null;
     state.streamAbort?.abort();
@@ -2585,6 +2694,11 @@ export function createBrowserApp({
           if (!ownsStream()) return;
           if (error instanceof AgintiProtocolError || error?.retryable === false) throw error;
         }
+        if (recoveries >= maxAutomaticAgentReconnects) {
+          throw failure ?? Object.assign(new Error("Agent stream reached its automatic reconnect boundary"), {
+            retryable: true,
+          });
+        }
         recoveries += 1;
         connection(authoritativeRun && TERMINAL.has(authoritativeRun.status)
           ? "Waiting for verified Agent completion"
@@ -2620,11 +2734,21 @@ export function createBrowserApp({
         flushDeferredSessionRevalidation();
         return;
       }
-      elements.resume_run.hidden = state.agentCancelPending || !state.capabilities.actions.resume;
-      connection(state.agentCancelPending ? "Confirming Agent cancellation" : "Agent stream interrupted", false);
-      showToast(state.agentCancelPending
-        ? "Cancellation is being confirmed. Its verified history will reconnect automatically."
-        : "The Agent run is still owned by AgInTi. Resume reconnects without restarting it.");
+      const snapshot = presentation.snapshot();
+      state.agentReconnect = Object.freeze({
+        session: state.session,
+        agent,
+        epoch: streamEpoch,
+        threadId: run.threadId,
+        runId: run.id,
+        presentation,
+        cursor: snapshot.cursor,
+      });
+      elements.run_state.textContent = "Interrupted";
+      elements.resume_run.textContent = "Reconnect";
+      elements.resume_run.hidden = false;
+      connection("Agent stream interrupted", false);
+      showToast("The Agent run is still owned by AgInTi. Reconnect continues the same verified run without restarting it.");
     } finally {
       if (state.streamAbort === controller) {
         state.streamAbort = null;
@@ -2750,6 +2874,7 @@ export function createBrowserApp({
       }
       if (thread.lastRunId === null) state.runId = null;
       state.agentReplayFailed = false;
+      scheduleNewestMessage({ force: true, expectedEpoch });
       return true;
     } catch (error) {
       if (clientReleaseMismatch(error) !== null) throw error;
@@ -3156,10 +3281,12 @@ export function createBrowserApp({
             onCursor: async (cursor) => { state.chatAfterSequence = cursor.afterSequence; },
           })) {
             if (event.type === "delta") {
+              const followNewest = state.followNewest;
               elements.run_state.textContent = "Generating";
               connection("Connected");
               state.chatOutput += event.delta.content;
               renderer.renderMarkdown(state.assistantNode, state.chatOutput);
+              scheduleNewestMessage({ follow: followNewest, expectedEpoch });
             } else {
               await finishChatGeneration(event.generation, controller, expectedEpoch);
               return;
@@ -3227,6 +3354,7 @@ export function createBrowserApp({
         refreshThreadList,
       });
       if (state.mode !== "chat" || state.viewEpoch !== expectedEpoch) return;
+      scheduleNewestMessage({ force: true, expectedEpoch });
       generationId = snapshot.thread.currentGenerationId;
       if (!generationId) {
         state.chatGeneration = null;
@@ -3823,11 +3951,13 @@ export function createBrowserApp({
         finishRetainedUpdateRecovery();
       }
       resolveLegacyUpdateRecovery("this conversation");
+      scheduleNewestMessage({ force: true });
       return;
     }
     state.busy = true;
     updateImageControl();
     renderThreads();
+    clearAgentReconnect();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     let releaseRefreshTarget = null;
@@ -3869,6 +3999,7 @@ export function createBrowserApp({
 
   async function restoreModeView({ autoOpen = false, prefetchedChatThreads = null } = {}) {
     const mode = state.mode;
+    clearAgentReconnect();
     const epoch = ++state.viewEpoch;
     const preferred = mode === "agent" ? state.agentThreadId : state.chatThreadId;
     state.streamAbort?.abort();
@@ -5198,6 +5329,7 @@ export function createBrowserApp({
     }
     if (!canRetryProtectedRestore && !canRetryAgentVerification
         && state.mode === "agent" && state.runId
+        && state.agentReconnect === null
         && (!state.agentReplayOfferResume || state.agentRunStatus === "completed")) {
       elements.resume_run.hidden = true;
       showToast("This verified Agent run is not resumable.");
@@ -5207,6 +5339,7 @@ export function createBrowserApp({
     elements.resume_run.disabled = true;
     updateImageControl();
     let ownsAgentResume = null;
+    let reconnectDescriptor = null;
     let releaseRefreshTarget = null;
     try {
       if (canRetryProtectedRestore) {
@@ -5279,6 +5412,27 @@ export function createBrowserApp({
         else if (state.chatGeneration?.status === "in_progress") await streamChatGeneration(state.chatGeneration, {
           afterSequence: state.chatAfterSequence,
           output: state.chatOutput,
+        });
+      } else if (state.mode === "agent" && state.agentReconnect !== null) {
+        reconnectDescriptor = state.agentReconnect;
+        if (!currentAgentReconnect(reconnectDescriptor)) {
+          clearAgentReconnect();
+          elements.resume_run.hidden = true;
+          showToast("This Agent reconnect no longer owns the current run. Reopen the conversation to verify its latest state.");
+          return;
+        }
+        connection("Verifying Agent run before reconnect", false);
+        const response = await reconnectDescriptor.agent.runStatus(reconnectDescriptor.runId);
+        if (!currentAgentReconnect(reconnectDescriptor)) return;
+        const authoritativeRun = correlatedAgentRun(response.run, {
+          runId: reconnectDescriptor.runId,
+          threadId: reconnectDescriptor.threadId,
+        });
+        await streamAgentRun(authoritativeRun, {
+          cursor: reconnectDescriptor.cursor,
+          recoveryPresentation: reconnectDescriptor.presentation,
+          expectedRunId: reconnectDescriptor.runId,
+          expectedThreadId: reconnectDescriptor.threadId,
         });
       } else if (state.runId && state.capabilities.enabled && state.capabilities.actions.resume) {
         const requestedRunId = state.runId;
@@ -5365,6 +5519,7 @@ export function createBrowserApp({
         });
       }
     } catch (error) {
+      if (reconnectDescriptor !== null && !currentAgentReconnect(reconnectDescriptor)) return;
       if (ownsAgentResume !== null && !ownsAgentResume()) return;
       releaseRefreshTarget = clientReleaseMismatch(error);
       if (releaseRefreshTarget !== null) {
@@ -5402,7 +5557,9 @@ export function createBrowserApp({
         } else {
           showToast(state.mode === "chat"
             ? "The durable LocalLLM request could not reconnect yet."
-            : "AgInTi could not resume this run.");
+            : reconnectDescriptor !== null
+              ? "AgInTi could not reconnect to this run yet. No new run was created."
+              : "AgInTi could not resume this run.");
         }
       }
     } finally {
@@ -6213,6 +6370,14 @@ export function createBrowserApp({
   function bind() {
     if (state.bound) return;
     state.bound = true;
+    elements.chat_scroll.addEventListener("scroll", () => {
+      state.followNewest = chatIsNearBottom();
+      updateGoToBottom();
+    });
+    elements.go_to_bottom.addEventListener("click", () => {
+      state.followNewest = true;
+      scheduleNewestMessage({ force: true, behavior: "smooth" });
+    });
     elements.login_form.addEventListener("submit", (event) => { void login(event); });
     elements.composer.addEventListener("submit", (event) => { void submitMessage(event); });
     elements.add_image.addEventListener("click", () => elements.image_input.click?.());

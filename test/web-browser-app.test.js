@@ -76,6 +76,10 @@ class Node {
     this.checked = false;
     this.value = "";
     this.type = "";
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+    this.clientHeight = 0;
+    this.scrollCalls = [];
   }
   appendChild(child) {
     child.parentNode = this;
@@ -91,6 +95,10 @@ class Node {
   dispatch(name, event = {}) { for (const listener of this.listeners.get(name) ?? []) listener(event); }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
+  scrollTo(options) {
+    this.scrollTop = Number(options?.top ?? 0);
+    this.scrollCalls.push({ top: this.scrollTop, behavior: options?.behavior ?? "auto" });
+  }
   get textContent() { return this.tagName === "#text" ? this.nodeValue : this.children.map((child) => child.textContent).join(""); }
   set textContent(value) { this.children = [new Node("#text", String(value))]; }
 }
@@ -100,7 +108,8 @@ const IDS = [
   "signed-in-user", "logout", "new-thread", "thread-list", "workspace", "conversation-title",
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
-  "welcome-eyebrow", "welcome-copy", "messages", "activity-panel", "run-state", "agent-plan",
+  "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
+  "activity-panel", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
@@ -300,12 +309,15 @@ function harness({
   cursorStore,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
+  maxAutomaticAgentReconnects = 3,
+  requestAnimationFrame = (callback) => callback(),
 } = {}) {
   const document = new Document({ ...(decodeImage === undefined ? {} : { decodeImage }) });
   const windowListeners = new Map();
   const window = {
     location: { protocol: "http:", reload() {} },
     setTimeout() {},
+    requestAnimationFrame,
     addEventListener(name, listener) {
       const current = windowListeners.get(name) ?? [];
       current.push(listener);
@@ -343,6 +355,7 @@ function harness({
     ...(cursorStore === undefined ? {} : { cursorStore }),
     wait,
     maxStreamBackoffSteps,
+    maxAutomaticAgentReconnects,
   });
   return { app, document, sessionClient, window };
 }
@@ -646,6 +659,142 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
   assert.equal(malformed.document.getElementById("connection-state").textContent, "Connected · Chat only");
   assert.match(malformed.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
+});
+
+test("Chat and Agent thread hydration both open at the newest message", async () => {
+  const messages = [
+    chatMessage(1, "user", "Older Chat turn"),
+    chatMessage(2, "assistant", "Newest Chat answer"),
+  ];
+  const storedChatThread = chatThread({
+    title: "Hydrated Chat",
+    revision: 2,
+    ledgerHash: CHAT_HASH_B,
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const chatBrowser = harness({
+    chat: baseChat({
+      async listThreads() { return { threads: [storedChatThread] }; },
+      async getThread() { return { thread: storedChatThread }; },
+      async listMessages({ afterRevision, limit }) {
+        return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+      },
+    }),
+  });
+  const chatScroll = chatBrowser.document.getElementById("chat-scroll");
+  chatScroll.scrollHeight = 1_600;
+  chatScroll.clientHeight = 420;
+  await chatBrowser.app.initialize();
+  assert.equal(chatScroll.scrollTop, 1_600);
+  assert.equal(chatBrowser.document.getElementById("go-to-bottom").hidden, true);
+  assert.match(chatBrowser.document.getElementById("messages").textContent, /Newest Chat answer/u);
+
+  const history = await verifiedEvents([
+    ["output.delta", { text: "Newest Agent answer" }],
+    ["run.completed", {}],
+  ]);
+  const storedAgentThread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_user_hydration", role: "user", content: "Older Agent turn", runId: RUN_ID },
+      { id: "msg_assistant_hydration", role: "assistant", content: "Stored Agent answer", runId: RUN_ID },
+    ],
+  });
+  const agentBrowser = harness({
+    agent: {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async listThreads() { return { schemaVersion: "1", threads: [storedAgentThread], nextBefore: null }; },
+      async getThread() { return { thread: storedAgentThread }; },
+      async runStatus() { return { run: terminalRun("completed", history) }; },
+      async *streamRunEvents() {
+        for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+  });
+  const agentScroll = agentBrowser.document.getElementById("chat-scroll");
+  agentScroll.scrollHeight = 2_100;
+  agentScroll.clientHeight = 420;
+  await agentBrowser.app.initialize();
+  assert.equal(agentScroll.scrollTop, 2_100);
+  assert.equal(agentBrowser.document.getElementById("go-to-bottom").hidden, true);
+  assert.match(agentBrowser.document.getElementById("messages").textContent, /Newest Agent answer/u);
+});
+
+test("Agent streaming follows only a reader already near bottom and the control restores newest position", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "First streamed part" }],
+    ["output.delta", { text: " and second streamed part" }],
+    ["run.completed", {}],
+  ]);
+  const firstApplied = Promise.withResolvers();
+  const continueStream = Promise.withResolvers();
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Scroll behavior" } }; },
+    async startRun() { return { run: run() }; },
+    async *streamRunEvents() {
+      yield { event: events[0], cursor: { seq: events[0].seq, hash: events[0].hash } };
+      firstApplied.resolve();
+      await continueStream.promise;
+      yield { event: events[1], cursor: { seq: events[1].seq, hash: events[1].hash } };
+      yield { event: events[2], cursor: { seq: events[2].seq, hash: events[2].hash } };
+    },
+  };
+  const browser = harness({ agent });
+  const scroll = browser.document.getElementById("chat-scroll");
+  scroll.scrollHeight = 1_000;
+  scroll.clientHeight = 300;
+  scroll.scrollTop = 700;
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Stream while I read";
+  const sending = browser.app.submitMessage({ preventDefault() {} });
+  await firstApplied.promise;
+  assert.equal(scroll.scrollTop, 1_000, "a reader at the newest message follows the first delta");
+
+  scroll.scrollHeight = 1_500;
+  scroll.scrollTop = 180;
+  scroll.dispatch("scroll");
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, false);
+  continueStream.resolve();
+  await sending;
+  assert.equal(scroll.scrollTop, 180, "later deltas do not yank a reader who scrolled up");
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, false);
+
+  browser.document.getElementById("go-to-bottom").dispatch("click");
+  assert.equal(scroll.scrollTop, 1_500);
+  assert.equal(scroll.scrollCalls.at(-1).behavior, "smooth");
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, true);
+});
+
+test("a newest-message animation frame is fenced when its conversation view is replaced", async () => {
+  const frames = [];
+  const history = await verifiedEvents([["run.completed", {}]]);
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [{ id: "msg_user_frame_fence", role: "user", content: "Old view", runId: RUN_ID }],
+  });
+  const browser = harness({
+    requestAnimationFrame(callback) { frames.push(callback); },
+    agent: {
+      ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { thread }; },
+      async runStatus() { return { run: terminalRun("completed", history) }; },
+      async *streamRunEvents() {
+        for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+  });
+  const scroll = browser.document.getElementById("chat-scroll");
+  scroll.scrollHeight = 1_200;
+  scroll.clientHeight = 300;
+  await browser.app.initialize();
+  assert.ok(frames.length > 0);
+  browser.document.getElementById("new-thread").dispatch("click");
+  for (const frame of frames.splice(0)) frame();
+  assert.equal(scroll.scrollCalls.length, 0, "frames owned by the replaced view cannot scroll the new conversation");
+  assert.equal(browser.document.getElementById("messages").children.length, 0);
 });
 
 test("a new Agent send clears completed activity before dispatch confirmation", async () => {
@@ -6966,6 +7115,7 @@ test("bounded native stream rotations keep reconnecting until AgInTi is terminal
   const browser = harness({
     agent,
     maxStreamBackoffSteps: 2,
+    maxAutomaticAgentReconnects: 7,
     wait: async (milliseconds) => { waits.push(milliseconds); },
   });
   await browser.app.initialize();
@@ -7007,6 +7157,125 @@ test("retryable outage recovers through status probe and cursor replay without s
   assert.equal(starts, 1);
   assert.equal(resumes, 0);
   assert.match(browser.document.getElementById("messages").textContent, /Recovered/u);
+});
+
+test("Agent reconnect exhausts a finite automatic budget then continues the same run and cursor read-only", async () => {
+  const first = await verifiedEvent({
+    seq: 1,
+    type: "output.delta",
+    payload: { text: "Only once" },
+    previousHash: ZERO_HASH,
+  });
+  const terminal = await verifiedEvent({
+    seq: 2,
+    type: "run.completed",
+    payload: {},
+    previousHash: first.hash,
+  });
+  const streamCursors = [];
+  const waits = [];
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Reconnect exactly" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async resumeRun() { resumes += 1; throw new Error("a stream reconnect must never resume a run"); },
+    async runStatus() { statuses += 1; return { run: run() }; },
+    async *streamRunEvents(options) {
+      streams += 1;
+      streamCursors.push(options.cursor);
+      if (streams === 1) yield { event: first, cursor: { seq: first.seq, hash: first.hash } };
+      if (streams === 3) yield { event: terminal, cursor: { seq: terminal.seq, hash: terminal.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    maxAutomaticAgentReconnects: 1,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Reconnect this exact run";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  const reconnect = browser.document.getElementById("resume-run");
+  assert.equal(streams, 2, "one initial stream plus one automatic reconnect exhausts the finite budget");
+  assert.equal(statuses, 2, "each nonterminal boundary is authoritatively status-probed");
+  assert.deepEqual(waits, [250]);
+  assert.equal(reconnect.hidden, false);
+  assert.equal(reconnect.textContent, "Reconnect");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Interrupted");
+  assert.deepEqual(streamCursors.map((cursor) => cursor.seq), [0, 1]);
+
+  await browser.app.resume();
+
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0, "Reconnect is a read-only same-run operation, never runs/resume");
+  assert.equal(statuses, 3, "the explicit reconnect probes the exact run before opening its stream");
+  assert.equal(streams, 3);
+  assert.deepEqual(streamCursors.map((cursor) => cursor.seq), [0, 1, 1]);
+  assert.equal(
+    browser.document.getElementById("messages").textContent.split("Only once").length - 1,
+    1,
+    "cursor continuation does not duplicate already-rendered output",
+  );
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(reconnect.hidden, true);
+  assert.equal(reconnect.textContent, "Resume");
+});
+
+test("an authentication reset rejects an in-flight stale Agent reconnect descriptor", async () => {
+  const first = await verifiedEvent({
+    seq: 1,
+    type: "output.delta",
+    payload: { text: "Before sign-out" },
+    previousHash: ZERO_HASH,
+  });
+  const reconnectProbe = Promise.withResolvers();
+  const reconnectProbeStarted = Promise.withResolvers();
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Stale reconnect" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async resumeRun() { resumes += 1; throw new Error("stale reconnect must never mutate"); },
+    async runStatus() {
+      statuses += 1;
+      if (statuses === 2) {
+        reconnectProbeStarted.resolve();
+        return await reconnectProbe.promise;
+      }
+      return { run: run() };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 1) yield { event: first, cursor: { seq: first.seq, hash: first.hash } };
+    },
+  };
+  const browser = harness({ agent, maxAutomaticAgentReconnects: 0 });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Fence this reconnect";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("resume-run").textContent, "Reconnect");
+
+  const reconnecting = browser.app.resume();
+  await reconnectProbeStarted.promise;
+  await browser.app.logout();
+  reconnectProbe.resolve({ run: run() });
+  await reconnecting;
+
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0);
+  assert.equal(statuses, 2);
+  assert.equal(streams, 1, "the descriptor cannot open a stream after its session/view ownership is reset");
+  assert.equal(browser.document.getElementById("login-view").hidden, false);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.equal(browser.document.getElementById("resume-run").textContent, "Resume");
 });
 
 test("login errors distinguish credentials from busy/unavailable without leaking details", async () => {

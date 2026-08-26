@@ -529,7 +529,9 @@ ${modulePreloads}
           <p id="welcome-copy">Agent mode appears only after AgInTi proves its exact capability contract.</p>
         </section>
         <section id="messages" class="messages" aria-live="polite" aria-relevant="additions text"></section>
+        <div id="chat-bottom" class="chat-bottom" aria-hidden="true"></div>
       </div>
+      <button id="go-to-bottom" class="go-to-bottom" type="button" aria-label="Go to newest message" title="Go to newest message" hidden>↓</button>
 
       <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity" hidden>
         <details id="activity-disclosure" class="activity-disclosure">
@@ -669,7 +671,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 #offline-banner { grid-area: offline; }
 .context-indicator { grid-area: context; }
 .update-notice { position: fixed; z-index: 10; top: max(.4rem, env(safe-area-inset-top)); left: 50%; width: min(calc(100% - 1rem), 620px); margin: 0; transform: translateX(-50%); box-shadow: var(--shadow); }
-.chat-scroll { grid-area: chat; min-height: 0; overflow-y: auto; padding: clamp(1rem, 4vw, 3rem) max(1rem, calc((100% - 850px) / 2)); }
+.chat-scroll { grid-area: chat; min-height: 0; overflow-y: auto; scroll-padding-block-end: 4rem; padding: clamp(1rem, 4vw, 3rem) max(1rem, calc((100% - 850px) / 2)); }
+.chat-bottom { width: 100%; height: 3.75rem; }
+.go-to-bottom { grid-area: chat; z-index: 3; align-self: end; justify-self: end; width: 46px; min-width: 46px; height: 46px; min-height: 46px; margin: .75rem max(1rem, env(safe-area-inset-right)); padding: 0; border-radius: 999px; background: var(--surface); color: var(--accent-strong); box-shadow: var(--shadow); touch-action: manipulation; }
 .welcome { margin: 11vh auto 2rem; max-width: 680px; text-align: center; }
 .welcome p:last-child { color: var(--muted); }
 .messages { display: grid; gap: 1.2rem; }

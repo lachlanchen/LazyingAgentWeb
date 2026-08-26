@@ -498,7 +498,7 @@ ${modulePreloads}
     <section id="workspace" class="workspace" data-mode="chat" data-status="idle">
       <header class="topbar">
         <button id="open-sidebar" class="icon-button" type="button" aria-label="Open conversations">☰</button>
-        <div>
+        <div class="conversation-meta">
           <strong id="conversation-title">New conversation</strong>
           <span id="connection-state" class="connection-state" role="status">Connecting</span>
         </div>
@@ -513,6 +513,10 @@ ${modulePreloads}
             <option value="system">System</option>
           </select>
         </label>
+        <details class="topbar-info">
+          <summary aria-label="Show app and capability information">Info</summary>
+          <p id="capability-note" class="capability-note">Chat · LocalLLM text only · no tools, file creation, or web search.</p>
+        </details>
       </header>
 
       <div id="offline-banner" class="notice" role="status" hidden>You are offline. Messages stay in the composer until the connection returns.</div>
@@ -569,7 +573,6 @@ ${modulePreloads}
           <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
         </div>
       </form>
-      <p id="capability-note" class="footer-note">Chat · LocalLLM text only · no tools, file creation, or web search.</p>
     </section>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
@@ -631,8 +634,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .login-card input { min-height: 46px; padding: .7rem .8rem; }
 .remember { display: flex; align-items: center; gap: .55rem; color: var(--muted); }
 .remember input { width: 1.05rem; height: 1.05rem; }
-.muted, .privacy-note, .footer-note { color: var(--muted); }
-.privacy-note, .footer-note { font-size: .82rem; }
+.muted, .privacy-note, .capability-note { color: var(--muted); }
+.privacy-note, .capability-note { font-size: .82rem; }
 .form-error { margin: 0; color: var(--danger); }
 .eyebrow { margin: 0; color: var(--accent); font-size: .78rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
 .app-view { height: 100vh; height: 100dvh; min-height: 0; display: grid; overflow: hidden; grid-template-columns: 280px minmax(0, 1fr); }
@@ -646,15 +649,22 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .thread-delete { width: 100%; min-width: 4.5rem; min-height: 44px; padding-inline: .65rem; color: var(--danger); text-align: center !important; }
 .thread-delete:hover:not(:disabled) { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
 .sidebar footer { flex: 0 0 auto; display: grid; gap: .5rem; }
-.workspace { min-width: 0; min-height: 0; height: 100%; grid-column: 2; display: grid; overflow: hidden; grid-template-areas: "topbar" "offline" "context" "chat" "activity" "composer" "footer"; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto auto; grid-template-columns: minmax(0, 1fr); }
-.topbar { grid-area: topbar; min-height: 66px; display: flex; align-items: center; gap: .8rem; padding: .7rem 1rem; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(16px); }
-.topbar > div:nth-child(2) { display: grid; min-width: 0; margin-right: auto; }
-.connection-state { color: var(--muted); font-size: .78rem; }
-.mode-switch { display: flex; padding: .2rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
-.mode-switch button { border: 0; padding: .45rem .75rem; background: transparent; }
+.workspace { min-width: 0; min-height: 0; height: 100%; grid-column: 2; display: grid; overflow: hidden; grid-template-areas: "topbar" "offline" "context" "chat" "activity" "composer"; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; grid-template-columns: minmax(0, 1fr); }
+.topbar { grid-area: topbar; min-width: 0; min-height: 56px; display: flex; flex-wrap: nowrap; align-items: center; gap: .65rem; padding: max(.3rem, env(safe-area-inset-top)) .75rem .3rem; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(16px); white-space: nowrap; }
+.conversation-meta { min-width: 0; flex: 1 1 auto; display: flex; align-items: baseline; gap: .5rem; overflow: hidden; }
+#conversation-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connection-state { min-width: 0; max-width: min(12rem, 28vw); flex: 0 1 auto; overflow: hidden; color: var(--muted); font-size: .78rem; text-overflow: ellipsis; white-space: nowrap; }
+.mode-switch { display: flex; padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+.mode-switch button { min-height: 44px; border: 0; padding: .45rem .75rem; background: transparent; }
 .mode-switch button[aria-pressed="true"] { background: var(--surface); color: var(--accent-strong); box-shadow: 0 1px 5px rgb(0 0 0 / 8%); }
 .theme-label { display: flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .8rem; }
 .theme-label select { padding: .42rem; }
+.topbar-info { position: relative; flex: 0 0 auto; }
+.topbar-info > summary { min-width: 44px; min-height: 44px; display: inline-grid; place-items: center; padding: .45rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--accent-strong); cursor: pointer; font-size: .82rem; font-weight: 700; list-style: none; user-select: none; }
+.topbar-info > summary::-webkit-details-marker { display: none; }
+.topbar-info > summary::marker { content: ""; }
+.topbar-info > summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent); outline-offset: 2px; }
+.capability-note { position: absolute; z-index: 6; top: calc(100% + .4rem); right: 0; width: min(22rem, calc(100vw - 1rem)); margin: 0; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); line-height: 1.4; text-align: left; white-space: normal; }
 .notice, .context-indicator { margin: .65rem 1rem 0; padding: .65rem .8rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); color: var(--muted); }
 #offline-banner { grid-area: offline; }
 .context-indicator { grid-area: context; }
@@ -706,7 +716,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-swatch-6 { background: #427f9e; }
 .artifact-swatch-7 { background: #9b6b2f; }
 .artifact-rejected { color: var(--danger); }
-.composer { grid-area: composer; display: flex; gap: .75rem; align-items: end; padding: .8rem max(1rem, calc((100% - 850px) / 2)); border-top: 1px solid var(--line); background: var(--surface); }
+.composer { grid-area: composer; display: flex; gap: .75rem; align-items: end; padding: .8rem max(1rem, calc((100% - 850px) / 2)) max(.8rem, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--surface); }
 .composer textarea { min-height: 48px; max-height: 180px; flex: 1; resize: vertical; padding: .75rem; }
 .search-controls { display: flex; align-items: end; gap: .45rem; }
 .search-controls > button { min-height: 48px; }
@@ -737,7 +747,6 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message > .message-attachment { max-width: min(100%, 620px); margin-bottom: .65rem; }
 .message-attachment-status { padding: .35rem .5rem; border-color: transparent; background: transparent; text-align: left; }
 .composer-actions { display: flex; gap: .4rem; }
-.footer-note { grid-area: footer; margin: 0; padding: 0 max(1rem, calc((100% - 850px) / 2)) max(.6rem, env(safe-area-inset-bottom)); text-align: center; background: var(--surface); }
 .icon-button { display: none; }
 .sidebar-scrim { display: none; }
 .install-app { width: 100%; }
@@ -753,9 +762,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .icon-button { display: inline-grid; }
   #open-sidebar, #send-message { min-width: 48px; min-height: 48px; }
   .theme-label { display: none; }
-  .topbar { gap: .45rem; }
+  .topbar { gap: .35rem; padding: max(.2rem, env(safe-area-inset-top)) .5rem .2rem; }
+  .connection-state { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .mode-switch button { padding-inline: .55rem; }
-  .composer { flex-direction: column; align-items: stretch; }
+  .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .5rem; padding: .6rem .75rem max(.6rem, env(safe-area-inset-bottom)); }
+  .composer > .image-button, .composer > .image-preview, .composer > .search-controls { grid-column: 1 / -1; }
+  .composer textarea { grid-column: 1; width: 100%; }
+  .composer-actions { grid-column: 2; }
   .search-controls { align-items: stretch; }
   .search-options { flex: 1; }
   .search-options label { flex: 1; }

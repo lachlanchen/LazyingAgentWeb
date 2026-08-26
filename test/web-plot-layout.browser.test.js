@@ -182,7 +182,7 @@ const BROWSER_FIXTURE = `<!doctype html>
 <div class="app-view">
   <aside id="sidebar" class="sidebar"><header class="brand">Private conversations</header><nav id="thread-list" class="thread-list"><button class="thread-open" aria-current="true">A deliberately long Agent conversation title</button></nav></aside><button class="sidebar-scrim" hidden></button>
   <section id="workspace" class="workspace">
-    <header class="topbar">Adversarial plot layout</header><div hidden></div><div hidden></div>
+    <header class="topbar"><button id="open-sidebar" class="icon-button" type="button" aria-label="Open conversations">☰</button><div class="conversation-meta"><strong id="conversation-title">An intentionally very long adversarial Agent conversation title that must stay on one row</strong><span class="connection-state" role="status">Connected · Agent available</span></div><div class="mode-switch" role="group" aria-label="Conversation mode"><button type="button" aria-pressed="true">Agent</button><button type="button" aria-pressed="false">Chat</button></div><label class="theme-label">Theme<select><option>Bright</option></select></label><details id="topbar-info" class="topbar-info"><summary aria-label="Show app and capability information">Info</summary><p id="capability-note" class="capability-note">Agent capabilities and local storage information.</p></details></header><div hidden></div><div hidden></div>
     <div class="chat-scroll"><section class="messages"><article class="message" data-role="assistant">
       <p>Completed bounded analysis.</p><section class="message-artifacts">
         <article class="artifact"><h3>Long categorical labels</h3><div id="categorical"></div></article>
@@ -192,7 +192,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Compiled paper</h3><div id="file-artifact"></div></article>
       </section>
     </article></section></div>
-    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><button id="run-agent">Run</button></form><p id="footer-note" class="footer-note">Agent footer</p>
+    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><div class="composer-actions"><button id="run-agent">Run</button></div></form>
   </section>
 </div>
 <script type="module">
@@ -273,11 +273,21 @@ const GEOMETRY_EXPRESSION = `(() => {
   const wideLabels = [...categoricalTarget.querySelectorAll('.plot-label-wide')];
   const compactLabels = [...categoricalTarget.querySelectorAll('.plot-label-compact')];
   const workspace = rectangle(document.querySelector('#workspace'));
+  const topbarNode = document.querySelector('.topbar');
+  const topbar = rectangle(topbarNode);
+  const topbarChildren = [...topbarNode.children].filter(visible);
+  const conversationTitle = document.querySelector('#conversation-title');
+  const topbarInfo = document.querySelector('#topbar-info');
+  const topbarInfoDefaultOpen = topbarInfo.open;
+  const topbarBeforeInfo = rectangle(topbarNode);
+  topbarInfo.open = true;
+  const infoNote = rectangle(document.querySelector('#capability-note'));
+  const topbarWithInfo = rectangle(topbarNode);
+  topbarInfo.open = false;
   const chatScroll = rectangle(document.querySelector('.chat-scroll'));
   const composer = rectangle(document.querySelector('#composer'));
   const messageInput = rectangle(document.querySelector('#message-input'));
   const runAgent = rectangle(document.querySelector('#run-agent'));
-  const footer = rectangle(document.querySelector('#footer-note'));
   const activityPanel = document.querySelector('#activity-panel');
   const activityDisclosure = document.querySelector('#activity-disclosure');
   const activityDetails = document.querySelector('#activity-details');
@@ -303,19 +313,32 @@ const GEOMETRY_EXPRESSION = `(() => {
   return {
     viewport: { width: innerWidth, height: innerHeight },
     workspace,
+    header: {
+      topbar,
+      defaultInfoOpen: topbarInfoDefaultOpen,
+      heightUnchangedWhenInfoOpens: topbarBeforeInfo.height === topbarWithInfo.height,
+      childrenInside: topbarChildren.every((node) => contains(topbar, rectangle(node))),
+      childrenShareOneRow: topbarChildren.every((node) => {
+        const child = node.getBoundingClientRect();
+        const center = (child.top + child.bottom) / 2;
+        const barCenter = (topbar.top + topbar.bottom) / 2;
+        return Math.abs(center - barCenter) <= 2;
+      }),
+      titleEllipsized: conversationTitle.scrollWidth > conversationTitle.clientWidth,
+      infoNote,
+      infoInsideViewport: infoNote.left >= -.5 && infoNote.right <= innerWidth + .5,
+    },
     shell: {
       chatScroll,
       composer,
       messageInput,
       runAgent,
-      footer,
       chatScrollInsideWorkspace: contains(workspace, chatScroll),
       composerInsideWorkspace: contains(workspace, composer),
       inputInsideComposer: contains(composer, messageInput),
       actionInsideComposer: contains(composer, runAgent),
-      footerInsideWorkspace: contains(workspace, footer),
       chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
-      composerAboveFooter: composer.bottom <= footer.top + .5,
+      composerAtWorkspaceBottom: Math.abs(composer.bottom - workspace.bottom) <= .5,
     },
     activity: {
       defaultOpen: activityDefaultOpen,
@@ -467,14 +490,21 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.equal(result.activity.chatAboveExpanded, true);
       assert.equal(result.activity.expandedAboveComposer, true);
       assert.equal(result.activity.composerInsideWorkspaceWhenExpanded, true);
+      assert.equal(result.header.defaultInfoOpen, false);
+      assert.equal(result.header.heightUnchangedWhenInfoOpens, true);
+      assert.equal(result.header.childrenInside, true);
+      assert.equal(result.header.childrenShareOneRow, true);
+      assert.equal(result.header.titleEllipsized, true);
+      assert.equal(result.header.infoInsideViewport, true);
+      assert.ok(result.header.topbar.height >= 44 && result.header.topbar.height <= 58,
+        `${label} compact topbar height ${result.header.topbar.height}`);
       for (const [check, accepted] of Object.entries({
         chatScrollInsideWorkspace: result.shell.chatScrollInsideWorkspace,
         composerInsideWorkspace: result.shell.composerInsideWorkspace,
         inputInsideComposer: result.shell.inputInsideComposer,
         actionInsideComposer: result.shell.actionInsideComposer,
-        footerInsideWorkspace: result.shell.footerInsideWorkspace,
         chatScrollAboveComposer: result.shell.chatScrollAboveComposer,
-        composerAboveFooter: result.shell.composerAboveFooter,
+        composerAtWorkspaceBottom: result.shell.composerAtWorkspaceBottom,
       })) {
         if (accepted !== true) shellFailures.push({ label, check, shell: result.shell });
       }

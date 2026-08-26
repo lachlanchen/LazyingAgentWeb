@@ -910,6 +910,8 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.doesNotMatch(html, /<details id="activity-disclosure"[^>]*\sopen(?:\s|>)/u);
   assert.match(html, /<button id="send-message"[^>]*aria-label="Send Chat"[^>]*>Send Chat<\/button>/u);
   assert.match(html, /id="capability-note"[^>]*>Chat · LocalLLM text only · no tools, file creation, or web search\.<\/p>/u);
+  assert.match(html, /<details class="topbar-info">[\s\S]*<summary aria-label="Show app and capability information">Info<\/summary>[\s\S]*id="capability-note"[\s\S]*<\/details>[\s\S]*<\/header>/u);
+  assert.doesNotMatch(html, /class="footer-note"/u);
   assert.doesNotMatch(html, /name="(?:model|provider|runtime|tools|cwd|sandbox)/iu);
   assert.doesNotMatch(html, /value="[^"\n]*(?:password|token|secret)/iu);
   assert.match(BRIGHT_APP_CSS, /^:root \{[\s\S]*--bg: #f4f7f6/u);
@@ -968,6 +970,29 @@ test("Agent activity is a collapsed in-flow disclosure that cannot overlay chat 
   assert.match(BRIGHT_APP_CSS, /@media \(max-width: 760px\) \{[\s\S]*\.activity-details \{ max-height: min\(24dvh, 14rem\); \}/u);
 });
 
+test("the compact topbar is one row with an ellipsized title and collapsed capability Info", () => {
+  const topbarRule = /\.topbar \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const metaRule = /\.conversation-meta \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const titleRule = /#conversation-title \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const infoRule = /\.topbar-info \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const summaryRule = /\.topbar-info > summary \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const noteRule = /(?:^|\n)\.capability-note \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(topbarRule && metaRule && titleRule && infoRule && summaryRule && noteRule);
+  assert.match(topbarRule[1], /min-height:\s*56px;/u);
+  assert.match(topbarRule[1], /flex-wrap:\s*nowrap;/u);
+  assert.match(topbarRule[1], /white-space:\s*nowrap;/u);
+  assert.match(metaRule[1], /min-width:\s*0;/u);
+  assert.match(metaRule[1], /overflow:\s*hidden;/u);
+  assert.match(titleRule[1], /overflow:\s*hidden;/u);
+  assert.match(titleRule[1], /text-overflow:\s*ellipsis;/u);
+  assert.match(titleRule[1], /white-space:\s*nowrap;/u);
+  assert.match(infoRule[1], /position:\s*relative;/u);
+  assert.match(summaryRule[1], /min-width:\s*44px;/u);
+  assert.match(summaryRule[1], /min-height:\s*44px;/u);
+  assert.match(noteRule[1], /position:\s*absolute;/u);
+  assert.match(noteRule[1], /white-space:\s*normal;/u);
+});
+
 test("mobile thread rows reserve non-overlapping title and full Delete control rectangles", () => {
   const rowRule = /\.thread-row \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
   const openRule = /\.thread-open \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
@@ -1020,7 +1045,7 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   );
   assert.match(
     BRIGHT_APP_CSS,
-    /\.workspace \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;[^}]*grid-template-areas: "topbar" "offline" "context" "chat" "activity" "composer" "footer";[^}]*grid-template-rows: auto auto auto minmax\(0, 1fr\) auto auto auto;[^}]*grid-template-columns: minmax\(0, 1fr\);/u,
+    /\.workspace \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;[^}]*grid-template-areas: "topbar" "offline" "context" "chat" "activity" "composer";[^}]*grid-template-rows: auto auto auto minmax\(0, 1fr\) auto auto;[^}]*grid-template-columns: minmax\(0, 1fr\);/u,
   );
   for (const [selector, area] of [
     [".topbar", "topbar"],
@@ -1029,17 +1054,17 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     [".chat-scroll", "chat"],
     [".activity-panel", "activity"],
     [".composer", "composer"],
-    [".footer-note", "footer"],
   ]) {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
     assert.match(BRIGHT_APP_CSS, new RegExp(`${escaped} \\{[^}]*grid-area: ${area};`, "u"));
   }
   assert.match(BRIGHT_APP_CSS, /\.chat-scroll \{[^}]*min-height: 0;[^}]*overflow-y: auto;/u);
-  assert.match(BRIGHT_APP_CSS, /\.footer-note \{[^}]*padding:[^;}]*max\(\.6rem, env\(safe-area-inset-bottom\)\);/u);
+  assert.match(BRIGHT_APP_CSS, /\.composer \{[^}]*padding:[^;}]*max\(\.8rem, env\(safe-area-inset-bottom\)\);/u);
   assert.match(
     BRIGHT_APP_CSS,
-    /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*flex-direction: column;[^}]*align-items: stretch;/u,
+    /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) auto;[^}]*padding:[^;}]*max\(\.6rem, env\(safe-area-inset-bottom\)\);/u,
   );
+  assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
 });
 
 test("mobile sidebar and send controls expose comfortable touch targets", () => {
@@ -1052,6 +1077,8 @@ test("mobile sidebar and send controls expose comfortable touch targets", () => 
   assert.ok(touchTargetRule);
   assert.match(touchTargetRule[1], /min-width:\s*48px;/u);
   assert.match(touchTargetRule[1], /min-height:\s*48px;/u);
+  assert.match(BRIGHT_APP_CSS, /\.topbar-info > summary \{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px;/u);
+  assert.match(BRIGHT_APP_CSS, /\.mode-switch button \{[^}]*min-height:\s*44px;/u);
 });
 
 test("Agent plots keep the workspace track and use readable desktop and iPhone geometry", () => {

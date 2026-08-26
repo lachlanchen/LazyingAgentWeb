@@ -90,6 +90,7 @@ function exactLimitOverrides(input = {}) {
     bodyTimeoutMs: [50, 15_000],
     visionBodyTimeoutMs: [1_000, 300_000],
     dependencyTimeoutMs: [50, 120_000],
+    jobAdmissionTimeoutMs: [50, 600_000],
     jobTimeoutMs: [50, 600_000],
     visionJobTimeoutMs: [50, 900_000],
     sseLifetimeMs: [100, 120_000],
@@ -1244,19 +1245,23 @@ export function createCloudRequestHandler({
     if (jobs.has(jobKey)) return true;
     if (stopping || !directChatConnector || jobs.size >= limits.directChatJobs) return false;
     const scheduled = chat.getGeneration({ accountId, threadId, generationId });
-    const jobTimeoutMs = scheduled?.modelAlias === visionModelAlias
+    const executionTimeoutMs = scheduled?.modelAlias === visionModelAlias
       ? limits.visionJobTimeoutMs
       : limits.jobTimeoutMs;
     const controller = new AbortController();
-    const job = { controller, timedOut: false, promise: null, lease: null };
+    const job = { controller, timedOut: false, promise: null, lease: null, timer: null };
     jobs.set(jobKey, job);
-    const timer = setTimeout(() => {
-      job.timedOut = true;
-      const error = new Error('direct chat generation timed out');
-      error.name = 'TimeoutError';
-      controller.abort(error);
-    }, jobTimeoutMs);
-    timer.unref?.();
+    const armJobTimeout = (milliseconds, phase) => {
+      clearTimeout(job.timer);
+      job.timer = setTimeout(() => {
+        job.timedOut = true;
+        const error = new Error(`direct chat generation ${phase} timed out`);
+        error.name = 'TimeoutError';
+        controller.abort(error);
+      }, milliseconds);
+      job.timer.unref?.();
+    };
+    armJobTimeout(limits.jobAdmissionTimeoutMs, 'admission');
     job.promise = (async () => {
       try {
         const thread = chat.getThread(accountId, threadId);
@@ -1338,7 +1343,10 @@ export function createCloudRequestHandler({
             ownerToken,
             fence: lease.fence
           });
-          if (marker.dispatchAuthorized === true) break;
+          if (marker.dispatchAuthorized === true) {
+            armJobTimeout(executionTimeoutMs, 'execution');
+            break;
+          }
           if (marker.dispatchState !== 'global_busy') {
             const error = new Error('inference dispatch is already ambiguous');
             error.failureCode = 'provider_unavailable';
@@ -1431,7 +1439,7 @@ export function createCloudRequestHandler({
           // Another request may have cancelled or completed the same durable generation.
         }
       } finally {
-        clearTimeout(timer);
+        clearTimeout(job.timer);
         if (job.renewTimer) clearInterval(job.renewTimer);
         if (job.lease) {
           try {

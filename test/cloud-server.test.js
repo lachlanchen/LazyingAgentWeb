@@ -462,6 +462,9 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   assert.equal(immutable.headers.get('cache-control'), 'public, max-age=31536000, immutable');
   const manifest = await fetch(`${baseUrl}/manifest.webmanifest?v=${RELEASE_ID}`, { headers: publicBoundary(baseUrl) });
   assert.equal(manifest.headers.get('cache-control'), 'no-store');
+  assert.equal(CLOUD_HTTP_LIMITS.jobAdmissionTimeoutMs, 120_000);
+  assert.equal(CLOUD_HTTP_LIMITS.jobTimeoutMs, 600_000);
+  assert.equal(CLOUD_HTTP_LIMITS.visionJobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.directChatJobs, 1);
 });
 
@@ -2441,7 +2444,7 @@ test('fences overlapping cloud dispatchers and resolves an ambiguous zero-delta 
   assert.equal(secondDispatches, 0);
 });
 
-test('queues a different generation across BFF processes until global inference capacity is free', async (t) => {
+test('gives a globally queued generation a fresh execution deadline after admission', async (t) => {
   let releaseFirst;
   const firstMayFinish = new Promise((resolve) => { releaseFirst = resolve; });
   let firstDispatches = 0;
@@ -2458,12 +2461,18 @@ test('queues a different generation across BFF processes until global inference 
   const secondConnector = {
     async generate() {
       secondDispatches += 1;
-      return (async function* () { yield 'second result'; })();
+      return (async function* () {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        yield 'second result';
+      })();
     }
   };
   const state = testState(t, { connector: firstConnector });
   const first = await state.start();
-  const second = await state.start({ directChatConnector: secondConnector });
+  const second = await state.start({
+    directChatConnector: secondConnector,
+    limits: { jobAdmissionTimeoutMs: 1_000, jobTimeoutMs: 600 }
+  });
   const auth = await login(first.baseUrl);
   for (const [baseUrl, threadId] of [
     [first.baseUrl, 'chat-global-first'],
@@ -2542,7 +2551,7 @@ test('fails a globally queued generation truthfully if its admission deadline ex
   // Keep the admission owner alive well beyond the assertion window. A busy
   // CI runner must not make this fixture release the global slot before the
   // deliberately short second deadline is observed.
-  const first = await state.start({ limits: { jobTimeoutMs: 10_000 } });
+  const first = await state.start({ limits: { jobAdmissionTimeoutMs: 10_000 } });
   const second = await state.start({
     directChatConnector: {
       async generate() {
@@ -2550,7 +2559,7 @@ test('fails a globally queued generation truthfully if its admission deadline ex
         return (async function* () { yield 'must not run'; })();
       }
     },
-    limits: { jobTimeoutMs: 50 }
+    limits: { jobAdmissionTimeoutMs: 50 }
   });
   const auth = await login(first.baseUrl);
   const startThread = async (baseUrl, suffix) => {

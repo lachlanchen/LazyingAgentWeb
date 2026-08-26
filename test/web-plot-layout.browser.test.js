@@ -180,7 +180,7 @@ const BROWSER_FIXTURE = `<!doctype html>
 <meta name="lazying-agent-release" content="release-${"f".repeat(64)}">
 <style>${BRIGHT_APP_CSS}</style></head><body>
 <div class="app-view">
-  <aside id="sidebar" class="sidebar">Private conversations</aside><button class="sidebar-scrim" hidden></button>
+  <aside id="sidebar" class="sidebar"><header class="brand">Private conversations</header><nav id="thread-list" class="thread-list"><button class="thread-open" aria-current="true">A deliberately long Agent conversation title</button></nav></aside><button class="sidebar-scrim" hidden></button>
   <section id="workspace" class="workspace">
     <header class="topbar">Adversarial plot layout</header><div hidden></div><div hidden></div>
     <div class="chat-scroll"><section class="messages"><article class="message" data-role="assistant">
@@ -296,6 +296,7 @@ const GEOMETRY_EXPRESSION = `(() => {
   const fileTargetRect = rectangle(fileTarget);
   const fileControlsRect = rectangle(fileControls);
   const sidebar = document.querySelector('#sidebar');
+  const agentThreadOpenHeight = document.querySelector('#thread-list > .thread-open').getBoundingClientRect().height;
   sidebar.hidden = true;
   const maskedWorkspace = rectangle(document.querySelector('#workspace'));
   sidebar.hidden = false;
@@ -339,6 +340,7 @@ const GEOMETRY_EXPRESSION = `(() => {
       minimumActionHeight: Math.min(...fileActions.map((node) => node.getBoundingClientRect().height)),
       hrefs: fileActions.map((node) => node.href),
     },
+    agentThreadOpenHeight,
     maskPreserved: workspace.left === maskedWorkspace.left && workspace.width === maskedWorkspace.width,
     pageOverflow: document.documentElement.scrollWidth > innerWidth,
     categorical: chart(categoricalTarget),
@@ -451,6 +453,7 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.equal(result.file.actionsInsideControls, true);
       assert.equal(result.file.actionsOverlap, false);
       assert.ok(result.file.minimumActionHeight >= 44);
+      assert.ok(result.agentThreadOpenHeight >= 44);
       assert.deepEqual(result.file.hrefs, [
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}&download=1`,

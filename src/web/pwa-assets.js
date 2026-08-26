@@ -642,7 +642,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .thread-list { min-height: 0; flex: 1 1 0; display: grid; align-content: start; gap: .35rem; overflow-y: auto; overscroll-behavior: contain; }
 .thread-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(4.5rem, max-content); gap: .3rem; align-items: stretch; }
 .thread-list button { min-width: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
-.thread-open { width: 100%; }
+.thread-open { width: 100%; min-height: 44px; }
 .thread-delete { width: 100%; min-width: 4.5rem; min-height: 44px; padding-inline: .65rem; color: var(--danger); text-align: center !important; }
 .thread-delete:hover:not(:disabled) { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
 .sidebar footer { flex: 0 0 auto; display: grid; gap: .5rem; }

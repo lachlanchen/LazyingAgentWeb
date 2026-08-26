@@ -970,8 +970,10 @@ test("Agent activity is a collapsed in-flow disclosure that cannot overlay chat 
 
 test("mobile thread rows reserve non-overlapping title and full Delete control rectangles", () => {
   const rowRule = /\.thread-row \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const openRule = /\.thread-open \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
   const deleteRule = /\.thread-delete \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
   assert.ok(rowRule);
+  assert.ok(openRule);
   assert.ok(deleteRule);
   assert.match(rowRule[1], /display:\s*grid;/u);
   assert.match(
@@ -981,7 +983,10 @@ test("mobile thread rows reserve non-overlapping title and full Delete control r
   assert.match(deleteRule[1], /width:\s*100%;/u);
   assert.match(deleteRule[1], /min-width:\s*4\.5rem;/u);
   assert.match(deleteRule[1], /min-height:\s*44px;/u);
+  assert.match(openRule[1], /width:\s*100%;/u);
+  assert.match(openRule[1], /min-height:\s*44px;/u);
   assert.doesNotMatch(rowRule[1], /position:\s*(?:absolute|fixed)/u);
+  assert.doesNotMatch(openRule[1], /position:\s*(?:absolute|fixed)/u);
   assert.doesNotMatch(deleteRule[1], /position:\s*(?:absolute|fixed)/u);
 });
 

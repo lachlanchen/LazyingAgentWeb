@@ -648,6 +648,55 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.match(malformed.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
 });
 
+test("a new Agent send clears completed activity before dispatch confirmation", async () => {
+  const terminal = await verifiedEvent({
+    seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH,
+  });
+  const accepted = Promise.withResolvers();
+  const observed = Promise.withResolvers();
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() {
+      observed.resolve();
+      return await accepted.promise;
+    },
+    async *streamRunEvents() {
+      yield { event: terminal, cursor: { seq: terminal.seq, hash: terminal.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  const plan = browser.document.getElementById("agent-plan");
+  const timeline = browser.document.getElementById("agent-timeline");
+  const artifacts = browser.document.getElementById("agent-artifacts");
+  for (const [target, text] of [[plan, "Old completed plan"], [timeline, "Old completed tool"]]) {
+    const item = browser.document.createElement("li");
+    item.textContent = text;
+    target.appendChild(item);
+  }
+  const oldArtifact = browser.document.createElement("section");
+  oldArtifact.textContent = "Old completed artifact";
+  artifacts.appendChild(oldArtifact);
+  artifacts.hidden = false;
+  browser.document.getElementById("run-state").textContent = "Completed";
+  browser.document.getElementById("workspace").dataset.status = "completed";
+  browser.document.getElementById("message-input").value = "Start a clean current activity view";
+
+  const sending = browser.app.submitMessage({ preventDefault() {} });
+  await observed.promise;
+  assert.equal(plan.children.length, 0);
+  assert.equal(timeline.children.length, 0);
+  assert.equal(artifacts.children.length, 0);
+  assert.equal(artifacts.hidden, true);
+  assert.equal(browser.document.getElementById("run-state").textContent, "Starting");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "running");
+
+  accepted.resolve({ run: run() });
+  await sending;
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+});
+
 test("negotiated Agent Search binds one immutable selection to one start mutation", async () => {
   const completed = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
   const accepted = Promise.withResolvers();

@@ -2032,6 +2032,17 @@ export function createBrowserApp({
     state.agentCancelPending = false;
   }
 
+  function beginAgentSubmissionActivity() {
+    elements.agent_plan.replaceChildren();
+    elements.agent_timeline.replaceChildren();
+    elements.agent_artifacts.replaceChildren();
+    elements.agent_artifacts.hidden = true;
+    elements.run_state.textContent = "Starting";
+    elements.workspace.dataset.status = "running";
+    elements.stop_run.hidden = true;
+    elements.resume_run.hidden = true;
+  }
+
   function fenceAttachmentRestorationsForSend() {
     state.imageRenderEpoch += 1;
     resetAttachmentRestorations({ deferQueued: true });
@@ -4268,6 +4279,7 @@ export function createBrowserApp({
     elements.message_input.value = "";
     state.busy = true;
     elements.send_message.disabled = true;
+    if (submissionMode === "agent") beginAgentSubmissionActivity();
     updateImageControl();
     try {
       if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text, agentSearch);
@@ -4348,6 +4360,8 @@ export function createBrowserApp({
       } else {
         if (state.mode === "agent") {
           if (elements.message_input.value === "") elements.message_input.value = draft;
+          elements.run_state.textContent = "Interrupted";
+          elements.workspace.dataset.status = "failed";
           if (state.agentThreadId !== null) {
             // Until a fresh authoritative read succeeds, the dispatch may have
             // reached AgInTi even though its response was unusable. Reuse the

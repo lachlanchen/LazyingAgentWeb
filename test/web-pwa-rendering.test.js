@@ -1295,6 +1295,232 @@ test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and 
   assert.equal(agentDeleteCalls, 0, "Direct Chat deletion never calls the Agent client");
 });
 
+function completedDeletionRaceFixture() {
+  const now = "2026-08-26T18:00:00.000Z";
+  const threadId = "chat_delete_completed_race_xxxxxxx";
+  const generationId = "generation_delete_completed_race_x";
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
+  const stale = Object.freeze({
+    threadId,
+    title: "Completed image answer",
+    modelAlias: "local-default",
+    revision: 0,
+    ledgerHash: null,
+    messageCount: 0,
+    ledgerBytes: 0,
+    currentGenerationId: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const completed = Object.freeze({
+    ...stale,
+    revision: 2,
+    ledgerHash: hashB,
+    messageCount: 2,
+    ledgerBytes: 35,
+  });
+  const sibling = Object.freeze({
+    ...stale,
+    threadId: "chat_delete_sibling_xxxxxxxxxxxxx",
+    title: "Keep this conversation",
+  });
+  const messages = Object.freeze([
+    Object.freeze({
+      threadId,
+      messageId: "message_delete_race_user_xxxxxxxx",
+      revision: 1,
+      role: "user",
+      content: "Describe both images",
+      contentBytes: 20,
+      previousHash: null,
+      messageHash: hashA,
+      generationId: null,
+      createdAt: now,
+    }),
+    Object.freeze({
+      threadId,
+      messageId: "message_delete_race_answer_xxxxxx",
+      revision: 2,
+      role: "assistant",
+      content: "Both are visible",
+      contentBytes: 15,
+      previousHash: hashA,
+      messageHash: hashB,
+      generationId,
+      createdAt: now,
+    }),
+  ]);
+  const generation = Object.freeze({
+    threadId,
+    generationId,
+    status: "completed",
+    terminal: true,
+    finalRevision: completed.revision,
+    finalHash: completed.ledgerHash,
+  });
+  let created = false;
+  let authoritative = stale;
+  let listCalls = 0;
+  let retryDeleteCalls = 0;
+  const exactThreadReads = [];
+  const preparedTickets = [];
+  const deleteTickets = [];
+  const chat = {
+    async capabilities() { return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 }; },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId, title, idempotencyKey: "thread_create_delete_race_0001" });
+    },
+    async createThread(ticket) {
+      created = true;
+      authoritative = stale;
+      return { request: ticket, thread: stale };
+    },
+    async retryCreateThread() { throw new Error("unexpected create retry"); },
+    async listThreads() {
+      listCalls += 1;
+      return { threads: created ? [stale, sibling] : [] };
+    },
+    async getThread(requestedThreadId) {
+      exactThreadReads.push(requestedThreadId);
+      assert.equal(requestedThreadId, threadId, "refresh stays bound to the completed conversation");
+      return { thread: authoritative };
+    },
+    async listMessages({ threadId: requestedThreadId, afterRevision, limit }) {
+      assert.equal(requestedThreadId, threadId);
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment() { throw new Error("unexpected attachment read"); },
+    prepareThreadDeletion(value) {
+      const ticket = Object.freeze({
+        ...value,
+        idempotencyKey: `thread_delete_completed_race_${preparedTickets.length + 1}`,
+      });
+      preparedTickets.push(ticket);
+      return ticket;
+    },
+    async deleteThread(ticket) {
+      deleteTickets.push(ticket);
+      if (ticket.threadId !== threadId
+          || ticket.expectedRevision !== authoritative.revision
+          || ticket.expectedHash !== authoritative.ledgerHash
+          || authoritative.currentGenerationId !== null) {
+        throw new DirectChatTransportError("stale or active deletion cursor", {
+          status: 409,
+          retryable: false,
+        });
+      }
+      return { deleted: true, threadId, request: ticket };
+    },
+    async retryDeleteThread() {
+      retryDeleteCalls += 1;
+      throw new Error("an authoritative 409 must not retry the stale ticket");
+    },
+    prepareRun(value) {
+      return Object.freeze({
+        ...value,
+        generationId,
+        idempotencyKey: "run_start_delete_race_0001",
+      });
+    },
+    async startRun(ticket) {
+      authoritative = completed;
+      return { request: ticket, generation };
+    },
+    async retryRun() { throw new Error("unexpected run retry"); },
+    async getRunStatus() { return { generation }; },
+    async *streamRunEvents() {},
+    prepareCancellation() { throw new Error("unexpected cancellation"); },
+    async cancelRun() { throw new Error("unexpected cancellation"); },
+  };
+  return {
+    chat,
+    completed,
+    sibling,
+    threadId,
+    preparedTickets,
+    deleteTickets,
+    exactThreadReads,
+    get listCalls() { return listCalls; },
+    get retryDeleteCalls() { return retryDeleteCalls; },
+    setAuthoritative(thread) { authoritative = Object.freeze(thread); },
+  };
+}
+
+async function finishDeletionRaceConversation(fixture) {
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent: idleAuthenticatedPwaClients().agent,
+    chat: fixture.chat,
+    wait: async () => {},
+    confirmThreadDeletion: () => true,
+  });
+  await harness.app.initialize();
+  harness.document.getElementById("message-input").value = "Describe both images";
+  await harness.app.submitMessage({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(harness.document.getElementById("messages").textContent, /Both are visible/u);
+  return harness;
+}
+
+test("post-completion deletion refreshes one stale sidebar cursor and deletes only its bound thread", async () => {
+  const fixture = completedDeletionRaceFixture();
+  const harness = await finishDeletionRaceConversation(fixture);
+  const listCallsBeforeDeletion = fixture.listCalls;
+  const readsBeforeDeletion = fixture.exactThreadReads.length;
+
+  assert.equal(await harness.app.deleteChatThread(fixture.threadId), true);
+  assert.equal(fixture.preparedTickets.length, 2, "the rejected stale cursor is replaced exactly once");
+  assert.deepEqual(fixture.preparedTickets.map((ticket) => [ticket.threadId, ticket.expectedRevision, ticket.expectedHash]), [
+    [fixture.threadId, 0, null],
+    [fixture.threadId, fixture.completed.revision, fixture.completed.ledgerHash],
+  ]);
+  assert.equal(fixture.deleteTickets.length, 2);
+  assert.equal(fixture.retryDeleteCalls, 0, "the stale idempotency ticket is never replayed with a changed body");
+  assert.equal(fixture.listCalls, listCallsBeforeDeletion, "cursor repair uses one exact thread read, not a broad list read");
+  assert.deepEqual(fixture.exactThreadReads.slice(readsBeforeDeletion), [fixture.threadId]);
+  const rows = harness.document.getElementById("thread-list").children;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].dataset.threadId, fixture.sibling.threadId, "the unrelated conversation remains visible");
+  assert.equal(harness.document.getElementById("messages").children.length, 0);
+  assert.match(harness.document.getElementById("toast").textContent, /Conversation deleted/u);
+});
+
+test("post-completion deletion never rebases onto newly active work", async () => {
+  const fixture = completedDeletionRaceFixture();
+  const harness = await finishDeletionRaceConversation(fixture);
+  const active = Object.freeze({
+    ...fixture.completed,
+    revision: 3,
+    ledgerHash: "c".repeat(64),
+    messageCount: 3,
+    currentGenerationId: "generation_delete_new_work_xxxxxxx",
+  });
+  fixture.setAuthoritative(active);
+  const readsBeforeDeletion = fixture.exactThreadReads.length;
+
+  assert.equal(await harness.app.deleteChatThread(fixture.threadId), false);
+  assert.equal(fixture.preparedTickets.length, 1, "active work cannot mint a replacement deletion ticket");
+  assert.equal(fixture.deleteTickets.length, 1);
+  assert.equal(fixture.retryDeleteCalls, 0);
+  assert.deepEqual(fixture.exactThreadReads.slice(readsBeforeDeletion), [fixture.threadId]);
+  const rows = harness.document.getElementById("thread-list").children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].dataset.threadId, fixture.threadId);
+  assert.equal(rows[0].children[1].disabled, true, "the refreshed active conversation cannot be deleted");
+  assert.equal(rows[1].dataset.threadId, fixture.sibling.threadId);
+  assert.match(harness.document.getElementById("messages").textContent, /Both are visible/u,
+    "a rejected deletion never hides the rendered conversation");
+  assert.match(harness.document.getElementById("toast").textContent, /changed or still has unresolved work/u);
+});
+
 test("ambiguous deletion retains one exact ticket through malformed and lost responses", async () => {
   const now = "2026-08-24T10:00:00.000Z";
   const thread = {

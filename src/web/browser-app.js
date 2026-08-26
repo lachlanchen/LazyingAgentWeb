@@ -3318,6 +3318,55 @@ export function createBrowserApp({
       && error.status !== 404;
   }
 
+  function replaceListedChatThread(authoritative) {
+    const index = state.chatThreads.findIndex((thread) => thread.threadId === authoritative.threadId);
+    if (index < 0) return false;
+    state.chatThreadListEpoch += 1;
+    state.chatThreads = state.chatThreads.map((thread, candidate) => (
+      candidate === index ? authoritative : thread
+    ));
+    return true;
+  }
+
+  async function refreshCompletedThreadDeletion(pending) {
+    if (state.chatPendingDeletion !== pending || !currentThreadDeletion(pending)
+        || state.chatPendingSend !== null || state.chatFinalization !== null) return null;
+    const rendered = state.chatThread;
+    const generation = state.chatGeneration;
+    if (state.chatThreadId !== pending.threadId || rendered?.threadId !== pending.threadId
+        || rendered.currentGenerationId !== null
+        || generation?.threadId !== pending.threadId || generation.status !== "completed"
+        || generation.terminal !== true || generation.finalRevision !== rendered.revision
+        || generation.finalHash !== rendered.ledgerHash) return null;
+
+    const { thread: authoritative } = await pending.chat.getThread(pending.threadId);
+    if (state.chatPendingDeletion !== pending || !currentThreadDeletion(pending)
+        || state.chatPendingSend !== null || state.chatFinalization !== null
+        || state.chatThread !== rendered || state.chatGeneration !== generation
+        || authoritative.threadId !== pending.threadId) return null;
+    if (!replaceListedChatThread(authoritative)
+        || authoritative.currentGenerationId !== null
+        || authoritative.revision <= pending.revision
+        || authoritative.revision !== generation.finalRevision
+        || authoritative.ledgerHash !== generation.finalHash) return null;
+
+    const ticket = pending.chat.prepareThreadDeletion({
+      threadId: pending.threadId,
+      expectedRevision: authoritative.revision,
+      expectedHash: authoritative.ledgerHash,
+    });
+    const refreshed = Object.freeze({
+      session: pending.session,
+      chat: pending.chat,
+      threadId: pending.threadId,
+      revision: authoritative.revision,
+      ledgerHash: authoritative.ledgerHash,
+      ticket,
+    });
+    state.chatPendingDeletion = refreshed;
+    return refreshed;
+  }
+
   function finishLocalThreadDeletion(pending, authoritativeThreads = null) {
     if (!currentThreadDeletion(pending)) return false;
     const threadId = pending.threadId;
@@ -3458,42 +3507,61 @@ export function createBrowserApp({
         state.chatPendingDeletion = pending;
       }
 
-      let result = null;
-      let ambiguous = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          result = await (attempt === 0 && retained === null
-            ? pending.chat.deleteThread(pending.ticket)
-            : pending.chat.retryDeleteThread(pending.ticket));
-          ambiguous = null;
-          break;
-        } catch (error) {
-          if (!currentThreadDeletion(pending)) return false;
-          if (deletionAlreadyAbsent(error)) return finishLocalThreadDeletion(pending);
-          if (definitiveDeletionRejection(error)) throw error;
-          ambiguous = error;
-          if (attempt === 0) {
-            connection("Retrying the same durable deletion", false);
-            await wait(250);
+      let refreshedCompletedCursor = false;
+      while (true) {
+        let result = null;
+        let ambiguous = null;
+        let retryWithRefreshedCursor = false;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            result = await (attempt === 0 && retained === null
+              ? pending.chat.deleteThread(pending.ticket)
+              : pending.chat.retryDeleteThread(pending.ticket));
+            ambiguous = null;
+            break;
+          } catch (error) {
+            if (!currentThreadDeletion(pending)) return false;
+            if (deletionAlreadyAbsent(error)) return finishLocalThreadDeletion(pending);
+            if (!refreshedCompletedCursor && retained === null && attempt === 0
+                && error instanceof DirectChatTransportError && error.status === 409) {
+              let refreshed;
+              try {
+                refreshed = await refreshCompletedThreadDeletion(pending);
+              } catch (refreshError) {
+                if (deletionAlreadyAbsent(refreshError)) return finishLocalThreadDeletion(pending);
+                throw refreshError;
+              }
+              if (refreshed !== null) {
+                pending = refreshed;
+                refreshedCompletedCursor = true;
+                retryWithRefreshedCursor = true;
+                break;
+              }
+            }
+            if (definitiveDeletionRejection(error)) throw error;
+            ambiguous = error;
+            if (attempt === 0) {
+              connection("Retrying the same durable deletion", false);
+              await wait(250);
+            }
           }
         }
+        if (retryWithRefreshedCursor) continue;
+        if (result !== null) {
+          if (!currentThreadDeletion(pending) || result.deleted !== true || result.threadId !== threadId) return false;
+          return finishLocalThreadDeletion(pending);
+        }
+        if (ambiguous !== null) return await reconcileThreadDeletion(pending);
+        return false;
       }
-      if (result !== null) {
-        if (!currentThreadDeletion(pending) || result.deleted !== true || result.threadId !== threadId) return false;
-        return finishLocalThreadDeletion(pending);
-      }
-      if (ambiguous !== null) return await reconcileThreadDeletion(pending);
-      return false;
     } catch (error) {
       const pending = state.chatPendingDeletion;
       if (pending !== null && currentThreadDeletion(pending)) state.chatPendingDeletion = null;
       if (isChatAuthenticationAfterAmbiguousDispatch(error)) {
         requireFreshAuthentication();
       } else if (error instanceof DirectChatTransportError && error.status === 409) {
-        if (retained !== null) {
-          renderThreads();
-          focusSoon(() => focusThreadDeleteControl(threadId));
-        }
+        renderThreads();
+        focusSoon(() => focusThreadDeleteControl(threadId));
         showToast("Deletion stopped because this conversation changed or still has unresolved work.");
       } else {
         if (retained !== null) {

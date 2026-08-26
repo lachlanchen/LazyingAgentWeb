@@ -88,33 +88,18 @@ jobs:
           set -euo pipefail
           npm pack --json --ignore-scripts > "$RUNNER_TEMP/npm-pack.json"
           TARBALL="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const x=Array.isArray(p)?p:Object.values(p);if(x.length!==1||typeof x[0].filename!=='string')process.exit(1);process.stdout.write(x[0].filename)" "$RUNNER_TEMP/npm-pack.json")"
-          INTEGRITY="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const x=Array.isArray(p)?p:Object.values(p);if(x.length!==1||typeof x[0].integrity!=='string')process.exit(1);process.stdout.write(x[0].integrity)" "$RUNNER_TEMP/npm-pack.json")"
           test "$TARBALL" = "lazyingart-agent-web-${RELEASE_TAG#v}.tgz"
           mkdir "$RUNNER_TEMP/release-asset"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$TARBALL" --dir "$RUNNER_TEMP/release-asset"
           cmp --silent "$TARBALL" "$RUNNER_TEMP/release-asset/$TARBALL"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
           sha256sum "$TARBALL"
 
       - name: Publish exact package with npm trusted publishing
         shell: bash
         env:
           TARBALL: ${{ steps.package.outputs.tarball }}
-          EXPECTED_INTEGRITY: ${{ steps.package.outputs.integrity }}
         run: |
           set -euo pipefail
-          NAME="$(node -p "require('./package.json').name")"
-          VERSION="$(node -p "require('./package.json').version")"
           npm ping
-          if npm view "$NAME@$VERSION" dist.integrity --json > "$RUNNER_TEMP/published-integrity.json" 2> "$RUNNER_TEMP/npm-view-error.log"; then
-            PUBLISHED_INTEGRITY="$(node -e "const v=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));if(typeof v!=='string')process.exit(1);process.stdout.write(v)" "$RUNNER_TEMP/published-integrity.json")"
-            test "$PUBLISHED_INTEGRITY" = "$EXPECTED_INTEGRITY"
-            echo "The exact package version is already published."
-            exit 0
-          fi
-          if ! grep -Eq 'E404|404 Not Found' "$RUNNER_TEMP/npm-view-error.log"; then
-            cat "$RUNNER_TEMP/npm-view-error.log" >&2
-            exit 1
-          fi
-          npm publish "./$TARBALL" --access public --provenance
+          node scripts/npm-publish-idempotent.mjs "./$TARBALL"

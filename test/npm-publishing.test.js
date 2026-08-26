@@ -11,6 +11,10 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
     new URL('../.github/workflows/npm-publish.yml', import.meta.url),
     'utf8',
   );
+  const publisher = await readFile(
+    new URL('../scripts/npm-publish-idempotent.mjs', import.meta.url),
+    'utf8',
+  );
   const verificationWorkflow = await readFile(
     new URL('../.github/workflows/ci.yml', import.meta.url),
     'utf8',
@@ -29,13 +33,23 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
     'npm ci --ignore-scripts',
     'const x=Array.isArray(p)?p:Object.values(p)',
     'cmp --silent "$TARBALL" "$RUNNER_TEMP/release-asset/$TARBALL"',
-    'test "$PUBLISHED_INTEGRITY" = "$EXPECTED_INTEGRITY"',
-    'npm publish "./$TARBALL" --access public --provenance',
+    'node scripts/npm-publish-idempotent.mjs "./$TARBALL"',
   ]) {
     assert.ok(workflow.includes(required), `missing publishing invariant: ${required}`);
   }
 
-  assert.doesNotMatch(workflow, /(?:NODE_AUTH_TOKEN|NPM_TOKEN|pull_request_target|pull_request:)/u);
+  for (const required of [
+    "['publish', tarball, '--access', 'public', '--provenance']",
+    "cache: 'no-store'",
+    "'cache-control': 'no-cache, no-store, max-age=0'",
+    "endpoint.searchParams.set('cache-bust'",
+    'document.dist.integrity !== local.integrity',
+    'document.dist.shasum !== local.shasum',
+  ]) {
+    assert.ok(publisher.includes(required), `missing idempotent publisher invariant: ${required}`);
+  }
+
+  assert.doesNotMatch(workflow, /(?:npm view|NODE_AUTH_TOKEN|NPM_TOKEN|pull_request_target|pull_request:)/u);
   assert.match(verificationWorkflow, /node: \['22\.21\.0', '24'\]/u);
   assert.match(verificationWorkflow, /permissions:\n  contents: read/u);
   assert.match(verificationWorkflow, /npm ci --ignore-scripts/u);

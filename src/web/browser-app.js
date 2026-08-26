@@ -1241,7 +1241,6 @@ export function createBrowserApp({
     attachmentRestoreObserver: undefined,
     attachmentRestoreObserved: new Map(),
     attachmentRestoreQueue: [],
-    attachmentRestoreActive: 0,
     attachmentRestoreControllers: new Set(),
     runId: null,
     agentRunStatus: null,
@@ -1862,7 +1861,9 @@ export function createBrowserApp({
     state.attachmentRestoreObserved.clear();
     const queued = deferQueued ? [...state.attachmentRestoreQueue] : [];
     state.attachmentRestoreQueue.length = 0;
-    for (const controller of state.attachmentRestoreControllers) controller.abort();
+    const supersededControllers = [...state.attachmentRestoreControllers];
+    state.attachmentRestoreControllers.clear();
+    for (const controller of supersededControllers) controller.abort();
     for (const job of queued) deferAttachmentRestorationJob(job);
   }
 
@@ -1983,18 +1984,16 @@ export function createBrowserApp({
   }
 
   function drainAttachmentRestorations() {
-    while (state.attachmentRestoreActive < ATTACHMENT_RESTORE_CONCURRENCY
+    while (state.attachmentRestoreControllers.size < ATTACHMENT_RESTORE_CONCURRENCY
         && state.attachmentRestoreQueue.length > 0) {
       const job = state.attachmentRestoreQueue.shift();
       const controller = new AbortController();
-      state.attachmentRestoreActive += 1;
       state.attachmentRestoreControllers.add(controller);
       void Promise.resolve()
         .then(() => job.restore(controller.signal))
         .catch(() => { /* restoreMessageAttachment owns its visible failure state. */ })
         .finally(() => {
           state.attachmentRestoreControllers.delete(controller);
-          state.attachmentRestoreActive -= 1;
           if (job.image.dataset.previewState === "loading") deferAttachmentRestorationJob(job);
           drainAttachmentRestorations();
         });

@@ -3869,6 +3869,133 @@ test("every image in one historical gallery gets its own viewport restoration jo
   assert.deepEqual(images.map((image) => image.alt), ["Attached image 1", "Attached image 2"]);
 });
 
+test("a superseded non-cooperative gallery read cannot strand two-image previews after same-thread chat", async () => {
+  const observer = intersectionHarness();
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const descriptors = [1, 2].map((value) => Object.freeze({
+    attachmentId: `image_followup_${value}_xxxxxxxxxx`,
+    mediaType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 2,
+    height: 2,
+    sha256: String(value).repeat(64),
+  }));
+  const hashes = [CHAT_HASH_A, CHAT_HASH_B, "c".repeat(64), "d".repeat(64)];
+  const followupGenerationId = "generation_followup_xxxxxxxxxxxxx";
+  const messages = [
+    chatMessage(1, "user", "Compare both images", {
+      messageHash: hashes[0],
+      attachments: descriptors,
+    }),
+    chatMessage(2, "assistant", "Both images compared", {
+      previousHash: hashes[0],
+      messageHash: hashes[1],
+    }),
+  ];
+  let thread = chatThread({
+    revision: 2,
+    ledgerHash: hashes[1],
+    messageCount: 2,
+    ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+  });
+  const staleRead = Promise.withResolvers();
+  const staleReadStarted = Promise.withResolvers();
+  const attachmentReads = [];
+  let staleSignal;
+  let createdUrls = 0;
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    async getAttachment({ attachment, signal }) {
+      attachmentReads.push(attachment.attachmentId);
+      if (attachmentReads.length === 1) {
+        staleSignal = signal;
+        staleReadStarted.resolve();
+        return await staleRead.promise;
+      }
+      return { bytes, descriptor: attachment };
+    },
+    prepareRun(request) {
+      return Object.freeze({
+        ...request,
+        generationId: followupGenerationId,
+        idempotencyKey: "run_followup_gallery_xxxxxxxxxxx",
+      });
+    },
+    async startRun(ticket) {
+      messages.push(
+        chatMessage(3, "user", ticket.content, {
+          previousHash: hashes[1],
+          messageHash: hashes[2],
+        }),
+        chatMessage(4, "assistant", "Blue", {
+          previousHash: hashes[2],
+          messageHash: hashes[3],
+          generationId: followupGenerationId,
+        }),
+      );
+      thread = chatThread({
+        revision: 4,
+        ledgerHash: hashes[3],
+        messageCount: 4,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({
+          generationId: followupGenerationId,
+          status: "completed",
+          terminal: true,
+        }),
+      };
+    },
+  });
+  const browser = harness({
+    chat,
+    IntersectionObserver: observer.IntersectionObserver,
+    createObjectUrl() { createdUrls += 1; return `blob:followup-gallery-${createdUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+  const originalItems = [...observer.latest().targets];
+  assert.equal(originalItems.length, 2);
+  observer.latest().enter(originalItems[0]);
+  observer.latest().enter(originalItems[1]);
+  await staleReadStarted.promise;
+
+  browser.document.getElementById("message-input").value = "What color was the first object?";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(staleSignal.aborted, true, "the old cosmetic read is fenced before the exact follow-up mutation");
+  assert.match(browser.document.getElementById("messages").textContent,
+    /Compare both images[\s\S]*Both images compared[\s\S]*What color was the first object\?[\s\S]*Blue/u);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const currentItems = [...observer.latest().targets];
+  assert.equal(currentItems.length, 2, "the completed same-thread snapshot registers both stored images again");
+  observer.latest().enter(currentItems[0]);
+  observer.latest().enter(currentItems[1]);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const currentImages = currentItems.map((item) => item.children[0]);
+  assert.deepEqual(attachmentReads, [
+    descriptors[0].attachmentId,
+    descriptors[0].attachmentId,
+    descriptors[1].attachmentId,
+  ], "a stale unresolved task cannot retain the successor restoration slot");
+  assert.deepEqual(currentImages.map((image) => image.dataset.previewState), ["ready", "ready"]);
+  assert.deepEqual(currentImages.map((image) => image.alt), ["Attached image 1", "Attached image 2"]);
+
+  staleRead.resolve({ bytes, descriptor: descriptors[0] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(currentImages.map((image) => image.dataset.previewState), ["ready", "ready"],
+    "the late superseded response cannot replace the current DOM previews");
+  assert.equal(createdUrls, 2, "the superseded private bytes never receive an object URL");
+});
+
 async function sameThreadAttachmentMemoryCase({ blobLimit, decodedLimit }) {
   const observer = intersectionHarness();
   const hashes = ["5", "6", "7", "8"].map((value) => value.repeat(64));

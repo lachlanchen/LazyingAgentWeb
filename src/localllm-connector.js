@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 
 import { DIRECT_CHAT_CONTEXT_ENTRY_LIMIT } from './direct-chat-contract.js';
+import { directChatCapabilityNotice } from './direct-chat-capability-limits.js';
 import { VISION_MODEL_ALIAS } from './vision-attachment.js';
 
 const MODEL_ALIAS_PATTERN = /^localllm-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
@@ -386,7 +387,7 @@ function parseChunkData(source) {
   return boundedText(delta.content, 'stream delta content', MAX_EVENT_BYTES, { allowEmpty: true });
 }
 
-async function* decodeOpenAiStream(response, signal) {
+async function* decodeOpenAiStream(response, signal, maximumOutputBytes = MAX_OUTPUT_BYTES) {
   if (!response.body) fail('LOCALLLM_STREAM_INVALID', 'LocalLLM returned no streaming body.');
   const reader = response.body.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -453,7 +454,7 @@ async function* decodeOpenAiStream(response, signal) {
         }
         if (event.content) {
           outputBytes += Buffer.byteLength(event.content, 'utf8');
-          if (outputBytes > MAX_OUTPUT_BYTES) {
+          if (outputBytes > maximumOutputBytes) {
             fail('LOCALLLM_OUTPUT_LIMIT', 'LocalLLM output exceeded its connector bound.', {
               failureCode: 'response_limit'
             });
@@ -614,6 +615,7 @@ export function createLocalLlmConnector({
         );
       }
       const messages = [...validateContext(context)];
+      const capabilityNotice = directChatCapabilityNotice(messages.at(-1).content);
       if (visionAttachments.length > 0) {
         const last = messages.at(-1);
         messages[messages.length - 1] = Object.freeze({
@@ -644,7 +646,15 @@ export function createLocalLlmConnector({
         await discardBody(response);
         fail('LOCALLLM_STREAM_INVALID', 'LocalLLM returned an invalid stream response.');
       }
-      return decodeOpenAiStream(response, signal);
+      const noticeBytes = Buffer.byteLength(capabilityNotice, 'utf8');
+      const upstream = decodeOpenAiStream(response, signal, MAX_OUTPUT_BYTES - noticeBytes);
+      if (!capabilityNotice) return upstream;
+      return (async function* capabilityBoundOutput() {
+        const buffered = [];
+        for await (const delta of upstream) buffered.push(delta);
+        yield capabilityNotice;
+        for (const delta of buffered) yield delta;
+      }());
   }
 
   return Object.freeze({

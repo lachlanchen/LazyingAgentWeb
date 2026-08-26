@@ -107,7 +107,9 @@ test('streams only bounded assistant text through the exact authenticated route'
     ]);
   });
   const output = await value.generate(generationInput());
-  assert.deepEqual(await collect(output), ['Hel', 'lo']);
+  const deltas = await collect(output);
+  assert.match(deltas[0], /Direct Chat cannot execute code[\s\S]*still complete every supported text/u);
+  assert.deepEqual(deltas.slice(1), ['Hel', 'lo']);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'http://127.0.0.1:18120/v1/chat/completions');
   assert.equal(calls[0].init.method, 'POST');
@@ -129,12 +131,27 @@ test('streams only bounded assistant text through the exact authenticated route'
   assert.doesNotMatch(JSON.stringify(value), /local-test-token/u);
 });
 
+test('withholds a deterministic capability notice until the upstream stream is fully valid', async () => {
+  const value = connector(async () => streamResponse([
+    'data: {"choices":[{"index":0,"delta":{"content":"Done — I ran it."},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"tool_calls":[]},"finish_reason":null}]}\n\n',
+    'data: [DONE]\n\n'
+  ]));
+  const output = await value.generate(generationInput());
+  await assert.rejects(
+    output[Symbol.asyncIterator]().next(),
+    (error) => error instanceof LocalLlmConnectorError && error.code === 'LOCALLLM_STREAM_INVALID'
+  );
+});
+
 test('accepts only bounded printable optional stream fingerprints', async () => {
   const accepted = connector(async () => streamResponse([
     'data: {"system_fingerprint":null,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
     'data: [DONE]\n\n'
   ]));
-  assert.deepEqual(await collect(await accepted.generate(generationInput())), ['ok']);
+  const acceptedDeltas = await collect(await accepted.generate(generationInput()));
+  assert.match(acceptedDeltas[0], /Direct Chat cannot execute code/u);
+  assert.equal(acceptedDeltas.at(-1), 'ok');
 
   for (const systemFingerprint of [42, {}, '', 'bad\nfingerprint', 'x'.repeat(257)]) {
     const rejected = connector(async () => streamResponse([

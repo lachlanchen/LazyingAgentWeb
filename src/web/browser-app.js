@@ -223,6 +223,8 @@ function requestsAgentDocumentCreation(value) {
   }
   const action = normalizedExecutionAction(text);
   const createsDocument = /^(?:make|create|generate|write|rewrite|revise|update|edit|modify|correct|fix|regenerate|recompile|produce|prepare|compile|typeset|render|export|build|deliver|provide|save)\b/iu.test(action)
+    || /^(?:use|using)\s+(?:latex|tex)\s+to\s+(?:make|create|generate|write|produce|prepare|compile|typeset|render|export|build|deliver|provide|save)\b/iu.test(action)
+    || /^i\s+(?:need|want|would\s+like)\s+(?=[^.?!]{0,200}\b(?:latex|tex)(?:\s+(?:source|file|document))?\b)(?=[^.?!]{0,200}\b(?:compiled\s+)?pdf\b)(?=[^.?!]{0,200}\b(?:(?:latex|tex)\s+(?:source|file|document)|compiled\s+pdf)\b)/iu.test(text)
     || /^(?:创建|建立|生成|撰写|撰寫|重写|重寫|修改|修订|修訂|更新|重新生成|重新编译|重新編譯|编译|編譯|导出|導出|准备|準備|制作|製作|交付|排版)/u.test(action);
   const hasTex = /(?:\.tex\b|\b(?:latex|tex)(?:\s+(?:source|file|document|format))?\b)/iu.test(text);
   const hasPdf = /(?:\.pdf\b|\b(?:compiled\s+)?pdf\b)/iu.test(text);

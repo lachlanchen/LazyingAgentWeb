@@ -1231,6 +1231,9 @@ test("advertised TeX/PDF file creation requests hand off from Chat to Agent", as
     "Create a LaTeX source and compile it to PDF with one figure.",
     "Write a .tex report and provide the compiled .pdf.",
     "Write a latex of qaoa compile and give me link of pdf with figures",
+    "I need a LaTeX source and compiled PDF.",
+    "I want the TeX file and the compiled PDF.",
+    "Use LaTeX to make a PDF with a self-contained figure.",
     "请生成 LaTeX 源文件并编译成 PDF。",
   ]) {
     const started = [];
@@ -1267,6 +1270,8 @@ test("TeX/PDF wording stays in Chat when file creation is not advertised or not 
     "Write a latex of qaoa compile and give me link of pdf with figures",
     "Explain the difference between LaTeX and PDF.",
     "Do not create a LaTeX or PDF file.",
+    "I need an explanation of LaTeX and PDF.",
+    "How do I use LaTeX to make a PDF?",
   ];
   for (const [index, prompt] of prompts.entries()) {
     const fileCapability = index !== 0;

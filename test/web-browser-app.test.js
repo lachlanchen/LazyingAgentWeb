@@ -5026,6 +5026,145 @@ test("a local multi-image-run preparation failure preserves both images and the 
   assert.match(browser.document.getElementById("messages").textContent, /Retried safely/u);
 });
 
+test("not-sent image failures retain safe diagnostics and give a concise reason and recovery action", async (t) => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const cases = [
+    {
+      name: "expired sign-in",
+      point: "snapshot",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "authentication_required", status: 401, retryable: false,
+      }),
+      diagnostic: ["authentication", "authentication_required", "snapshot"],
+      expected: /sign-in expired[\s\S]*still ready[\s\S]*Sign in again/iu,
+    },
+    {
+      name: "oversized upload",
+      point: "run",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "request_too_large", status: 413, retryable: false,
+      }),
+      diagnostic: ["body_rejection", "request_too_large", "run_dispatch"],
+      expected: /upload was too large[\s\S]*still ready[\s\S]*(Remove an image|smaller files)/iu,
+    },
+    {
+      name: "rejected image format",
+      point: "run",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "invalid_attachment", status: 422, retryable: false,
+      }),
+      diagnostic: ["body_rejection", "invalid_attachment", "run_dispatch"],
+      expected: /image format or file was rejected[\s\S]*Replace the affected image/iu,
+    },
+    {
+      name: "stale conversation revision",
+      point: "run",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "conflict", status: 409, retryable: false,
+      }),
+      diagnostic: ["authoritative_conflict", "conflict", "run_dispatch"],
+      expected: /conversation changed[\s\S]*Reopen this conversation/iu,
+    },
+    {
+      name: "network timeout",
+      point: "snapshot",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "request_timeout", status: 504, retryable: true,
+      }),
+      diagnostic: ["network_timeout", "request_timeout", "snapshot"],
+      expected: /request timed out[\s\S]*Check your connection/iu,
+    },
+    {
+      name: "conversation refresh failure",
+      point: "snapshot",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "request_failed", status: 500, retryable: false,
+      }),
+      diagnostic: ["snapshot", "snapshot_unavailable", "snapshot"],
+      expected: /conversation could not be refreshed[\s\S]*Check your connection[\s\S]*reopen it/iu,
+    },
+    {
+      name: "service rejection",
+      point: "run",
+      error: () => new DirectChatTransportError("SERVER_INTERNAL_PRIVATE_MARKER", {
+        code: "content_rejected", status: 422, retryable: false,
+      }),
+      diagnostic: ["authoritative_rejection", "request_rejected", "run_dispatch"],
+      expected: /service rejected it before it ran[\s\S]*Edit it or retry/iu,
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      const thread = chatThread();
+      let failureEnabled = false;
+      const chat = baseChat({
+        async capabilities() {
+          return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+        },
+        async listThreads() { return { threads: [thread] }; },
+        async getThread() {
+          if (failureEnabled && candidate.point === "snapshot") throw candidate.error();
+          return { thread };
+        },
+        async listMessages() { return { messages: [] }; },
+        prepareRun(request) {
+          return Object.freeze({
+            ...request,
+            generationId: CHAT_GENERATION_ID,
+            idempotencyKey: "run_start_safe_failure_reason_x",
+          });
+        },
+        async startRun() {
+          if (candidate.point === "run") throw candidate.error();
+          throw new Error("a snapshot failure cannot dispatch a run");
+        },
+      });
+      const browser = harness({
+        chat,
+        async canonicalizeImage() {
+          return Object.freeze({
+            attachmentId: "image_safe_failure_reason_0001",
+            mediaType: "image/png",
+            byteLength: bytes.byteLength,
+            width: 80,
+            height: 80,
+            bytes,
+            previewBlob: new Blob([bytes], { type: "image/png" }),
+          });
+        },
+        createObjectUrl() { return `blob:safe-failure-${candidate.name}`; },
+        revokeObjectUrl() {},
+      });
+      await browser.app.initialize();
+      const input = browser.document.getElementById("image-input");
+      input.files = [{ name: "private.png" }];
+      input.dispatch("change");
+      await new Promise((resolve) => setImmediate(resolve));
+      const draft = `Keep ${candidate.name} prompt and image`;
+      browser.document.getElementById("message-input").value = draft;
+      failureEnabled = true;
+
+      await browser.app.submitMessage({ preventDefault() {} });
+
+      const toast = browser.document.getElementById("toast").textContent;
+      assert.match(toast, /image message was not sent[\s\S]*still ready/iu);
+      assert.match(toast, candidate.expected);
+      assert.doesNotMatch(toast, /SERVER_INTERNAL_PRIVATE_MARKER/u);
+      assert.equal(browser.document.getElementById("message-input").value, draft);
+      assert.equal(browser.document.getElementById("image-preview").hidden, false);
+      assert.deepEqual(
+        [
+          browser.document.getElementById("workspace").dataset.failureStage,
+          browser.document.getElementById("workspace").dataset.failureCode,
+          browser.document.getElementById("workspace").dataset.failureOperation,
+        ],
+        candidate.diagnostic,
+      );
+    });
+  }
+});
+
 test("an existing-thread snapshot outage restores the exact image draft before any run dispatch", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const draft = "  Describe this image.\nKeep the exact spacing.  ";
@@ -5884,7 +6023,8 @@ test("an authoritative run rejection releases its ticket and restores the exact 
   assert.equal(browser.document.getElementById("workspace").dataset.failureStage, "authoritative_conflict");
   assert.equal(browser.document.getElementById("workspace").dataset.failureCode, "conflict");
   assert.equal(browser.document.getElementById("workspace").dataset.failureOperation, "run_dispatch");
-  assert.match(browser.document.getElementById("toast").textContent, /not sent[\s\S]*composer/iu);
+  assert.match(browser.document.getElementById("toast").textContent,
+    /not sent[\s\S]*conversation changed[\s\S]*prompt is still ready[\s\S]*Reopen/iu);
 });
 
 test("an ambiguous new-thread commit keeps the exact image draft visible and resumes the same tickets", async () => {

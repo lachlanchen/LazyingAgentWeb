@@ -912,6 +912,46 @@ function chatFailureDiagnostic(error) {
   });
 }
 
+function chatNotSentRecoveryMessage(diagnostic, imageCount = 0) {
+  const hasImages = Number.isSafeInteger(imageCount) && imageCount > 0;
+  const subject = hasImages ? "This image message" : "This message";
+  const preserved = hasImages
+    ? `Your prompt and ${imageCount === 1 ? "image are" : "images are"} still ready.`
+    : "Your prompt is still ready.";
+  if (diagnostic.stage === "authentication" || diagnostic.stage === "csrf") {
+    return `${subject} was not sent because your sign-in expired. ${preserved} Sign in again, then retry.`;
+  }
+  if (diagnostic.stage === "body_rejection" && diagnostic.code === "request_too_large") {
+    return `${subject} was not sent because the upload was too large. ${preserved} Remove an image or choose smaller files, then retry.`;
+  }
+  if (diagnostic.stage === "body_rejection" && diagnostic.code === "invalid_attachment") {
+    return `${subject} was not sent because an image format or file was rejected. ${preserved} Replace the affected image, then retry.`;
+  }
+  if (diagnostic.stage === "authoritative_conflict") {
+    return `${subject} was not sent because the conversation changed. ${preserved} Reopen this conversation, then retry.`;
+  }
+  if (diagnostic.stage === "network_timeout") {
+    return `${subject} was not sent because the request timed out. ${preserved} Check your connection, then retry.`;
+  }
+  if (diagnostic.stage === "network") {
+    return `${subject} was not sent because the network was unavailable. ${preserved} Reconnect, then retry.`;
+  }
+  if (diagnostic.stage === "snapshot") {
+    return `${subject} was not sent because the conversation could not be refreshed. ${preserved} Check your connection, then reopen it and retry.`;
+  }
+  if (diagnostic.stage === "local_preparation") {
+    return `${subject} was not sent because the browser could not prepare it. ${preserved} ${hasImages
+      ? "Remove and re-add the images, then retry; refresh the app if it repeats."
+      : "Refresh the app, then retry."}`;
+  }
+  if (diagnostic.stage === "body_rejection") {
+    return `${subject} was not sent because the service could not accept it. ${preserved} ${hasImages
+      ? "Remove or replace the affected image, then retry."
+      : "Edit it, then retry."}`;
+  }
+  return `${subject} was not sent because the service rejected it before it ran. ${preserved} Edit it or retry when the service is available.`;
+}
+
 function normalizedBrowserPath(value, name, { trailingSlash = false } = {}) {
   if (typeof value !== "string" || value.length > 160 || !/^\/[A-Za-z0-9._~/-]*$/u.test(value) || value.includes("//")
       || value.split("/").some((part) => part === "." || part === "..")) {
@@ -4341,9 +4381,7 @@ export function createBrowserApp({
         const imageRestored = restoreDetachedImage(detachedImage);
         detachedImage = null;
         const diagnostic = applyChatFailureDiagnostic(error);
-        showToast(imageRestored
-          ? `This image message was not sent. Your prompt and ${selected.length === 1 ? "image" : "images"} are still ready; edit or retry them.`
-          : "This message was not sent. Your prompt is still in the composer; edit it and try again.");
+        showToast(chatNotSentRecoveryMessage(diagnostic, imageRestored ? selected.length : 0));
         if (diagnostic.reauthenticate) requireFreshAuthentication();
       } else if (state.mode === "chat" && state.chatPendingSend && !state.chatPendingSend.runDispatched) {
         elements.message_input.value = draft;

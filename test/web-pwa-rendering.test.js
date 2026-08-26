@@ -6202,7 +6202,7 @@ test("rendering implementation contains no HTML injection, dynamic code executio
 
 // Legacy encrypted update-handoff compatibility. Keep these fixtures separate
 // from current-version update tests so their historical wire bytes stay fixed.
-test("an encrypted inner-v1 Chat handoff restores its exact draft and PNG without a mutation", async () => {
+test("an encrypted inner-v1 Chat handoff restores its PNG into the current four-image composer without a mutation", async () => {
   const encoder = new TextEncoder();
   const createdAt = 125_000;
   const draft = "Restore this exact legacy PNG prompt without sending it";
@@ -6317,6 +6317,7 @@ test("an encrypted inner-v1 Chat handoff restores its exact draft and PNG withou
   };
   const store = memoryUpdateHandoffStore([[`/\u0000${handoffId}`, stored]]);
   const restoredBlobs = [];
+  let appendedImages = 0;
   const href = `https://llm.lazying.art/?v=${NEXT_RELEASE}#lazying-update-handoff=${handoffId}.${keyText}`;
   const harness = updateControllerHarness({
     waiting: false,
@@ -6332,9 +6333,23 @@ test("an encrypted inner-v1 Chat handoff restores its exact draft and PNG withou
     agent: idleAuthenticatedPwaClients().agent,
     chat,
     updateHandoffStore: store,
+    async canonicalizeImage() {
+      appendedImages += 1;
+      return Object.freeze({
+        attachmentId: `image_inner_v1_current_000${appendedImages}`,
+        mediaType: "image/png",
+        byteLength: imageBytes.byteLength,
+        width: 1,
+        height: 1,
+        bytes: imageBytes,
+        previewBlob: new Blob([imageBytes], { type: "image/png" }),
+      });
+    },
     createObjectUrl(blob) {
       restoredBlobs.push(blob);
-      return "blob:inner-v1-restored-png";
+      return restoredBlobs.length === 1
+        ? "blob:inner-v1-restored-png"
+        : `blob:inner-v1-current-${restoredBlobs.length - 1}`;
     },
     revokeObjectUrl() {},
   });
@@ -6351,6 +6366,18 @@ test("an encrypted inner-v1 Chat handoff restores its exact draft and PNG withou
   assert.equal(restoredBlobs.length, 1);
   assert.equal(restoredBlobs[0].type, "image/png");
   assert.deepEqual(new Uint8Array(await restoredBlobs[0].arrayBuffer()), imageBytes);
+
+  const imageInput = harness.document.getElementById("image-input");
+  imageInput.files = [{ name: "second.png" }, { name: "third.png" }, { name: "fourth.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(appendedImages, 3);
+  assert.match(harness.document.getElementById("image-preview-label").textContent, /4 images/u);
+  assert.equal(harness.document.getElementById("image-preview-thumbnail").src, "blob:inner-v1-restored-png",
+    "the restored legacy image remains first in current ordered multi-image input");
+  assert.equal(harness.document.getElementById("add-image").disabled, true,
+    "the successor shell enforces its current four-image limit");
+  assert.equal(restoredBlobs.length, 4);
   assert.deepEqual(mutationCalls, []);
   assert.deepEqual(store.calls, { save: 1, take: 1, discard: 1 },
     "startup re-retains the row until UI initialization, then consumes it exactly once");

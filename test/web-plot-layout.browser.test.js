@@ -192,7 +192,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Compiled paper</h3><div id="file-artifact"></div></article>
       </section>
     </article></section></div>
-    <aside class="activity-panel"><header><strong>Agent activity</strong><span>Completed</span></header><ol><li>Plan response — Completed</li><li>Run bounded analysis — Completed</li><li>Prepare answer — Completed</li></ol></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><button id="run-agent">Run</button></form><p id="footer-note" class="footer-note">Agent footer</p>
+    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><button id="run-agent">Run</button></form><p id="footer-note" class="footer-note">Agent footer</p>
   </section>
 </div>
 <script type="module">
@@ -278,6 +278,18 @@ const GEOMETRY_EXPRESSION = `(() => {
   const messageInput = rectangle(document.querySelector('#message-input'));
   const runAgent = rectangle(document.querySelector('#run-agent'));
   const footer = rectangle(document.querySelector('#footer-note'));
+  const activityPanel = document.querySelector('#activity-panel');
+  const activityDisclosure = document.querySelector('#activity-disclosure');
+  const activityDetails = document.querySelector('#activity-details');
+  const activityDefaultOpen = activityDisclosure.open;
+  const activityCollapsed = rectangle(activityPanel);
+  activityDisclosure.open = true;
+  const activityExpanded = rectangle(activityPanel);
+  const activityDetailsExpanded = rectangle(activityDetails);
+  const chatScrollWithActivity = rectangle(document.querySelector('.chat-scroll'));
+  const composerWithActivity = rectangle(document.querySelector('#composer'));
+  activityDisclosure.open = false;
+  const activityRestored = rectangle(activityPanel);
   const fileTarget = document.querySelector('#file-artifact');
   const fileControls = fileTarget.querySelector('.artifact-file-controls');
   const fileActions = [...fileTarget.querySelectorAll('.artifact-file-action')];
@@ -303,6 +315,18 @@ const GEOMETRY_EXPRESSION = `(() => {
       footerInsideWorkspace: contains(workspace, footer),
       chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
       composerAboveFooter: composer.bottom <= footer.top + .5,
+    },
+    activity: {
+      defaultOpen: activityDefaultOpen,
+      collapsed: activityCollapsed,
+      expanded: activityExpanded,
+      restored: activityRestored,
+      details: activityDetailsExpanded,
+      detailsOwnScroll: activityDetails.scrollHeight > activityDetails.clientHeight,
+      expandedInsideWorkspace: contains(workspace, activityExpanded),
+      chatAboveExpanded: chatScrollWithActivity.bottom <= activityExpanded.top + .5,
+      expandedAboveComposer: activityExpanded.bottom <= composerWithActivity.top + .5,
+      composerInsideWorkspaceWhenExpanded: contains(workspace, composerWithActivity),
     },
     file: {
       target: fileTargetRect,
@@ -431,6 +455,15 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}&download=1`,
       ]);
+      assert.equal(result.activity.defaultOpen, false);
+      assert.ok(result.activity.collapsed.height >= 44 && result.activity.collapsed.height <= 52);
+      assert.ok(result.activity.expanded.height > result.activity.collapsed.height);
+      assert.equal(result.activity.restored.height, result.activity.collapsed.height);
+      assert.equal(result.activity.detailsOwnScroll, true);
+      assert.equal(result.activity.expandedInsideWorkspace, true);
+      assert.equal(result.activity.chatAboveExpanded, true);
+      assert.equal(result.activity.expandedAboveComposer, true);
+      assert.equal(result.activity.composerInsideWorkspaceWhenExpanded, true);
       for (const [check, accepted] of Object.entries({
         chatScrollInsideWorkspace: result.shell.chatScrollInsideWorkspace,
         composerInsideWorkspace: result.shell.composerInsideWorkspace,

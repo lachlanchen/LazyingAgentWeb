@@ -905,6 +905,9 @@ test("content-addressed PWA shell is bright and has safe session/password-manage
   assert.match(html, /Password saving is handled only by your browser or password manager/u);
   assert.match(html, /id="agent-mode"[^>]*aria-pressed="false"/u);
   assert.match(html, /id="mode-switch"[^>]*hidden/u);
+  assert.match(html, /<aside id="activity-panel"[^>]*hidden>[\s\S]*<details id="activity-disclosure" class="activity-disclosure">/u);
+  assert.match(html, /<summary><strong>Agent activity<\/strong><span id="run-state">Idle<\/span><\/summary>/u);
+  assert.doesNotMatch(html, /<details id="activity-disclosure"[^>]*\sopen(?:\s|>)/u);
   assert.match(html, /<button id="send-message"[^>]*aria-label="Send Chat"[^>]*>Send Chat<\/button>/u);
   assert.match(html, /id="capability-note"[^>]*>Chat · LocalLLM text only · no tools, file creation, or web search\.<\/p>/u);
   assert.doesNotMatch(html, /name="(?:model|provider|runtime|tools|cwd|sandbox)/iu);
@@ -947,6 +950,22 @@ test("the conversation sidebar gives the thread list one bounded scroll region",
   );
   assert.match(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*flex: 0 0 auto;/u);
   assert.doesNotMatch(BRIGHT_APP_CSS, /\.sidebar footer \{[^}]*margin-top: auto;/u);
+});
+
+test("Agent activity is a collapsed in-flow disclosure that cannot overlay chat or the composer", () => {
+  const panelRule = /\.activity-panel \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const detailsRule = /\.activity-details \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(panelRule);
+  assert.ok(detailsRule);
+  assert.match(panelRule[1], /grid-area:\s*activity;/u);
+  assert.match(panelRule[1], /overflow:\s*hidden;/u);
+  assert.doesNotMatch(panelRule[1], /position\s*:/u);
+  assert.match(detailsRule[1], /max-height:\s*min\(30dvh, 20rem\);/u);
+  assert.match(detailsRule[1], /overflow-y:\s*auto;/u);
+  assert.match(BRIGHT_APP_CSS, /\.activity-disclosure > summary \{[^}]*min-height:\s*48px;[^}]*cursor:\s*pointer;/u);
+  assert.match(BRIGHT_APP_CSS, /\.activity-disclosure > summary::after \{[^}]*content:\s*"Show details ⌄";/u);
+  assert.match(BRIGHT_APP_CSS, /\.activity-disclosure\[open\] > summary::after \{ content: "Hide details ⌃"; \}/u);
+  assert.match(BRIGHT_APP_CSS, /@media \(max-width: 760px\) \{[\s\S]*\.activity-details \{ max-height: min\(24dvh, 14rem\); \}/u);
 });
 
 test("mobile thread rows reserve non-overlapping title and full Delete control rectangles", () => {

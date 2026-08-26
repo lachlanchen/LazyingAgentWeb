@@ -528,10 +528,14 @@ ${modulePreloads}
       </div>
 
       <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity" hidden>
-        <header><strong>Agent activity</strong><span id="run-state">Idle</span></header>
-        <ol id="agent-plan" class="agent-plan" data-testid="agent-plan"></ol>
-        <ol id="agent-timeline" class="agent-timeline" data-testid="tool-timeline"></ol>
-        <section id="agent-artifacts" class="agent-artifacts" data-testid="artifact-panel" hidden></section>
+        <details id="activity-disclosure" class="activity-disclosure">
+          <summary><strong>Agent activity</strong><span id="run-state">Idle</span></summary>
+          <div class="activity-details">
+            <ol id="agent-plan" class="agent-plan" data-testid="agent-plan"></ol>
+            <ol id="agent-timeline" class="agent-timeline" data-testid="tool-timeline"></ol>
+            <section id="agent-artifacts" class="agent-artifacts" data-testid="artifact-panel" hidden></section>
+          </div>
+        </details>
       </aside>
 
       <form id="composer" class="composer" autocomplete="off">
@@ -671,8 +675,15 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message th, .message td, .artifact-table th, .artifact-table td { padding: .55rem; border: 1px solid var(--line); text-align: left; }
 .table-scroll, .artifact-table-scroll { overflow-x: auto; }
 .math-display { overflow-x: auto; padding: .5rem 0; }
-.activity-panel { grid-area: activity; min-height: 0; max-height: 40dvh; overflow-y: auto; padding: .75rem max(1rem, calc((100% - 850px) / 2)); border-top: 1px solid var(--line); background: var(--surface-soft); }
-.activity-panel header { display: flex; justify-content: space-between; }
+.activity-panel { grid-area: activity; min-height: 0; overflow: hidden; border-top: 1px solid var(--line); background: var(--surface-soft); }
+.activity-disclosure > summary { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .35rem max(1rem, calc((100% - 850px) / 2)); cursor: pointer; user-select: none; }
+.activity-disclosure > summary::-webkit-details-marker { display: none; }
+.activity-disclosure > summary::marker { content: ""; }
+.activity-disclosure > summary strong { margin-right: auto; }
+.activity-disclosure > summary::after { content: "Show details ⌄"; min-width: max-content; color: var(--accent-strong); font-size: .82rem; font-weight: 700; }
+.activity-disclosure[open] > summary::after { content: "Hide details ⌃"; }
+.activity-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.activity-details { max-height: min(30dvh, 20rem); overflow-y: auto; overscroll-behavior: contain; padding: 0 max(1rem, calc((100% - 850px) / 2)) .75rem; }
 .agent-plan, .agent-timeline { display: grid; gap: .35rem; padding-left: 1.4rem; }
 .agent-artifacts { display: grid; gap: .75rem; }
 .artifact-plot { display: block; width: 100%; height: auto; max-width: 100%; max-height: 420px; aspect-ratio: 720 / 390; }
@@ -761,6 +772,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .plot-label-wide { display: none; }
   .plot-label-compact { display: inline; }
   .artifact-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); gap: .4rem .7rem; font-size: .92rem; }
+  .activity-details { max-height: min(24dvh, 14rem); }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
 `;

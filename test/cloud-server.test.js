@@ -430,7 +430,7 @@ test('refuses a Direct Chat adapter without deletion authority before listening'
   );
 });
 
-test('serves stable update metadata with HEAD parity and immutable caching only in the release namespace', async (t) => {
+test('serves stable update metadata with HEAD parity and immutable caching only for release-addressed public assets', async (t) => {
   const state = testState(t);
   const { baseUrl } = await state.start();
   const root = await fetch(`${baseUrl}/`, { headers: publicBoundary(baseUrl) });
@@ -461,7 +461,30 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   const immutable = await fetch(`${baseUrl}/assets/r/${RELEASE_ID}/app.js`, { headers: publicBoundary(baseUrl) });
   assert.equal(immutable.headers.get('cache-control'), 'public, max-age=31536000, immutable');
   const manifest = await fetch(`${baseUrl}/manifest.webmanifest?v=${RELEASE_ID}`, { headers: publicBoundary(baseUrl) });
-  assert.equal(manifest.headers.get('cache-control'), 'no-store');
+  const manifestHead = await fetch(`${baseUrl}/manifest.webmanifest?v=${RELEASE_ID}`, {
+    method: 'HEAD',
+    headers: publicBoundary(baseUrl)
+  });
+  assert.equal(manifest.status, 200);
+  assert.equal(manifest.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+  assert.equal(manifestHead.status, 200);
+  assert.equal(manifestHead.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+  assert.equal(manifestHead.headers.get('content-length'), manifest.headers.get('content-length'));
+  assert.equal(await manifestHead.text(), '');
+
+  const unversionedManifest = await fetch(`${baseUrl}/manifest.webmanifest`, {
+    headers: publicBoundary(baseUrl)
+  });
+  assert.equal(unversionedManifest.status, 404);
+  assert.equal(unversionedManifest.headers.get('cache-control'), 'no-store');
+  const wrongVersionManifest = await fetch(`${baseUrl}/manifest.webmanifest?v=release-wrong`, {
+    headers: publicBoundary(baseUrl)
+  });
+  assert.equal(wrongVersionManifest.status, 400);
+  assert.equal(wrongVersionManifest.headers.get('cache-control'), 'no-store');
+  const sessionApi = await post(baseUrl, '/api/session', {});
+  assert.equal(sessionApi.status, 200);
+  assert.equal(sessionApi.headers.get('cache-control'), 'no-store');
   assert.equal(CLOUD_HTTP_LIMITS.jobAdmissionTimeoutMs, 120_000);
   assert.equal(CLOUD_HTTP_LIMITS.jobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.visionJobTimeoutMs, 600_000);

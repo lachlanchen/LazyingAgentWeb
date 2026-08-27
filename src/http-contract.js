@@ -359,7 +359,13 @@ export function snapshotAndValidateAssetMap(assetMap, releaseIdInput) {
     }
   }
 
-  const immutableRoutes = new Set([...routeSet].filter((route) => route.startsWith(`${assetMap.releaseNamespace}/`)));
+  const immutableRoutes = new Set([
+    ...[...routeSet].filter((route) => route.startsWith(`${assetMap.releaseNamespace}/`)),
+    // The manifest target is exact-release-addressed just like the asset
+    // namespace. A successor release necessarily uses a different URL, while
+    // the stable root and worker remain the uncached discovery authorities.
+    manifestTarget
+  ]);
   return Object.freeze({
     releaseId,
     contentDigest: assetMap.contentDigest,

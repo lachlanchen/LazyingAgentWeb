@@ -241,6 +241,20 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
     afterHash: ZERO_HASH,
     lastEventHash: ZERO_HASH,
   }), /unsupported field/u);
+  for (const request of [{ runId: RUN_ID }, { threadId: THREAD_ID }]) {
+    const normalized = validateAgentRequest(AGINTI_RPC_PATHS.artifactsList, request);
+    assert.deepEqual(normalized, request);
+    assert.deepEqual(
+      validateAgentRequest(AGINTI_RPC_PATHS.artifactsList, normalized),
+      request,
+      "artifact-list normalization must remain valid across the browser and BFF trust boundaries",
+    );
+  }
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.artifactsList, {}), /exactly one/u);
+  assert.throws(() => validateAgentRequest(AGINTI_RPC_PATHS.artifactsList, {
+    runId: RUN_ID,
+    threadId: THREAD_ID,
+  }), /exactly one/u);
 });
 
 test("capabilities default to Chat and enable Agent only for exact AgInTi + LocalLLM proof", () => {

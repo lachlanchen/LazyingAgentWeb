@@ -352,8 +352,8 @@ export function validateAgentRequest(pathname, value = {}) {
         invalid("exactly one of threadId or runId is required");
       }
       return Object.freeze(object.threadId === undefined
-        ? { threadId: "", runId: validateRunId(object.runId) }
-        : { threadId: validateThreadId(object.threadId), runId: "" });
+        ? { runId: validateRunId(object.runId) }
+        : { threadId: validateThreadId(object.threadId) });
     }
     case AGINTI_RPC_PATHS.artifactsGet: {
       const object = exact(value, ["artifactId"], "request");

@@ -1,5 +1,11 @@
 const PNG_SIGNATURE = Object.freeze([137, 80, 78, 71, 13, 10, 26, 10]);
 const PNG_METADATA_CHUNKS = new Set(["caBX", "eXIf", "iCCP", "iTXt", "tEXt", "zTXt"]);
+const PNG_SERVER_RENDERING_CHUNKS = new Map([
+  ["cHRM", 32],
+  ["gAMA", 4],
+  ["pHYs", 9],
+  ["sRGB", 1],
+]);
 const JPEG_METADATA_MARKERS = new Set([
   0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
   0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xfe,
@@ -19,6 +25,13 @@ const CRC32_TABLE = (() => {
 
 function fail(message) {
   throw new TypeError(message);
+}
+
+export class UnsupportedCanvasPngEncodingError extends TypeError {
+  constructor() {
+    super("the browser returned PNG ancillary data outside the upload contract");
+    this.name = "UnsupportedCanvasPngEncodingError";
+  }
 }
 
 function joinedBytes(parts, byteLength) {
@@ -51,7 +64,7 @@ function crc32(bytes, start, end) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function stripPngMetadata(bytes) {
+function stripPngMetadata(bytes, requireServerCompatiblePng) {
   if (bytes.byteLength < 45 || PNG_SIGNATURE.some((value, index) => bytes[index] !== value)) {
     fail("canonical PNG framing is invalid");
   }
@@ -62,6 +75,8 @@ function stripPngMetadata(bytes) {
   let chunks = 0;
   let stripped = false;
   let sawEnd = false;
+  let sawImageData = false;
+  const renderingChunks = new Set();
   while (offset < bytes.byteLength) {
     if (bytes.byteLength - offset < 12) fail("canonical PNG framing is truncated");
     const length = view.getUint32(offset);
@@ -79,11 +94,26 @@ function stripPngMetadata(bytes) {
     }
     if (PNG_METADATA_CHUNKS.has(type)) stripped = true;
     else {
+      if (requireServerCompatiblePng && (type.charCodeAt(0) & 0x20) !== 0) {
+        const expectedLength = PNG_SERVER_RENDERING_CHUNKS.get(type);
+        const dataOffset = offset + 8;
+        const incompatible = expectedLength === undefined
+          || renderingChunks.has(type)
+          || length !== expectedLength
+          || sawImageData
+          || (type === "sRGB" && bytes[dataOffset] > 3)
+          || (type === "gAMA" && view.getUint32(dataOffset) === 0)
+          || (type === "pHYs" && (view.getUint32(dataOffset) === 0
+            || view.getUint32(dataOffset + 4) === 0 || bytes[dataOffset + 8] > 1));
+        if (incompatible) throw new UnsupportedCanvasPngEncodingError();
+        renderingChunks.add(type);
+      }
       const part = bytes.subarray(offset, end);
       parts.push(part);
       byteLength += part.byteLength;
     }
     offset = end;
+    if (type === "IDAT") sawImageData = true;
     if (type === "IEND") sawEnd = true;
   }
   if (!sawEnd) fail("canonical PNG is incomplete");
@@ -159,10 +189,14 @@ function stripJpegMetadata(bytes) {
   return stripped ? joinedBytes(parts, byteLength) : bytes;
 }
 
-export function sanitizeVisionImageBytes(bytes, mediaType) {
+export function sanitizeVisionImageBytes(bytes, mediaType, {
+  requireServerCompatiblePng = false,
+} = {}) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > SANITIZER_BYTE_LIMIT
       || !["image/jpeg", "image/png"].includes(mediaType)) {
     fail("canonical image bytes and media type are required");
   }
-  return mediaType === "image/png" ? stripPngMetadata(bytes) : stripJpegMetadata(bytes);
+  return mediaType === "image/png"
+    ? stripPngMetadata(bytes, requireServerCompatiblePng)
+    : stripJpegMetadata(bytes);
 }

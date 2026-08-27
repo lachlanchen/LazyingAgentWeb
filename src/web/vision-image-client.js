@@ -1,4 +1,7 @@
-import { sanitizeVisionImageBytes } from "./vision-image-sanitizer.js";
+import {
+  sanitizeVisionImageBytes,
+  UnsupportedCanvasPngEncodingError,
+} from "./vision-image-sanitizer.js";
 
 export const BROWSER_VISION_IMAGE_LIMITS = Object.freeze({
   // Files are read and decoded one at a time. This covers current 48 MP phone
@@ -340,10 +343,12 @@ async function boundedCanvasEncoding(document, canvas, bitmap, mediaType, initia
   fail(errorMessage);
 }
 
-async function sanitizedCanvasResult(encoded, mediaType, expectedDimensions, byteLimit, errorMessage, operation) {
+async function sanitizedCanvasResult(encoded, mediaType, expectedDimensions, byteLimit, errorMessage, operation, {
+  requireServerCompatiblePng = false,
+} = {}) {
   const canvasBytes = new Uint8Array(await operation.race(encoded.arrayBuffer()));
   if (canvasBytes.byteLength !== encoded.size) fail("canonical image changed while it was read");
-  const bytes = sanitizeVisionImageBytes(canvasBytes, mediaType);
+  const bytes = sanitizeVisionImageBytes(canvasBytes, mediaType, { requireServerCompatiblePng });
   if (bytes.byteLength > byteLimit) fail(errorMessage);
   const dimensions = inspectVisionImageBytes(bytes, mediaType);
   if (dimensions.width !== expectedDimensions.width || dimensions.height !== expectedDimensions.height) {
@@ -485,25 +490,57 @@ export async function canonicalizeVisionImage(file, {
         }
       }
       const canvas = document.createElement("canvas");
-      const mediaType = classification.canonicalMediaType;
+      let mediaType = classification.canonicalMediaType;
       const canonicalTarget = fittedDimensions(decoded.width, decoded.height, {
         maximumEdge: BROWSER_VISION_IMAGE_LIMITS.maximumEdge,
         pixels: BROWSER_VISION_IMAGE_LIMITS.pixels,
       });
-      const canonicalEncoding = await boundedCanvasEncoding(document, canvas, drawable, mediaType, canonicalTarget, {
+      let canonicalEncoding = await boundedCanvasEncoding(document, canvas, drawable, mediaType, canonicalTarget, {
         byteLimit: BROWSER_VISION_IMAGE_LIMITS.canonicalBytes,
         maximumEdge: BROWSER_VISION_IMAGE_LIMITS.maximumEdge,
         pixels: BROWSER_VISION_IMAGE_LIMITS.pixels,
         errorMessage: "canonical image exceeds 4 MiB after safe downscaling",
       }, operation);
-      const canonical = await sanitizedCanvasResult(
-        canonicalEncoding.blob,
-        mediaType,
-        canonicalEncoding.dimensions,
-        BROWSER_VISION_IMAGE_LIMITS.canonicalBytes,
-        "canonical image exceeds 4 MiB after safe downscaling",
-        operation,
-      );
+      let canonical;
+      try {
+        canonical = await sanitizedCanvasResult(
+          canonicalEncoding.blob,
+          mediaType,
+          canonicalEncoding.dimensions,
+          BROWSER_VISION_IMAGE_LIMITS.canonicalBytes,
+          "canonical image exceeds 4 MiB after safe downscaling",
+          operation,
+          { requireServerCompatiblePng: true },
+        );
+      } catch (error) {
+        if (!(error instanceof UnsupportedCanvasPngEncodingError) || mediaType !== "image/png") throw error;
+        operation.throwIfCancelled();
+        // Unknown ancillary chunks can change PNG rendering (for example transparency),
+        // so preserve the decoded pixels through the already-bounded JPEG path instead of stripping them.
+        mediaType = "image/jpeg";
+        canonicalEncoding = await boundedCanvasEncoding(
+          document,
+          canvas,
+          drawable,
+          mediaType,
+          canonicalEncoding.dimensions,
+          {
+            byteLimit: BROWSER_VISION_IMAGE_LIMITS.canonicalBytes,
+            maximumEdge: BROWSER_VISION_IMAGE_LIMITS.maximumEdge,
+            pixels: BROWSER_VISION_IMAGE_LIMITS.pixels,
+            errorMessage: "canonical image exceeds 4 MiB after safe downscaling",
+          },
+          operation,
+        );
+        canonical = await sanitizedCanvasResult(
+          canonicalEncoding.blob,
+          mediaType,
+          canonicalEncoding.dimensions,
+          BROWSER_VISION_IMAGE_LIMITS.canonicalBytes,
+          "canonical image exceeds 4 MiB after safe downscaling",
+          operation,
+        );
+      }
       let preview = canonical;
       if (canonical.dimensions.width > BROWSER_VISION_IMAGE_LIMITS.previewMaximumEdge
           || canonical.dimensions.height > BROWSER_VISION_IMAGE_LIMITS.previewMaximumEdge

@@ -40,6 +40,11 @@ function insertPngChunk(bytes, type, data) {
   return Buffer.concat([bytes.subarray(0, iendOffset), pngChunk(type, data), bytes.subarray(iendOffset)]);
 }
 
+function insertPngChunkAfterHeader(bytes, type, data) {
+  const headerEnd = 8 + 12 + 13;
+  return Buffer.concat([bytes.subarray(0, headerEnd), pngChunk(type, data), bytes.subarray(headerEnd)]);
+}
+
 function rewritePngDimensions(bytes, width, height) {
   const result = Buffer.from(bytes);
   result.writeUInt32BE(width, 16);
@@ -128,7 +133,10 @@ function browserHarness(outputBytes, outputType, dimensions, calls) {
       const bytes = typeof outputBytes === 'function'
         ? outputBytes({ width: canvas.width, height: canvas.height, type, quality })
         : outputBytes;
-      callback(new Blob([bytes], { type: outputType }));
+      const blobType = typeof outputType === 'function'
+        ? outputType({ width: canvas.width, height: canvas.height, type, quality })
+        : outputType;
+      callback(new Blob([bytes], { type: blobType }));
     }
   };
   return {
@@ -179,6 +187,44 @@ test('canonicalizes a PNG through a metadata-stripping canvas and closes decoded
     ['toBlob', 'image/png', undefined],
     ['close']
   ]);
+});
+
+test('falls back from a Safari PNG extension outside the server contract to an accepted JPEG', async () => {
+  const source = Buffer.from(createPwaIcon(192));
+  const safariPng = insertPngChunkAfterHeader(source, 'cICP', Buffer.from([1, 13, 0, 1]));
+  assert.throws(() => validateVisionAttachmentRequest({
+    attachmentId: 'image_0000000000000001',
+    mediaType: 'image/png',
+    data: safariPng.toString('base64')
+  }), /unsupported ancillary data/u, 'the fixture reproduces the former client/server contract mismatch');
+
+  const canonicalJpeg = rewriteJpegDimensions(JPEG_BYTES, 192, 192);
+  const calls = [];
+  const harness = browserHarness(
+    ({ type }) => type === 'image/png' ? safariPng : canonicalJpeg,
+    ({ type }) => type,
+    { width: 192, height: 192 },
+    calls
+  );
+
+  const result = await canonicalizeVisionImage(file(source, 'image/png'), harness);
+  assert.deepEqual([result.mediaType, result.width, result.height], ['image/jpeg', 192, 192]);
+  assert.deepEqual(Buffer.from(result.bytes), canonicalJpeg);
+  assert.equal(result.previewBlob.type, 'image/jpeg');
+  assert.deepEqual(Buffer.from(await result.previewBlob.arrayBuffer()), canonicalJpeg);
+  assert.deepEqual(validateVisionAttachmentRequest({
+    attachmentId: result.attachmentId,
+    mediaType: result.mediaType,
+    data: Buffer.from(result.bytes).toString('base64')
+  }).content, canonicalJpeg);
+  assert.deepEqual(calls.filter(([name]) => name === 'toBlob'), [
+    ['toBlob', 'image/png', undefined],
+    ['toBlob', 'image/jpeg', 0.9]
+  ]);
+  assert.deepEqual(calls.filter(([name]) => name === 'fillRect'), [
+    ['fillRect', 0, 0, 192, 192]
+  ], 'the JPEG fallback composites transparency onto white');
+  assert.deepEqual(calls.at(-1), ['close']);
 });
 
 test('canonicalizes JPEG onto white and preserves a required bounded decoded geometry', async () => {

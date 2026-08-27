@@ -109,7 +109,7 @@ const IDS = [
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
   "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
-  "activity-panel", "run-state", "agent-plan",
+  "activity-panel", "activity-disclosure", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
@@ -830,6 +830,7 @@ test("a new Agent send clears completed activity before dispatch confirmation", 
   artifacts.hidden = false;
   browser.document.getElementById("run-state").textContent = "Completed";
   browser.document.getElementById("workspace").dataset.status = "completed";
+  browser.document.getElementById("activity-disclosure").open = true;
   browser.document.getElementById("message-input").value = "Start a clean current activity view";
 
   const sending = browser.app.submitMessage({ preventDefault() {} });
@@ -838,12 +839,51 @@ test("a new Agent send clears completed activity before dispatch confirmation", 
   assert.equal(timeline.children.length, 0);
   assert.equal(artifacts.children.length, 0);
   assert.equal(artifacts.hidden, true);
+  assert.equal(browser.document.getElementById("activity-disclosure").open, false);
   assert.equal(browser.document.getElementById("run-state").textContent, "Starting");
   assert.equal(browser.document.getElementById("workspace").dataset.status, "running");
 
   accepted.resolve({ run: run() });
   await sending;
   assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+});
+
+test("replacing a conversation restores compact activity and follows the first new Agent turn", async () => {
+  const events = await verifiedEvents([
+    ["output.delta", { text: "New conversation answer" }],
+    ["run.completed", {}],
+  ]);
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread({ title: "Replacement conversation" }) }; },
+    async startRun() { return { run: run() }; },
+    async *streamRunEvents() {
+      for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  const scroll = browser.document.getElementById("chat-scroll");
+  await browser.app.initialize();
+  const oldMessage = browser.document.createElement("article");
+  oldMessage.textContent = "Old conversation content";
+  browser.document.getElementById("messages").appendChild(oldMessage);
+  scroll.scrollHeight = 1_200;
+  scroll.clientHeight = 300;
+  scroll.scrollTop = 100;
+  scroll.dispatch("scroll");
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, false);
+  browser.document.getElementById("activity-disclosure").open = true;
+
+  browser.document.getElementById("new-thread").dispatch("click");
+  assert.equal(browser.document.getElementById("activity-disclosure").open, false);
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, true);
+
+  scroll.scrollHeight = 1_800;
+  browser.document.getElementById("message-input").value = "Start at the newest message";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(scroll.scrollTop, 1_800);
+  assert.equal(browser.document.getElementById("go-to-bottom").hidden, true);
+  assert.match(browser.document.getElementById("messages").textContent, /New conversation answer/u);
 });
 
 test("negotiated Agent Search binds one immutable selection to one start mutation", async () => {

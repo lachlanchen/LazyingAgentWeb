@@ -1056,7 +1056,7 @@ function elementMap(document) {
     "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
     "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
     "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
-    "activity-panel", "run-state", "agent-plan",
+    "activity-panel", "activity-disclosure", "run-state", "agent-plan",
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
     "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
@@ -2138,6 +2138,7 @@ export function createBrowserApp({
     elements.agent_timeline.replaceChildren();
     elements.agent_artifacts.replaceChildren();
     elements.agent_artifacts.hidden = true;
+    elements.activity_disclosure.open = false;
     elements.context_indicator.hidden = true;
     elements.welcome.hidden = false;
     elements.run_state.textContent = "Idle";
@@ -2145,6 +2146,7 @@ export function createBrowserApp({
     elements.stop_run.hidden = true;
     elements.resume_run.hidden = true;
     elements.go_to_bottom.hidden = true;
+    state.followNewest = true;
     state.presentation = null;
     state.assistantNode = null;
     state.agentRunMessages.clear();
@@ -2159,6 +2161,7 @@ export function createBrowserApp({
     elements.agent_timeline.replaceChildren();
     elements.agent_artifacts.replaceChildren();
     elements.agent_artifacts.hidden = true;
+    elements.activity_disclosure.open = false;
     elements.run_state.textContent = "Starting";
     elements.workspace.dataset.status = "running";
     elements.stop_run.hidden = true;

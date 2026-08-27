@@ -173,7 +173,7 @@ const APP_IDS = [
   "connection-state", "mode-switch", "agent-mode", "chat-mode", "theme-picker", "offline-banner",
   "update-banner", "apply-update", "defer-update", "context-indicator", "context-indicator-text", "welcome",
   "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
-  "activity-panel", "run-state", "agent-plan",
+  "activity-panel", "activity-disclosure", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",

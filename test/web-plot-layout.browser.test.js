@@ -16,7 +16,10 @@ const CHROME = [
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
 ].find((candidate) => typeof candidate === "string" && existsSync(candidate)) ?? null;
-const CHROME_STARTUP_TIMEOUT_MS = 20_000;
+// GitHub's Node 24 runner can announce the DevTools socket only after a slow
+// cold Chrome/DBus startup. Keep the probe bounded, but leave enough time for
+// the announced loopback endpoint to begin accepting requests.
+const CHROME_STARTUP_TIMEOUT_MS = 45_000;
 const CHROME_DIAGNOSTIC_LIMIT = 4_096;
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -388,7 +391,7 @@ const GEOMETRY_EXPRESSION = `(() => {
 
 test("real Chrome keeps adversarial Agent plot ticks readable and contained at desktop and iPhone widths", {
   skip: CHROME === null ? "Chrome is unavailable" : false,
-  timeout: 45_000,
+  timeout: 75_000,
 }, async () => {
   const [safeRendering, protocol, webRelease] = await Promise.all([
     readFile(new URL("../src/web/safe-rendering.js", import.meta.url)),

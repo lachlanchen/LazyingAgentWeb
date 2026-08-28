@@ -6457,6 +6457,34 @@ test("Markdown renders text-only DOM and asks pinned KaTeX for MathML with trust
   assert.match(target.textContent, /<script>alert\(1\)<\/script>/u);
 });
 
+test("Markdown preserves adjacent assistant lines while retaining hard-break rendering", () => {
+  const document = new DomDocument();
+  const renderer = createSafeRenderer({ document });
+  const lineLayout = (markdown) => {
+    const target = document.createElement("section");
+    renderer.renderMarkdown(target, markdown);
+    const paragraph = target.walk().find((node) => node.tagName === "p");
+    const lines = [""];
+    let breaks = 0;
+    for (const node of paragraph.children) {
+      if (node.tagName === "br") {
+        breaks += 1;
+        lines.push("");
+      } else lines[lines.length - 1] += node.textContent;
+    }
+    return { breaks, lines };
+  };
+
+  assert.deepEqual(lineLayout("CHECKSUM: 783\nSAME_THREAD: yes"), {
+    breaks: 1,
+    lines: ["CHECKSUM: 783", "SAME_THREAD: yes"],
+  });
+  assert.deepEqual(lineLayout("First  \nSecond"), {
+    breaks: 1,
+    lines: ["First  ", "Second"],
+  });
+});
+
 test("plot, table, Markdown, and source artifacts render declaratively while active content fails closed", () => {
   const document = new DomDocument();
   const renderer = createSafeRenderer({ document });

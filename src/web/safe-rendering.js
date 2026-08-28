@@ -301,7 +301,7 @@ function appendInline(runtime, parent, source, budget, depth = 0) {
       continue;
     }
     if (source[cursor] === "\n") {
-      parent.appendChild(source.slice(Math.max(0, cursor - 2), cursor) === "  " ? createNode(document, "br") : document.createTextNode(" "));
+      parent.appendChild(createNode(document, "br"));
       cursor += 1;
       continue;
     }

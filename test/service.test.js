@@ -248,6 +248,9 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
 
   const options = harness.captured.serverOptions;
   assert.equal(options.agintiAdapter, service.agintiAdapter);
+  assert.equal(options.rolloutAdmission, service.rolloutAdmission);
+  assert.equal(options.rolloutAdmissionSocketPath, '/run/lazying-agent-web/admission.sock');
+  assert.equal(service.rolloutAdmissionMarker, join(state.root, 'state', 'cloud', 'rollout-admission.closed.json'));
   assert.ok(service.agintiAdapter);
   assert.equal(options.directChatStore, service.directChatStore);
   assert.equal(options.directChatContext, service.directChatContext);
@@ -294,6 +297,76 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   ]);
   await service.shutdown();
   await service.shutdown();
+  assert.equal(harness.fakeServer.shutdownCalls, 1);
+});
+
+test('shutdown while admission control starts prevents a later HTTP listen', async (t) => {
+  const state = serviceFixture(t);
+  const harness = serviceHarness(state.config);
+  let releaseAdmissionStart;
+  harness.fakeServer.startAdmissionControl = () => new Promise((resolve) => {
+    releaseAdmissionStart = resolve;
+  });
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: harness.fetchImpl,
+    serverFactory: harness.serverFactory
+  });
+
+  const starting = service.start();
+  await Promise.resolve();
+  assert.equal(typeof releaseAdmissionStart, 'function');
+  const stopping = service.shutdown();
+  releaseAdmissionStart();
+  const [startResult, stopResult] = await Promise.allSettled([starting, stopping]);
+
+  assert.equal(startResult.status, 'rejected');
+  assert.match(startResult.reason.message, /stopped during startup/iu);
+  assert.equal(stopResult.status, 'fulfilled');
+  assert.deepEqual(harness.fakeServer.listenCalls, []);
+  assert.equal(harness.fakeServer.listening, false);
+  assert.equal(harness.fakeServer.shutdownCalls, 1);
+});
+
+test('shutdown while HTTP bind is pending rejects start and prevents a late listener', async (t) => {
+  const state = serviceFixture(t);
+  const harness = serviceHarness(state.config);
+  let completeBind;
+  let bindCancelled = false;
+  harness.fakeServer.listen = function pendingListen(port, host, callback) {
+    this.listenCalls.push({ port, host });
+    this.port = port;
+    this.host = host;
+    completeBind = () => {
+      if (bindCancelled) return;
+      this.listening = true;
+      callback();
+    };
+    return this;
+  };
+  harness.fakeServer.shutdown = async function cancelPendingBind() {
+    this.shutdownCalls += 1;
+    bindCancelled = true;
+    this.listening = false;
+    this.emit('close');
+  };
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: harness.fetchImpl,
+    serverFactory: harness.serverFactory
+  });
+
+  const starting = service.start();
+  assert.equal(typeof completeBind, 'function');
+  const stopping = service.shutdown();
+  completeBind();
+  const [startResult, stopResult] = await Promise.allSettled([starting, stopping]);
+
+  assert.equal(startResult.status, 'rejected');
+  assert.match(startResult.reason.message, /stopped during HTTP startup/iu);
+  assert.equal(stopResult.status, 'fulfilled');
+  assert.equal(harness.fakeServer.listening, false);
+  assert.equal(harness.fakeServer.address(), null);
   assert.equal(harness.fakeServer.shutdownCalls, 1);
 });
 
@@ -365,7 +438,7 @@ test('operator health keeps storage and AgInTi visible when LocalLLM credentials
   assert.equal(JSON.stringify(report).includes(state.credentialsDirectory), false);
 });
 
-test('restarts over the same private databases with idempotent account provisioning', async (t) => {
+test('restarts over the same private databases with idempotent provisioning and closed admission', async (t) => {
   const state = serviceFixture(t);
   const firstHarness = serviceHarness(state.config);
   const first = await createStandaloneService({
@@ -374,6 +447,13 @@ test('restarts over the same private databases with idempotent account provision
     serverFactory: firstHarness.serverFactory
   });
   const firstAccount = first.account;
+  const operationId = 'service-rollout-operation-0001';
+  const closed = first.rolloutAdmission.close(operationId);
+  await first.rolloutAdmission.drain({
+    operationId,
+    expectedGeneration: closed.generation
+  });
+  assert.equal(existsSync(first.rolloutAdmissionMarker), true);
   await first.shutdown();
 
   const reloaded = loadServiceConfig({
@@ -390,6 +470,16 @@ test('restarts over the same private databases with idempotent account provision
     assert.deepEqual(second.account, firstAccount);
     assert.equal(second.controlStore.getAccount(state.config.account.principalId).issuer, 'local-login');
     assert.equal(second.controlStore.getAccount(state.config.account.principalId).subject, 'lachlanchen');
+    assert.deepEqual(second.rolloutAdmission.snapshot(), {
+      state: 'closed',
+      active: 0,
+      drained: false,
+      operationId,
+      generation: closed.generation
+    });
+    await second.rolloutAdmission.drain({ operationId, expectedGeneration: closed.generation });
+    second.rolloutAdmission.reopen({ operationId, expectedGeneration: closed.generation });
+    assert.equal(existsSync(second.rolloutAdmissionMarker), false);
   } finally {
     await second.shutdown();
   }

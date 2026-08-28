@@ -22,6 +22,9 @@ const SSE_BLOCK_LIMIT = 32 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const VISION_MUTATION_TIMEOUT_MS = 270_000;
 const DEFAULT_STREAM_TIMEOUT_MS = 45_000;
+const ROLLOUT_IN_PROGRESS_CODE = "rollout_in_progress";
+const ROLLOUT_RETRY_DEFAULT_SECONDS = 1;
+const ROLLOUT_RETRY_MAXIMUM_SECONDS = 5;
 const PREPARED_RUN_BODIES = new WeakMap();
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._~-]{16,160}$/u;
@@ -707,6 +710,17 @@ function mediaType(response) {
   return String(response.headers?.get?.("content-type") ?? "").split(";", 1)[0].trim().toLowerCase();
 }
 
+function rolloutRetryAfterMs(response) {
+  const value = response.headers?.get?.("retry-after");
+  const seconds = typeof value === "string" && /^\d+$/u.test(value)
+    ? Number(value)
+    : ROLLOUT_RETRY_DEFAULT_SECONDS;
+  const bounded = Number.isSafeInteger(seconds)
+    ? Math.min(ROLLOUT_RETRY_MAXIMUM_SECONDS, Math.max(1, seconds))
+    : ROLLOUT_RETRY_DEFAULT_SECONDS;
+  return bounded * 1_000;
+}
+
 function requireResponse(value) {
   if (value === null || typeof value !== "object" || !Number.isSafeInteger(value.status)
       || value.status < 100 || value.status > 599 || typeof value.headers?.get !== "function") {
@@ -835,6 +849,9 @@ async function responseFailure(response) {
     status,
     retryable: ["request_aborted", "request_error"].includes(code)
       || [408, 425, 429].includes(status) || status >= 500,
+    ...(status === 503 && code === ROLLOUT_IN_PROGRESS_CODE
+      ? { retryAfterMs: rolloutRetryAfterMs(response) }
+      : {}),
   });
 }
 

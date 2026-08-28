@@ -159,12 +159,13 @@ function event({ seq, type, payload, previousHash, runId = RUN_ID, threadId = TH
   return { ...envelope, hash: digest(canonicalJson(envelope)), ...extra };
 }
 
-function jsonResponse(value, { status = 200, releaseId = RELEASE } = {}) {
+function jsonResponse(value, { status = 200, releaseId = RELEASE, retryAfter } = {}) {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "x-lazying-agent-release": releaseId,
+      ...(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
     },
   });
 }
@@ -788,6 +789,53 @@ test("pinned Agent transport exposes an exact newer release without retrying", a
       && error.code === "client_release_mismatch"
       && error.serverRelease === NEXT_RELEASE
       && error.retryable === false,
+  );
+});
+
+test("Agent transport preserves only the exact rollout code and a bounded delta-seconds retry", async (t) => {
+  for (const candidate of [
+    { name: "missing", value: undefined, expected: 1_000 },
+    { name: "zero", value: "0", expected: 1_000 },
+    { name: "exact", value: "4", expected: 4_000 },
+    { name: "clamped", value: "12", expected: 5_000 },
+    { name: "non-delta", value: "tomorrow", expected: 1_000 },
+  ]) {
+    await t.test(candidate.name, async () => {
+      const client = new AgintiBrowserClient({
+        transportEndpoint: "/api/edge",
+        baseUrl: "https://llm.lazying.art/",
+        csrfToken: "csrf-token-value-long-enough",
+        fetchImpl: async () => jsonResponse({ error: { code: "rollout_in_progress" } }, {
+          status: 503,
+          retryAfter: candidate.value,
+        }),
+      });
+      await assert.rejects(
+        () => client.startRun(THREAD_ID, "Wait for the rollout", {
+          idempotency: "rollout_agent_mutation_0001",
+        }),
+        (error) => error instanceof AgintiTransportError
+          && error.code === "rollout_in_progress"
+          && error.status === 503
+          && error.retryable === true
+          && error.retryAfterMs === candidate.expected,
+      );
+    });
+  }
+
+  const nearMiss = new AgintiBrowserClient({
+    transportEndpoint: "/api/edge",
+    baseUrl: "https://llm.lazying.art/",
+    fetchImpl: async () => jsonResponse({ error: { code: "rollout_in_progress_extra" } }, {
+      status: 503,
+      retryAfter: "5",
+    }),
+  });
+  await assert.rejects(
+    () => nearMiss.listThreads(),
+    (error) => error instanceof AgintiTransportError
+      && error.code === "AGINTI_REQUEST_FAILED"
+      && !Object.hasOwn(error, "retryAfterMs"),
   );
 });
 

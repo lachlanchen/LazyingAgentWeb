@@ -112,6 +112,7 @@ function jsonResponse(value, {
   contentType = "application/json; charset=utf-8",
   cacheControl = "no-store",
   releaseId,
+  retryAfter,
 } = {}) {
   return new Response(JSON.stringify(value), {
     status,
@@ -119,6 +120,7 @@ function jsonResponse(value, {
       "content-type": contentType,
       "cache-control": cacheControl,
       ...(releaseId === undefined ? {} : { "x-lazying-agent-release": releaseId }),
+      ...(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
     },
   });
 }
@@ -599,6 +601,35 @@ test("server body-abort envelopes remain retryable for the app's exact idempoten
         && error.status === 400
         && error.retryable === true,
     );
+  }
+});
+
+test("rollout responses preserve their exact code and a defaulted or clamped delta-seconds retry", async (t) => {
+  for (const candidate of [
+    { name: "missing", value: undefined, expected: 1_000 },
+    { name: "zero", value: "0", expected: 1_000 },
+    { name: "exact", value: "3", expected: 3_000 },
+    { name: "clamped", value: "99", expected: 5_000 },
+    { name: "non-delta", value: "Wed, 21 Oct 2026 07:28:00 GMT", expected: 1_000 },
+  ]) {
+    await t.test(candidate.name, async () => {
+      const client = new DirectChatBrowserClient(clientOptions({
+        fetchImpl: async () => jsonResponse({
+          error: {
+            code: "rollout_in_progress",
+            message: "New work is temporarily paused. Retry shortly.",
+          },
+        }, { status: 503, retryAfter: candidate.value }),
+      }));
+      await assert.rejects(
+        () => client.listThreads(),
+        (error) => error instanceof DirectChatTransportError
+          && error.code === "rollout_in_progress"
+          && error.status === 503
+          && error.retryable === true
+          && error.retryAfterMs === candidate.expected,
+      );
+    });
   }
 });
 

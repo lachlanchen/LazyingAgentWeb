@@ -44,10 +44,12 @@ async function reserveLoopbackPort() {
 
 function fixture(root, servicePort, localLlmPort) {
   const credentialsDirectory = join(root, 'credentials');
+  const runtimeDirectory = join(root, 'run');
   const configPath = join(root, 'service.json');
   const cloudIndexDatabase = join(root, 'state', 'cloud', 'index.sqlite');
   const directChatDatabase = join(root, 'state', 'chat', 'chat.sqlite');
   mkdirSync(credentialsDirectory, { mode: 0o700 });
+  mkdirSync(runtimeDirectory, { mode: 0o700 });
   writeFileSync(join(credentialsDirectory, 'login-password-hash'), PASSWORD_RECORD, { mode: 0o400 });
   writeFileSync(join(credentialsDirectory, 'localllm-token'), LOCAL_TOKEN, { mode: 0o400 });
   const publicOrigin = `https://127.0.0.1:${servicePort}`;
@@ -83,6 +85,7 @@ function fixture(root, servicePort, localLlmPort) {
   return {
     configPath,
     credentialsDirectory,
+    runtimeDirectory,
     cloudIndexDatabase,
     directChatDatabase,
     publicOrigin,
@@ -96,6 +99,7 @@ function startCli(state) {
     cwd: REPOSITORY_ROOT,
     env: {
       CREDENTIALS_DIRECTORY: state.credentialsDirectory,
+      RUNTIME_DIRECTORY: state.runtimeDirectory,
       LANG: 'C',
       LC_ALL: 'C'
     },

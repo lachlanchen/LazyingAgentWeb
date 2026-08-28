@@ -12,6 +12,7 @@ import { DirectChatContextCoordinator } from '../src/chat-context.js';
 import { createAgintiAgentAdapter } from '../src/aginti-adapter.js';
 import { createCloudServer, resolveTrustedClientAddress } from '../src/cloud-server.js';
 import { CLIENT_RELEASE_HEADER_NAME, CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
+import { RolloutAdmissionLatch } from '../src/rollout-admission.js';
 import { CloudIndexStore } from '../src/store.js';
 import { canonicalJson } from '../src/web/aginti-protocol.js';
 import { createStandaloneAssetMap } from '../src/web/asset-map.js';
@@ -365,6 +366,40 @@ async function rawFramedRequest(baseUrl, request) {
   });
 }
 
+async function postHeadersWithoutBody(baseUrl, pathname, headers) {
+  const target = new URL(baseUrl);
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest({
+      host: target.hostname,
+      port: target.port,
+      path: pathname,
+      method: 'POST',
+      headers
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.once('end', () => {
+        clearTimeout(timer);
+        resolve({
+          status: response.statusCode,
+          headers: response.headers,
+          body: Buffer.concat(chunks).toString('utf8')
+        });
+      });
+    });
+    const timer = setTimeout(() => {
+      request.destroy();
+      reject(new Error('headers-only POST did not receive an early response'));
+    }, 1_000);
+    timer.unref?.();
+    request.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    request.flushHeaders();
+  });
+}
+
 function assertNoOwnerIdentity(value) {
   const source = typeof value === 'string' ? value : JSON.stringify(value);
   assert.doesNotMatch(source, /"accountId"/u);
@@ -428,6 +463,172 @@ test('refuses a Direct Chat adapter without deletion authority before listening'
     () => createCloudServer({ ...state.options, directChatStore: incomplete }),
     /deleteThread\(\)/u
   );
+});
+
+test('shutdown in the HTTP bind window cancels listen before it can become live', async (t) => {
+  const state = testState(t);
+  const port = await reserveLoopbackPort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const server = createCloudServer({
+    ...state.options,
+    publicOrigin: publicOriginFor(baseUrl)
+  });
+  t.after(async () => {
+    if (!server.listening) return;
+    await new Promise((resolve) => server.close(() => resolve()));
+  });
+  let listenCallback = false;
+
+  server.listen(port, '127.0.0.1', () => { listenCallback = true; });
+  assert.equal(server.listening, false, 'Node has not completed the asynchronous bind yet');
+  await server.shutdown();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(listenCallback, false);
+  assert.equal(server.listening, false);
+  assert.equal(server.address(), null);
+});
+
+test('shutdown observes HTTP failure while deferred job and control cleanup settle', async (t) => {
+  const state = testState(t, {
+    connector: { generate() { throw new Error('connector must not run after shutdown'); } },
+    limits: { jobTimeoutMs: 5_000 }
+  });
+  const context = state.options.directChatContext;
+  let enterAssemble;
+  const assembleEntered = new Promise((resolve) => { enterAssemble = resolve; });
+  let releaseAssemble;
+  const assembleGate = new Promise((resolve) => { releaseAssemble = resolve; });
+  const deferredContext = Object.freeze({
+    prepareForTurn: context.prepareForTurn.bind(context),
+    async assemble(input) {
+      enterAssemble();
+      await assembleGate;
+      return context.assemble(input);
+    }
+  });
+  const { server, baseUrl } = await state.start({
+    directChatContext: deferredContext,
+    rolloutAdmissionSocketPath: join(state.root, 'runtime', 'admission.sock')
+  });
+  await server.startAdmissionControl();
+  const auth = await login(baseUrl);
+  await post(baseUrl, '/api/chat/threads/create', {
+    threadId: 'chat-shutdown-failures', title: ''
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'create-chat-shutdown-failures-01'
+  });
+  const started = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-shutdown-failures',
+    messageId: 'message-shutdown-failures-user',
+    generationId: 'generation-shutdown-failures',
+    assistantMessageId: 'message-shutdown-failures-assistant',
+    content: 'Hold context assembly during shutdown.',
+    expectedRevision: 0,
+    expectedHash: null
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-chat-shutdown-failures-01'
+  });
+  assert.equal(started.status, 202);
+  await assembleEntered;
+
+  const httpFailure = Object.assign(new Error('synthetic HTTP close failure'), {
+    code: 'TEST_HTTP_CLOSE_FAILED'
+  });
+  const controlFailure = Object.assign(new Error('synthetic control close failure'), {
+    code: 'TEST_CONTROL_CLOSE_FAILED'
+  });
+  const originalHttpClose = server.close.bind(server);
+  let finishHttpClose;
+  const httpCloseFinished = new Promise((resolve) => { finishHttpClose = resolve; });
+  server.close = (callback) => originalHttpClose(() => {
+    finishHttpClose();
+    callback(httpFailure);
+  });
+
+  const controlServer = server.admissionControl.server;
+  const originalControlClose = controlServer.close.bind(controlServer);
+  let enterControlClose;
+  const controlCloseEntered = new Promise((resolve) => { enterControlClose = resolve; });
+  let releaseControlClose;
+  let controlCloseReleased = false;
+  controlServer.close = (callback) => {
+    enterControlClose();
+    releaseControlClose = () => {
+      if (controlCloseReleased) return;
+      controlCloseReleased = true;
+      originalControlClose(() => callback(controlFailure));
+    };
+    return controlServer;
+  };
+
+  const unhandled = [];
+  const onUnhandledRejection = (error) => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandledRejection);
+  t.after(() => process.off('unhandledRejection', onUnhandledRejection));
+
+  let outcome = 'pending';
+  const shutdown = server.shutdown();
+  void shutdown.then(
+    () => { outcome = 'fulfilled'; },
+    () => { outcome = 'rejected'; }
+  );
+  await Promise.all([httpCloseFinished, controlCloseEntered]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(outcome, 'pending', 'HTTP failure must not bypass either deferred cleanup');
+  assert.deepEqual(unhandled, []);
+
+  releaseAssemble();
+  const handler = server.listeners('request')[0];
+  await waitFor(() => handler.activeDirectChatJobs === 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(outcome, 'pending', 'job drain must not bypass deferred control cleanup');
+  assert.deepEqual(unhandled, []);
+
+  releaseControlClose();
+  await assert.rejects(shutdown, (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, 'cloud server shutdown failed');
+    assert.deepEqual(error.errors, [httpFailure, controlFailure]);
+    return true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(outcome, 'rejected');
+  assert.deepEqual(unhandled, []);
+  assert.equal(server.listening, false);
+  assert.equal(controlServer.listening, false);
+});
+
+test('external HTTP close observes admission cleanup rejection', async (t) => {
+  const state = testState(t);
+  const { server } = await state.start({
+    rolloutAdmissionSocketPath: join(state.root, 'external-close', 'admission.sock')
+  });
+  await server.startAdmissionControl();
+  const controlServer = server.admissionControl.server;
+  const originalControlClose = controlServer.close.bind(controlServer);
+  const controlFailure = Object.assign(new Error('synthetic external-close cleanup failure'), {
+    code: 'TEST_EXTERNAL_CONTROL_CLOSE_FAILED'
+  });
+  controlServer.close = (callback) => originalControlClose(() => callback(controlFailure));
+  const unhandled = [];
+  const onUnhandledRejection = (error) => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandledRejection);
+  t.after(() => process.off('unhandledRejection', onUnhandledRejection));
+
+  await new Promise((resolve, reject) => server.close((error) => (
+    error ? reject(error) : resolve()
+  )));
+  await waitFor(() => !controlServer.listening);
+  await new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
+
+  assert.deepEqual(unhandled, []);
+  assert.equal(server.listening, false);
+  assert.equal(controlServer.listening, false);
 });
 
 test('serves stable update metadata with HEAD parity and immutable caching only for release-addressed public assets', async (t) => {
@@ -1554,6 +1755,262 @@ test('logout revokes only its browser session and reports native Agent cancellat
   const restored = await post(baseUrl, '/api/session', {}, { cookie: auth.cookie, csrf: auth.csrf });
   assert.equal(restored.status, 200);
   assert.deepEqual(await restored.json(), { authenticated: false });
+});
+
+test('rejects Direct Chat before a large body, suppresses closed recovery, and reopens exactly', async (t) => {
+  let connectorDispatches = 0;
+  const connector = {
+    async generate() {
+      connectorDispatches += 1;
+      return (async function* () { yield 'Admission reopened'; })();
+    }
+  };
+  const rolloutAdmission = new RolloutAdmissionLatch();
+  const state = testState(t, {
+    connector,
+    limits: { sseLifetimeMs: 100, ssePollMs: 5 }
+  });
+  const { baseUrl } = await state.start({ rolloutAdmission });
+  const auth = await login(baseUrl);
+  for (const threadId of ['chat-rollout-pending', 'chat-rollout-reopen']) {
+    assert.equal((await post(baseUrl, '/api/chat/threads/create', { threadId, title: '' }, {
+      cookie: auth.cookie,
+      csrf: auth.csrf,
+      idempotency: `create-${threadId}-0001`
+    })).status, 201);
+  }
+
+  const operationId = 'agent-web-rollout-00000001';
+  const closed = rolloutAdmission.close(operationId);
+  await rolloutAdmission.drain({ operationId, expectedGeneration: closed.generation });
+
+  const early = await postHeadersWithoutBody(baseUrl, '/api/chat/runs/start', fetchMetadata(baseUrl, {
+    'content-type': 'application/json',
+    'content-length': String(8 * 1024 * 1024),
+    cookie: auth.cookie,
+    'x-csrf-token': auth.csrf,
+    'idempotency-key': 'rollout-large-vision-0001'
+  }));
+  assert.equal(early.status, 503);
+  assert.deepEqual(JSON.parse(early.body), {
+    error: {
+      code: 'rollout_in_progress',
+      message: 'New work is temporarily paused. Retry shortly.'
+    }
+  });
+  assert.equal(early.headers['cache-control'], 'no-store');
+  assert.equal(early.headers.pragma, 'no-cache');
+  assert.equal(early.headers.expires, '0');
+  assert.equal(early.headers['retry-after'], '1');
+  assert.equal(early.headers[CLIENT_RELEASE_HEADER_NAME], RELEASE_ID);
+  assert.equal(early.headers.connection, 'close');
+  assert.equal(connectorDispatches, 0);
+
+  state.directChatStore.startTurn({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-rollout-pending',
+    messageId: 'message-rollout-pending-user',
+    generationId: 'generation-rollout-pending',
+    assistantMessageId: 'message-rollout-pending-assistant',
+    content: 'Persisted before a process recovery scan.',
+    expectedRevision: 0,
+    expectedHash: null,
+    idempotencyKey: 'manual-rollout-pending-0001'
+  });
+  const status = await post(baseUrl, '/api/chat/runs/status', {
+    threadId: 'chat-rollout-pending', generationId: 'generation-rollout-pending'
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(status.status, 200);
+  assert.equal((await status.json()).generation.status, 'in_progress');
+  assert.equal(connectorDispatches, 0, 'status observation cannot redispatch while closed');
+
+  const events = await post(baseUrl, '/api/chat/runs/events', {
+    threadId: 'chat-rollout-pending',
+    generationId: 'generation-rollout-pending',
+    afterSequence: 0
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(events.status, 200);
+  assert.match(await events.text(), /event: reconnect/u);
+  assert.equal(connectorDispatches, 0, 'event observation cannot redispatch while closed');
+
+  const cancelled = await post(baseUrl, '/api/chat/runs/cancel', {
+    threadId: 'chat-rollout-pending', generationId: 'generation-rollout-pending'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'cancel-rollout-pending-0001'
+  });
+  assert.equal(cancelled.status, 200, 'cancellation remains responsive while admission is closed');
+
+  rolloutAdmission.reopen({ operationId, expectedGeneration: closed.generation });
+  const reopened = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-rollout-reopen',
+    messageId: 'message-rollout-reopen-user',
+    generationId: 'generation-rollout-reopen',
+    assistantMessageId: 'message-rollout-reopen-assistant',
+    content: 'Run after exact reopen.',
+    expectedRevision: 0,
+    expectedHash: null
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-rollout-reopen-0001'
+  });
+  assert.equal(reopened.status, 202);
+  await waitFor(() => state.directChatStore.getGeneration({
+    accountId: PRINCIPAL_ID,
+    threadId: 'chat-rollout-reopen',
+    generationId: 'generation-rollout-reopen'
+  })?.status === 'completed');
+  assert.equal(connectorDispatches, 1);
+});
+
+test('drains a pre-close Direct Chat generation while keeping cancellation responsive', async (t) => {
+  let entered = false;
+  const connector = {
+    async generate({ signal }) {
+      entered = true;
+      return (async function* () {
+        yield 'Working';
+        await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      })();
+    }
+  };
+  const rolloutAdmission = new RolloutAdmissionLatch();
+  const state = testState(t, { connector });
+  const { baseUrl } = await state.start({ rolloutAdmission });
+  const auth = await login(baseUrl);
+  for (const threadId of ['chat-rollout-active', 'chat-rollout-rejected']) {
+    await post(baseUrl, '/api/chat/threads/create', { threadId, title: '' }, {
+      cookie: auth.cookie,
+      csrf: auth.csrf,
+      idempotency: `create-${threadId}-0001`
+    });
+  }
+  const started = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-rollout-active',
+    messageId: 'message-rollout-active-user',
+    generationId: 'generation-rollout-active',
+    assistantMessageId: 'message-rollout-active-assistant',
+    content: 'Keep the rollout drain active.',
+    expectedRevision: 0,
+    expectedHash: null
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-rollout-active-0001'
+  });
+  assert.equal(started.status, 202);
+  await waitFor(() => entered);
+
+  const operationId = 'agent-web-rollout-00000002';
+  const closed = rolloutAdmission.close(operationId);
+  assert.equal(closed.active, 1, 'the background generation owns the surviving child admission');
+  let drained = false;
+  const drain = rolloutAdmission.drain({
+    operationId,
+    expectedGeneration: closed.generation
+  }).then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(drained, false);
+
+  const rejected = await post(baseUrl, '/api/chat/runs/start', {
+    threadId: 'chat-rollout-rejected',
+    messageId: 'message-rollout-rejected-user',
+    generationId: 'generation-rollout-rejected',
+    assistantMessageId: 'message-rollout-rejected-assistant',
+    content: 'This must not cross the close point.',
+    expectedRevision: 0,
+    expectedHash: null
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'start-rollout-rejected-0001'
+  });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).error.code, 'rollout_in_progress');
+
+  const cancelled = await post(baseUrl, '/api/chat/runs/cancel', {
+    threadId: 'chat-rollout-active', generationId: 'generation-rollout-active'
+  }, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'cancel-rollout-active-0001'
+  });
+  assert.equal(cancelled.status, 200);
+  await drain;
+  assert.equal(drained, true);
+  assert.equal(rolloutAdmission.snapshot().active, 0);
+  assert.equal(rolloutAdmission.snapshot().state, 'closed');
+});
+
+test('gates only Agent start and resume while status and cancellation stay responsive', async (t) => {
+  const threadId = 'thr_12345678-1234-4123-8123-123456789abc';
+  const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
+  const resumedRunId = 'run_11111111-2222-4333-8444-555555555555';
+  const calls = [];
+  const runResponse = (path, input) => ({
+    schemaVersion: '1',
+    run: {
+      id: path === '/agent/v1/runs/resume' ? resumedRunId : runId,
+      threadId,
+      previousRunId: path === '/agent/v1/runs/resume' ? input.runId : null,
+      status: 'starting',
+      createdAt: '2026-08-29T00:00:00.000Z',
+      startedAt: null,
+      completedAt: null,
+      cancelRequestedAt: null,
+      output: '',
+      error: null,
+      authority: { kind: 'aginti', snapshotHash: null, runtimeRevision: null, contextDigest: null },
+      eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: '0'.repeat(64), prunedThroughSeq: 0 }
+    }
+  });
+  const adapter = {
+    capabilities() { throw new Error('not used'); },
+    async rpc(path, input) {
+      calls.push(path);
+      return runResponse(path, input);
+    }
+  };
+  const rolloutAdmission = new RolloutAdmissionLatch();
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start({ rolloutAdmission });
+  const auth = await login(baseUrl);
+  const operationId = 'agent-web-rollout-00000003';
+  const closed = rolloutAdmission.close(operationId);
+  await rolloutAdmission.drain({ operationId, expectedGeneration: closed.generation });
+
+  const startBody = { threadId, input: { text: 'Do not start while closed.' } };
+  const closedStart = await post(baseUrl, '/api/transport/agent/v1/runs/start', startBody, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'agent-rollout-start-0001'
+  });
+  assert.equal(closedStart.status, 503);
+  assert.equal((await closedStart.json()).error.code, 'rollout_in_progress');
+  const closedResume = await post(baseUrl, '/api/transport/agent/v1/runs/resume', { runId }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'agent-rollout-resume-0001'
+  });
+  assert.equal(closedResume.status, 503);
+  assert.equal(calls.length, 0);
+
+  const observed = await post(baseUrl, '/api/transport/agent/v1/runs/status', { runId }, {
+    cookie: auth.cookie, csrf: auth.csrf
+  });
+  assert.equal(observed.status, 200);
+  const cancelled = await post(baseUrl, '/api/transport/agent/v1/runs/cancel', { runId }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'agent-rollout-cancel-0001'
+  });
+  assert.equal(cancelled.status, 200);
+  assert.deepEqual(calls, ['/agent/v1/runs/status', '/agent/v1/runs/cancel']);
+
+  rolloutAdmission.reopen({ operationId, expectedGeneration: closed.generation });
+  assert.equal((await post(baseUrl, '/api/transport/agent/v1/runs/start', startBody, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'agent-rollout-start-0002'
+  })).status, 200);
+  assert.equal((await post(baseUrl, '/api/transport/agent/v1/runs/resume', { runId }, {
+    cookie: auth.cookie, csrf: auth.csrf, idempotency: 'agent-rollout-resume-0002'
+  })).status, 200);
+  assert.deepEqual(calls.slice(-2), ['/agent/v1/runs/start', '/agent/v1/runs/resume']);
 });
 
 test('starts a user turn and generation through the one atomic store mutation', async (t) => {

@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createBrowserApp } from "../src/web/browser-app.js";
+import { AgintiTransportError } from "../src/web/aginti-client.js";
 import { canonicalJson, verifyAgentEvent } from "../src/web/aginti-protocol.js";
 import { DirectChatTransportError } from "../src/web/direct-chat-client.js";
 
@@ -19,6 +20,24 @@ const CHAT_THREAD_ID = "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx";
 const CHAT_GENERATION_ID = "generation_0004_xxxxxxxxxxxxxxxxxxxxxxxx";
 const CHAT_HASH_A = "a".repeat(64);
 const CHAT_HASH_B = "b".repeat(64);
+
+function rolloutChatError(retryAfterMs = 1_000) {
+  return new DirectChatTransportError("Direct Chat request was not accepted.", {
+    code: "rollout_in_progress",
+    status: 503,
+    retryable: true,
+    retryAfterMs,
+  });
+}
+
+function rolloutAgentError(retryAfterMs = 1_000) {
+  return new AgintiTransportError("AgInTi request was not accepted", {
+    code: "rollout_in_progress",
+    status: 503,
+    retryable: true,
+    retryAfterMs,
+  });
+}
 
 function chatThread(overrides = {}) {
   return {
@@ -1151,6 +1170,304 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
   assert.match(browser.document.getElementById("messages").textContent, /Confirmed follow-up/u);
 });
 
+test("an existing Agent continuation honors rollout delay and a repeated rollout stays immediately retryable", async () => {
+  const histories = new Map([
+    [RUN_ID, await verifiedEvents([["run.completed", {}]])],
+    [SECOND_RUN_ID, await verifiedEvents([
+      ["output.delta", { text: "Accepted after rollout" }],
+      ["run.completed", {}],
+    ], { runId: SECOND_RUN_ID })],
+    [THIRD_RUN_ID, await verifiedEvents([
+      ["output.delta", { text: "Accepted on the next send" }],
+      ["run.completed", {}],
+    ], { runId: THIRD_RUN_ID })],
+  ]);
+  let thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_rollout_user_0001", role: "user", content: "Initial", runId: RUN_ID },
+      { id: "msg_rollout_answer_001", role: "assistant", content: "Initial answer", runId: RUN_ID },
+    ],
+  });
+  const calls = [];
+  const waits = [];
+  const accept = (runId, previousRunId, text) => {
+    thread = agentThread({
+      lastRunId: runId,
+      messages: [
+        ...thread.messages,
+        { id: `msg_rollout_user_${calls.length}xxxx`, role: "user", content: text, runId },
+        { id: `msg_rollout_answer_${calls.length}xx`, role: "assistant", content: "Stored", runId },
+      ],
+    });
+    return { run: run("running", { id: runId, previousRunId }) };
+  };
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async runStatus(runId) {
+      return { run: terminalRun("completed", histories.get(runId), { id: runId }) };
+    },
+    async startRun() { throw new Error("an existing Agent thread must use resume"); },
+    async resumeRun(previousRunId, text, options) {
+      calls.push({ previousRunId, text, options });
+      if (calls.length === 1) throw rolloutAgentError(2_000);
+      if (calls.length === 2) return accept(SECOND_RUN_ID, RUN_ID, text);
+      if (calls.length === 3) throw rolloutAgentError(1_000);
+      if (calls.length === 4) throw rolloutAgentError(4_000);
+      return accept(THIRD_RUN_ID, SECOND_RUN_ID, text);
+    },
+    async *streamRunEvents({ runId }) {
+      for (const event of histories.get(runId)) {
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      }
+    },
+  };
+  const browser = harness({ agent, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  await browser.app.initialize();
+
+  browser.document.getElementById("message-input").value = "Continue after rollout";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.deepEqual(waits, [2_000]);
+  assert.equal(calls[0].options.idempotency, calls[1].options.idempotency);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+
+  const retainedDraft = "Keep this continuation ready";
+  browser.document.getElementById("message-input").value = retainedDraft;
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.deepEqual(waits, [2_000, 1_000], "only the first rollout response schedules one retry");
+  assert.equal(calls.length, 4);
+  assert.equal(calls[2].options.idempotency, calls[3].options.idempotency);
+  assert.equal(browser.document.getElementById("message-input").value, retainedDraft);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.notEqual(browser.document.getElementById("run-state").textContent, "Interrupted");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.match(browser.document.getElementById("toast").textContent, /update is finishing[\s\S]*retry shortly/iu);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(calls.length, 5, "the next same-thread send is not fenced by the rollout");
+  assert.equal(calls[4].previousRunId, SECOND_RUN_ID);
+  assert.notEqual(calls[4].options.idempotency, calls[3].options.idempotency);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(browser.document.getElementById("messages").textContent, /Accepted on the next send/u);
+});
+
+test("a new Agent thread survives repeated rollout rejection without a pending-create or Interrupted fence", async () => {
+  const completed = await verifiedEvents([
+    ["output.delta", { text: "New thread accepted" }],
+    ["run.completed", {}],
+  ]);
+  let thread = null;
+  let creates = 0;
+  const starts = [];
+  const waits = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() {
+      return { schemaVersion: "1", threads: thread === null ? [] : [thread], nextBefore: null };
+    },
+    async createThread() {
+      creates += 1;
+      thread = agentThread();
+      return { thread };
+    },
+    async startRun(threadId, text, options) {
+      starts.push({ threadId, text, options });
+      if (starts.length <= 2) throw rolloutAgentError(starts.length === 1 ? 3_000 : 5_000);
+      if (starts.length === 3) throw rolloutAgentError(2_000);
+      return { run: run("running") };
+    },
+    async *streamRunEvents() {
+      for (const event of completed) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  await browser.app.initialize();
+  const input = browser.document.getElementById("message-input");
+  input.value = "Create this Agent conversation";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(creates, 1);
+  assert.equal(starts.length, 2);
+  assert.deepEqual(waits, [3_000]);
+  assert.equal(input.value, "Create this Agent conversation");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "idle");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Idle");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(creates, 1, "the already-created empty thread remains usable");
+  assert.equal(starts.length, 4);
+  assert.deepEqual(waits, [3_000, 2_000]);
+  assert.notEqual(starts[2].options.idempotency, starts[1].options.idempotency);
+  assert.equal(starts[2].options.idempotency, starts[3].options.idempotency);
+  assert.equal(input.value, "");
+  assert.match(browser.document.getElementById("messages").textContent, /New thread accepted/u);
+});
+
+test("an ambiguous Agent thread create survives later rollout and release fences with one exact ticket", async () => {
+  const completed = await verifiedEvents([["run.completed", {}]]);
+  const calls = [];
+  const waits = [];
+  let starts = 0;
+  const thread = agentThread();
+  const firstAmbiguity = Object.assign(new Error("accepted create response was lost"), { retryable: true });
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread(body, options) {
+      calls.push({ body, options });
+      if (calls.length === 1) throw firstAmbiguity;
+      if (calls.length <= 4) throw rolloutAgentError(1_000);
+      if (calls.length === 5) {
+        throw new AgintiTransportError("new release is binding", {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: `release-${"f".repeat(64)}`,
+        });
+      }
+      return { thread };
+    },
+    async startRun() { starts += 1; return { run: run("running") }; },
+    async *streamRunEvents() {
+      for (const event of completed) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  let reloads = 0;
+  browser.window.location.reload = () => { reloads += 1; };
+  await browser.app.initialize();
+  const input = browser.document.getElementById("message-input");
+  input.value = "Preserve this exact Agent create";
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(waits, [250]);
+  assert.equal(starts, 0);
+  assert.match(browser.document.getElementById("toast").textContent, /same exact conversation/u);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(calls.length, 4, "a closed retry receives only the bounded exact-ticket retry");
+  assert.deepEqual(waits, [250, 1_000]);
+  assert.equal(starts, 0);
+  assert.match(browser.document.getElementById("toast").textContent, /same exact conversation/u);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(calls.length, 5);
+  assert.equal(reloads, 0, "a later release fence cannot erase an earlier ambiguous create receipt");
+  assert.equal(starts, 0);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(calls.length, 6);
+  assert.equal(new Set(calls.map(({ options }) => options.idempotency)).size, 1);
+  assert.deepEqual(calls.map(({ body }) => body), calls.map(() => calls[0].body));
+  assert.equal(starts, 1);
+  assert.equal(input.value, "");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("an ambiguous Agent run followed by rollout remains fenced until read-only reopen confirms it", async () => {
+  const history = await verifiedEvents([
+    ["output.delta", { text: "Confirmed without a new mutation key" }],
+    ["run.completed", {}],
+  ]);
+  let thread = agentThread();
+  const starts = [];
+  const waits = [];
+  const prompt = "Run this exact accepted Agent task";
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async startRun(threadId, text, options) {
+      starts.push({ threadId, text, options });
+      if (starts.length === 1) {
+        thread = agentThread({
+          lastRunId: RUN_ID,
+          messages: [
+            { id: "msg_agent_ambiguous_user", role: "user", content: text, runId: RUN_ID },
+            { id: "msg_agent_ambiguous_answer", role: "assistant", content: "Stored answer", runId: RUN_ID },
+          ],
+        });
+        throw Object.assign(new Error("accepted run response was lost"), { retryable: true });
+      }
+      throw rolloutAgentError(1_000);
+    },
+    async resumeRun() { throw new Error("a pristine thread must use startRun"); },
+    async runStatus(runId) { return { run: terminalRun("completed", history, { id: runId }) }; },
+    async *streamRunEvents({ runId }) {
+      assert.equal(runId, RUN_ID);
+      for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = prompt;
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.deepEqual(waits, [250]);
+  assert.equal(starts.length, 2);
+  assert.equal(starts[0].options.idempotency, starts[1].options.idempotency);
+  assert.equal(browser.document.getElementById("run-state").textContent, "Interrupted");
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts.length, 2, "the replay fence blocks a new mutation key before reconciliation");
+  await browser.app.openThread(THREAD_ID, { mode: "agent" });
+  assert.equal(starts.length, 2, "reopen performs only authoritative reads");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(browser.document.getElementById("messages").textContent, /Confirmed without a new mutation key/u);
+});
+
+test("an ambiguous known-thread Agent run dominates a later release mismatch", async () => {
+  const history = await verifiedEvents([["run.completed", {}]]);
+  let thread = agentThread();
+  const starts = [];
+  let reloads = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread() { return { thread }; },
+    async startRun(threadId, text, options) {
+      starts.push({ threadId, text, options });
+      if (starts.length === 1) {
+        thread = agentThread({
+          lastRunId: RUN_ID,
+          messages: [
+            { id: "msg_agent_release_user", role: "user", content: text, runId: RUN_ID },
+            { id: "msg_agent_release_answer", role: "assistant", content: "Stored", runId: RUN_ID },
+          ],
+        });
+        throw Object.assign(new Error("accepted response was lost"), { retryable: true });
+      }
+      throw new AgintiTransportError("new release is binding", {
+        code: "client_release_mismatch",
+        status: 409,
+        retryable: false,
+        serverRelease: `release-${"d".repeat(64)}`,
+      });
+    },
+    async runStatus(runId) { return { run: terminalRun("completed", history, { id: runId }) }; },
+    async *streamRunEvents({ runId }) {
+      for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  browser.window.location.reload = () => { reloads += 1; };
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Keep the known-thread receipt fence";
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(starts.length, 2);
+  assert.equal(starts[0].options.idempotency, starts[1].options.idempotency);
+  assert.equal(reloads, 0);
+  assert.equal(browser.document.getElementById("run-state").textContent, "Interrupted");
+  await browser.app.openThread(THREAD_ID, { mode: "agent" });
+  assert.equal(starts.length, 2);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
 test("Agent thread creation retries a lost response with one idempotency key and one accepted user turn", async () => {
   const events = await verifiedEvents([
     ["output.delta", { text: "Created once" }],
@@ -2123,6 +2440,68 @@ test("Agent resume binds a new run to the exact failed predecessor before openin
     1,
     "input-less Resume does not invent a second user message",
   );
+});
+
+test("Agent Resume retains one ticket when ambiguity is followed by rollout and release fences", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const completed = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
+  const calls = [];
+  let streams = 0;
+  let reloads = 0;
+  const firstAmbiguity = Object.assign(new Error("accepted Resume response was lost"), { retryable: true });
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(runId, text, options) {
+      calls.push({ runId, text, options });
+      if (calls.length === 1) throw firstAmbiguity;
+      if (calls.length === 2) throw rolloutAgentError(1_000);
+      if (calls.length === 3) {
+        throw new AgintiTransportError("new release is binding", {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: `release-${"c".repeat(64)}`,
+        });
+      }
+      return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      const event = streams === 1 ? failed : completed;
+      yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({ agent });
+  browser.window.location.reload = () => { reloads += 1; };
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Create a failed run";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+  const corrected = "Use this exact corrected Resume input";
+  browser.document.getElementById("message-input").value = corrected;
+
+  await browser.app.resume();
+  await browser.app.resume();
+  await browser.app.resume();
+  assert.equal(calls.length, 3);
+  assert.equal(new Set(calls.map(({ options }) => options.idempotency)).size, 1);
+  assert.equal(calls.every(({ text }) => text === corrected), true);
+  assert.equal(reloads, 0);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+
+  await browser.app.resume();
+  assert.equal(calls.length, 4);
+  assert.equal(new Set(calls.map(({ options }) => options.idempotency)).size, 1);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("message-input").value, "");
 });
 
 test("Agent Resume submits a corrected failed or cancelled draft only after its exact successor is accepted", async () => {
@@ -5342,6 +5721,325 @@ test("a local multi-image-run preparation failure preserves both images and the 
   assert.ok(revokedUrls.includes("blob:retry-image-1"));
   assert.ok(revokedUrls.includes("blob:retry-image-2"));
   assert.match(browser.document.getElementById("messages").textContent, /Retried safely/u);
+});
+
+test("a rollout-gated multi-image Chat send waits once and succeeds without an ambiguity status probe", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const attachmentIds = ["image_rollout_success_0000001", "image_rollout_success_0000002"];
+  let thread = null;
+  let messages = [];
+  let preparedRun;
+  let starts = 0;
+  let retries = 0;
+  let statusReads = 0;
+  const waits = [];
+  const accept = (ticket) => {
+    messages = [
+      chatMessage(1, "user", ticket.content),
+      chatMessage(2, "assistant", "Accepted after the update"),
+    ];
+    thread = chatThread({
+      title: thread.title,
+      revision: 2,
+      ledgerHash: CHAT_HASH_B,
+      messageCount: 2,
+      ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+    });
+    return {
+      request: ticket,
+      generation: chatGeneration({ status: "completed", terminal: true }),
+    };
+  };
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_rollout_success_0001" });
+    },
+    async createThread(ticket) {
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread === null ? [] : [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparedRun = request;
+      return Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_rollout_success_000001",
+      });
+    },
+    async startRun() {
+      starts += 1;
+      throw rolloutChatError(5_000);
+    },
+    async retryRun(ticket) {
+      retries += 1;
+      return accept(ticket);
+    },
+    async getRunStatus() {
+      statusReads += 1;
+      throw new Error("a definitive rollout rejection must not be status-probed");
+    },
+  });
+  let objectUrlSerial = 0;
+  const browser = harness({
+    chat,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+    async canonicalizeImage(file) {
+      const index = file.name.endsWith("one.png") ? 0 : 1;
+      return Object.freeze({
+        attachmentId: attachmentIds[index],
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64 + index,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl(blob) {
+      objectUrlSerial += 1;
+      return `blob:rollout-success-${blob.size}-${objectUrlSerial}`;
+    },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "one.png" }, { name: "two.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Describe both rollout images";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(starts, 1);
+  assert.equal(retries, 1);
+  assert.equal(statusReads, 0);
+  assert.deepEqual(waits, [5_000]);
+  assert.deepEqual(preparedRun.attachments.map(({ attachmentId }) => attachmentId), attachmentIds);
+  assert.equal(browser.document.getElementById("message-input").value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.match(browser.document.getElementById("messages").textContent, /Accepted after the update/u);
+});
+
+test("repeated rollout rejection restores an exact two-image Chat composer and the same thread accepts the next send", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const attachmentIds = ["image_rollout_retry_00000001", "image_rollout_retry_00000002"];
+  const draft = "  Keep both rollout images ready.\n  ";
+  let thread = null;
+  let messages = [];
+  let creates = 0;
+  let starts = 0;
+  let retries = 0;
+  let statusReads = 0;
+  let preparations = 0;
+  const prepared = [];
+  const waits = [];
+  const accept = (ticket) => {
+    messages = [
+      chatMessage(1, "user", ticket.content),
+      chatMessage(2, "assistant", "Accepted on the same thread"),
+    ];
+    thread = chatThread({
+      title: thread.title,
+      revision: 2,
+      ledgerHash: CHAT_HASH_B,
+      messageCount: 2,
+      ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+    });
+    return {
+      request: ticket,
+      generation: chatGeneration({
+        generationId: ticket.generationId,
+        status: "completed",
+        terminal: true,
+      }),
+    };
+  };
+  const chat = baseChat({
+    async capabilities() {
+      return { visionInput: true, visionMediaTypes: ["image/jpeg", "image/png"], maximumImageBytes: 4 * 1024 * 1024 };
+    },
+    prepareThread({ title }) {
+      return Object.freeze({ threadId: CHAT_THREAD_ID, title, idempotencyKey: "thread_rollout_retry_00001" });
+    },
+    async createThread(ticket) {
+      creates += 1;
+      thread = chatThread({ title: ticket.title });
+      return { request: ticket, thread };
+    },
+    async listThreads() { return { threads: thread === null ? [] : [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      preparations += 1;
+      prepared.push(request);
+      return Object.freeze({
+        ...request,
+        generationId: preparations === 1 ? CHAT_GENERATION_ID : "generation_rollout_retry_000002",
+        idempotencyKey: `run_rollout_retry_00000${preparations}`,
+      });
+    },
+    async startRun(ticket) {
+      starts += 1;
+      throw rolloutChatError(starts === 1 ? 2_000 : 1_000);
+    },
+    async retryRun(ticket) {
+      retries += 1;
+      if (retries === 1) throw rolloutChatError(4_000);
+      return accept(ticket);
+    },
+    async getRunStatus() {
+      statusReads += 1;
+      throw new Error("a definitive rollout rejection must not be status-probed");
+    },
+  });
+  let objectUrlSerial = 0;
+  const browser = harness({
+    chat,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+    async canonicalizeImage(file) {
+      const index = file.name.endsWith("one.png") ? 0 : 1;
+      return Object.freeze({
+        attachmentId: attachmentIds[index],
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64 + index,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { objectUrlSerial += 1; return `blob:rollout-retry-${objectUrlSerial}`; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const input = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "one.png" }, { name: "two.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  input.value = draft;
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(creates, 1);
+  assert.equal(starts, 1);
+  assert.equal(retries, 1);
+  assert.equal(statusReads, 0);
+  assert.deepEqual(waits, [2_000], "the second rollout does not start another automatic retry");
+  assert.equal(input.value, draft);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.match(browser.document.getElementById("image-preview-label").textContent, /2 images/u);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.match(browser.document.getElementById("toast").textContent, /prompt and images are still ready[\s\S]*retry shortly/iu);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(creates, 1, "the rollout-created thread remains selected and usable");
+  assert.equal(starts, 2);
+  assert.equal(retries, 2);
+  assert.equal(statusReads, 0);
+  assert.deepEqual(waits, [2_000, 1_000]);
+  assert.equal(prepared.length, 2);
+  assert.deepEqual(prepared[1].attachments.map(({ attachmentId }) => attachmentId), attachmentIds);
+  assert.equal(prepared[1].attachments[0].bytes, bytes);
+  assert.equal(prepared[1].attachments[1].bytes, bytes);
+  assert.equal(input.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.match(browser.document.getElementById("messages").textContent, /Accepted on the same thread/u);
+});
+
+test("Direct Chat ambiguity dominates later rollout and release fences until Resume confirms the exact ticket", async () => {
+  let thread = chatThread();
+  let messages = [];
+  let prepared;
+  const dispatches = [];
+  const waits = [];
+  const firstAmbiguity = Object.assign(new Error("accepted response was lost"), { retryable: true });
+  const chat = baseChat({
+    async listThreads() { return { threads: [thread] }; },
+    async getThread() { return { thread }; },
+    async listMessages({ afterRevision, limit }) {
+      return { messages: messages.filter((message) => message.revision > afterRevision).slice(0, limit) };
+    },
+    prepareRun(request) {
+      prepared = Object.freeze({
+        ...request,
+        generationId: CHAT_GENERATION_ID,
+        idempotencyKey: "run_ambiguity_before_rollout_x",
+      });
+      return prepared;
+    },
+    async startRun(ticket) {
+      dispatches.push(ticket);
+      throw firstAmbiguity;
+    },
+    async retryRun(ticket) {
+      dispatches.push(ticket);
+      if (dispatches.length <= 4) throw rolloutChatError(1_000);
+      if (dispatches.length === 5) {
+        throw new DirectChatTransportError("new release is binding", {
+          code: "client_release_mismatch",
+          status: 409,
+          retryable: false,
+          serverRelease: `release-${"e".repeat(64)}`,
+        });
+      }
+      messages = [
+        chatMessage(1, "user", ticket.content),
+        chatMessage(2, "assistant", "Confirmed exact-ticket result"),
+      ];
+      thread = chatThread({
+        revision: 2,
+        ledgerHash: CHAT_HASH_B,
+        messageCount: 2,
+        ledgerBytes: messages.reduce((total, message) => total + message.contentBytes, 0),
+      });
+      return {
+        request: ticket,
+        generation: chatGeneration({ status: "completed", terminal: true }),
+      };
+    },
+  });
+  const browser = harness({ chat, wait: async (milliseconds) => { waits.push(milliseconds); } });
+  let reloads = 0;
+  browser.window.location.reload = () => { reloads += 1; };
+  await browser.app.initialize();
+  const input = browser.document.getElementById("message-input");
+  input.value = "Preserve this ambiguous Direct Chat turn";
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(dispatches.length, 2);
+  assert.deepEqual(waits, [250]);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+
+  await browser.app.resume();
+  assert.equal(dispatches.length, 4, "Resume makes only one bounded retry while rollout remains closed");
+  assert.deepEqual(waits, [250, 1_000]);
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+
+  await browser.app.resume();
+  assert.equal(dispatches.length, 5);
+  assert.equal(reloads, 0, "a later release mismatch cannot replace an older ambiguous receipt");
+  assert.equal(browser.document.getElementById("resume-run").hidden, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+
+  await browser.app.resume();
+  assert.equal(dispatches.length, 6);
+  assert.equal(dispatches.every((ticket) => ticket === prepared), true);
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(browser.document.getElementById("messages").textContent, /Confirmed exact-ticket result/u);
 });
 
 test("not-sent image failures retain safe diagnostics and give a concise reason and recovery action", async (t) => {

@@ -28,6 +28,11 @@ import {
   validateTransportAgentRequest
 } from './http-contract.js';
 import { ControlPlaneError } from './errors.js';
+import {
+  createRolloutAdmissionControlServer,
+  ROLLOUT_IN_PROGRESS_CODE,
+  RolloutAdmissionLatch
+} from './rollout-admission.js';
 import { VISION_MODEL_ALIAS } from './vision-attachment.js';
 import {
   AGINTI_MAX_FILE_ARTIFACT_BYTES,
@@ -1024,6 +1029,7 @@ export function createCloudRequestHandler({
   visionEnabled = false,
   visionModelAlias = VISION_MODEL_ALIAS,
   agintiAdapter,
+  rolloutAdmission,
   clock = () => new Date(),
   requestOutcomeObserver,
   limits: limitOverrides = {}
@@ -1061,6 +1067,10 @@ export function createCloudRequestHandler({
   if (agintiAdapter !== undefined && agintiAdapter !== null
       && (typeof agintiAdapter.rpc !== 'function' || typeof agintiAdapter.capabilities !== 'function')) {
     throw new TypeError('agintiAdapter must provide the frozen rpc() and capabilities() interface');
+  }
+  const admissions = rolloutAdmission ?? new RolloutAdmissionLatch();
+  if (!(admissions instanceof RolloutAdmissionLatch)) {
+    throw new TypeError('rolloutAdmission must be a RolloutAdmissionLatch');
   }
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   if (requestOutcomeObserver !== undefined && typeof requestOutcomeObserver !== 'function') {
@@ -1240,17 +1250,46 @@ export function createCloudRequestHandler({
     return backgroundDrain;
   }
 
-  function scheduleGeneration(accountId, threadId, generationId, startKey, preparation) {
+  function scheduleGeneration(
+    accountId,
+    threadId,
+    generationId,
+    startKey,
+    preparation,
+    parentAdmission
+  ) {
     const jobKey = `${threadId}:${generationId}`;
     if (jobs.has(jobKey)) return true;
-    if (stopping || !directChatConnector || jobs.size >= limits.directChatJobs) return false;
-    const scheduled = chat.getGeneration({ accountId, threadId, generationId });
-    const executionTimeoutMs = scheduled?.modelAlias === visionModelAlias
-      ? limits.visionJobTimeoutMs
-      : limits.jobTimeoutMs;
-    const controller = new AbortController();
-    const job = { controller, timedOut: false, promise: null, lease: null, timer: null };
-    jobs.set(jobKey, job);
+    const generationAdmission = parentAdmission === undefined
+      ? admissions.acquire('direct-chat-generation')
+      : parentAdmission.fork('direct-chat-generation');
+    if (generationAdmission === null) return false;
+    if (stopping || !directChatConnector || jobs.size >= limits.directChatJobs) {
+      generationAdmission.release();
+      return false;
+    }
+    let job;
+    let controller;
+    let executionTimeoutMs;
+    try {
+      const scheduled = chat.getGeneration({ accountId, threadId, generationId });
+      executionTimeoutMs = scheduled?.modelAlias === visionModelAlias
+        ? limits.visionJobTimeoutMs
+        : limits.jobTimeoutMs;
+      controller = new AbortController();
+      job = {
+        controller,
+        timedOut: false,
+        promise: null,
+        lease: null,
+        timer: null,
+        admission: generationAdmission
+      };
+      jobs.set(jobKey, job);
+    } catch (error) {
+      generationAdmission.release();
+      throw error;
+    }
     const armJobTimeout = (milliseconds, phase) => {
       clearTimeout(job.timer);
       job.timer = setTimeout(() => {
@@ -1455,6 +1494,7 @@ export function createCloudRequestHandler({
           }
         }
         if (jobs.get(jobKey) === job) jobs.delete(jobKey);
+        job.admission.release();
       }
     })();
     void job.promise.catch(() => {
@@ -1473,7 +1513,7 @@ export function createCloudRequestHandler({
     );
   }
 
-  async function handleChat(req, res, route, body, session, requestSignal) {
+  async function handleChat(req, res, route, body, session, requestSignal, runAdmission) {
     const accountId = configuredAccount.principalId;
     const input = validateChatRequest(route.pathname, body);
     const idempotencyKey = routeRequiresIdempotency(route.pathname)
@@ -1572,7 +1612,8 @@ export function createCloudRequestHandler({
         input.threadId,
         input.generationId,
         idempotencyKey,
-        preparation
+        preparation,
+        runAdmission
       )) {
         throw new CloudHttpError(503, 'chat_resume_pending', 'The persisted generation is waiting for LocalLLM capacity.', { retryAfter: 2 });
       }
@@ -1838,6 +1879,7 @@ export function createCloudRequestHandler({
     res[RESPONSE_RELEASE_ID] = assets.releaseId;
     let releaseBody = null;
     let releaseStream = null;
+    let runAdmission = null;
     let outcomeRoute = 'unknown';
     let outcomeFetchMetadata = 'unchecked';
     let outcomeRelease = 'unchecked';
@@ -1921,6 +1963,27 @@ export function createCloudRequestHandler({
       const preauthenticated = route.kind === 'chat' || route.kind === 'agent'
         ? requireAuthentication(metadataAuthenticated ?? await authenticate(req))
         : null;
+      const admissionKind = route.pathname === CLOUD_ROUTES.chatRunsStart
+        ? 'direct-chat-start'
+        : (route.kind === 'agent'
+            && [AGINTI_RPC_PATHS.runsStart, AGINTI_RPC_PATHS.runsResume].includes(route.nativeAgentPath)
+          ? 'agent-start-resume'
+          : null);
+      if (admissionKind !== null) {
+        runAdmission = admissions.acquire(admissionKind);
+        if (runAdmission === null) {
+          // Reject before reading a potentially large vision body. Closing the
+          // connection prevents unread request bytes from becoming a later HTTP
+          // message on the same socket.
+          req.shouldKeepAlive = false;
+          throw new CloudHttpError(
+            503,
+            ROLLOUT_IN_PROGRESS_CODE,
+            'New work is temporarily paused. Retry shortly.',
+            { retryAfter: 1 }
+          );
+        }
+      }
       const admissionKey = preauthenticated
         ? `${clientAddress}\u0000${configuredAccount.principalId}`
         : clientAddress;
@@ -1958,7 +2021,15 @@ export function createCloudRequestHandler({
         return;
       }
       if (route.kind === 'chat') {
-        await handleChat(req, res, route, body, preauthenticated, disconnect.controller.signal);
+        await handleChat(
+          req,
+          res,
+          route,
+          body,
+          preauthenticated,
+          disconnect.controller.signal,
+          runAdmission
+        );
         return;
       }
       if (route.kind === 'agent') {
@@ -1973,6 +2044,7 @@ export function createCloudRequestHandler({
     } finally {
       releaseBody?.();
       releaseStream?.();
+      runAdmission?.release();
       disconnect.cleanup();
       if (requestOutcomeObserver !== undefined && req.method === 'POST') {
         try {
@@ -1999,6 +2071,7 @@ export function createCloudRequestHandler({
     activeDirectChatJobs: { get: () => jobs.size, enumerable: true },
     activeStreams: { get: () => streamGate.active, enumerable: true },
     activeEphemeralSessions: { get: () => ephemeralSessions.size, enumerable: true },
+    rolloutAdmission: { value: admissions, enumerable: true },
     maximumBodyReadTimeoutMs: {
       value: Math.max(limits.bodyTimeoutMs, limits.visionBodyTimeoutMs)
     }
@@ -2006,8 +2079,16 @@ export function createCloudRequestHandler({
   return handler;
 }
 
-export function createCloudServer(options) {
-  const handler = createCloudRequestHandler(options);
+export function createCloudServer(options = {}) {
+  const rolloutAdmission = options.rolloutAdmission ?? new RolloutAdmissionLatch();
+  const handler = createCloudRequestHandler({ ...options, rolloutAdmission });
+  const admissionControl = options.rolloutAdmissionSocketPath === undefined
+    ? null
+    : createRolloutAdmissionControlServer({
+        latch: rolloutAdmission,
+        releaseId: handler.releaseId,
+        socketPath: options.rolloutAdmissionSocketPath
+      });
   const server = createNodeServer({
     connectionsCheckingInterval: 1_000,
     highWaterMark: 64 * 1024,
@@ -2027,22 +2108,58 @@ export function createCloudServer(options) {
   server.requestTimeout = handler.maximumBodyReadTimeoutMs + REQUEST_BODY_TIMEOUT_MARGIN_MS;
   server.keepAliveTimeout = 5_000;
   server.maxHeadersCount = 64;
-  server.on('close', () => { void handler.closeBackgroundJobs(); });
+  server.on('close', () => {
+    // An externally initiated close has no shutdown() caller to observe
+    // cleanup failures. Explicit shutdown still owns and preserves the same
+    // cached cleanup promises below; these catches only prevent an orphaned
+    // rejection on the event-hook path.
+    void Promise.resolve().then(() => handler.closeBackgroundJobs()).catch(() => {});
+    void Promise.resolve().then(() => admissionControl?.shutdown()).catch(() => {});
+  });
   let shutdownPromise = null;
-  Object.defineProperty(server, 'shutdown', {
-    enumerable: true,
-    value() {
-      if (shutdownPromise) return shutdownPromise;
-      const drained = handler.closeBackgroundJobs();
-      shutdownPromise = new Promise((resolve, reject) => {
-        if (!server.listening) {
-          resolve();
-          return;
-        }
-        server.close((error) => error ? reject(error) : resolve());
-        server.closeAllConnections?.();
-      }).then(() => drained);
-      return shutdownPromise;
+  Object.defineProperties(server, {
+    rolloutAdmission: { value: rolloutAdmission, enumerable: true },
+    admissionControl: { value: admissionControl, enumerable: true },
+    startAdmissionControl: {
+      enumerable: true,
+      value() { return admissionControl?.start() ?? Promise.resolve(null); }
+    },
+    shutdown: {
+      enumerable: true,
+      value() {
+        if (shutdownPromise) return shutdownPromise;
+        const startStep = (callback) => {
+          try { return Promise.resolve(callback()); }
+          catch (error) { return Promise.reject(error); }
+        };
+        const drained = startStep(() => handler.closeBackgroundJobs());
+        const controlStopped = startStep(() => admissionControl?.shutdown());
+        const httpStopped = new Promise((resolve, reject) => {
+          const finish = (error) => {
+            if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+            else resolve();
+          };
+          try {
+            // Node reports listening=false while a just-issued listen() is still
+            // binding. close() is deliberately unconditional so shutdown also
+            // cancels that pending bind before it can become externally live.
+            server.close(finish);
+            server.closeAllConnections?.();
+          } catch (error) {
+            finish(error);
+          }
+        });
+        shutdownPromise = Promise.allSettled([httpStopped, drained, controlStopped]).then((results) => {
+          const failures = results
+            .filter((result) => result.status === 'rejected')
+            .map((result) => result.reason);
+          if (failures.length === 1) throw failures[0];
+          if (failures.length > 1) {
+            throw new AggregateError(failures, 'cloud server shutdown failed');
+          }
+        });
+        return shutdownPromise;
+      }
     }
   });
   return server;

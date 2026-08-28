@@ -69,7 +69,8 @@ boundary, and replaceable-node contract are specified in
   Direct Chat deletion route.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
-  admission, owner-safe response projections, and graceful job draining.
+  admission, owner-safe response projections, graceful job draining, and an
+  owner-only crash-persistent rollout admission latch for new Chat/Agent work.
 - `CloudIndexStore` for cloud accounts, digest-only browser sessions,
   presentation-only AgInTi thread indexes, delivery cursors, and closed
   idempotency receipts.
@@ -274,6 +275,13 @@ and omit `credentials.agintiToken` when the Agent transport is intentionally
 absent. Configuring the transport does not claim Agent readiness: capability
 discovery stays fail-closed until AgInTi itself proves its native API, policy,
 sandbox, and current resource admission.
+
+`serve` also requires systemd's exact single absolute `RUNTIME_DIRECTORY`.
+With `RuntimeDirectory=lazying-agent-web`, the service derives only
+`/run/lazying-agent-web/admission.sock`; a missing, relative, root, or
+colon-separated multi-directory value fails before listening. The runtime
+directory is owner-only and the fixed `admission.sock` basename is never read
+from JSON configuration or caller input.
 
 Before switching an edge proxy to a candidate build, derive its exact,
 secret-free static allowlist from that same installed package and config:

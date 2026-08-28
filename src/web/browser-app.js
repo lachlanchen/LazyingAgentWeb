@@ -35,6 +35,9 @@ const AUTHENTICATION_FAILURE_CODES = new Set(["authentication_required", "invali
 const BODY_REJECTION_CODES = new Set([
   "invalid_attachment", "invalid_json", "request_aborted", "request_error", "request_too_large",
 ]);
+const ROLLOUT_IN_PROGRESS_CODE = "rollout_in_progress";
+const ROLLOUT_RETRY_DEFAULT_MS = 1_000;
+const ROLLOUT_RETRY_MAXIMUM_MS = 5_000;
 const SAFE_CHAT_FAILURE_OPERATIONS = new Set([
   "local_thread", "local_run", "thread_dispatch", "snapshot", "run_dispatch", "before_run_dispatch",
 ]);
@@ -1319,6 +1322,8 @@ export function createBrowserApp({
     sessionRevalidationPending: false,
     followNewest: true,
   };
+  const agentThreadCreateAmbiguities = new WeakMap();
+  const agentResumeAmbiguities = new WeakMap();
 
   function showToast(message) {
     elements.toast.textContent = String(message).slice(0, 400);
@@ -2918,21 +2923,84 @@ export function createBrowserApp({
     }
   }
 
-  async function exactMutation(dispatch, retry, { onAmbiguous = () => {}, onConfirmed = () => {} } = {}) {
+  async function exactMutation(dispatch, retry, {
+    inheritedAmbiguity = null,
+    onAmbiguous = () => {},
+    onConfirmed = () => {},
+  } = {}) {
+    let dominantAmbiguity = inheritedAmbiguity;
     try {
       const result = await dispatch();
       onConfirmed();
       return result;
     }
     catch (error) {
+      if (clientReleaseMismatch(error) !== null && dominantAmbiguity !== null) {
+        throw dominantAmbiguity;
+      }
       if (error?.retryable !== true) throw error;
-      onAmbiguous(error);
+      const rolloutDelay = rolloutRetryDelay(error);
+      if (rolloutDelay !== null) {
+        connection("App update finishing · retrying shortly", false);
+        await wait(rolloutDelay);
+        try {
+          const result = await retry();
+          onConfirmed();
+          return result;
+        } catch (retryError) {
+          if ((rolloutRetryDelay(retryError) !== null || clientReleaseMismatch(retryError) !== null)
+              && dominantAmbiguity !== null) {
+            throw dominantAmbiguity;
+          }
+          if (rolloutRetryDelay(retryError) === null && retryError?.retryable === true
+              && dominantAmbiguity === null) {
+            dominantAmbiguity = retryError;
+            onAmbiguous(retryError);
+          }
+          throw retryError;
+        }
+      }
+      if (dominantAmbiguity === null) {
+        dominantAmbiguity = error;
+        onAmbiguous(error);
+      }
       connection("Retrying the same durable request", false);
       await wait(250);
-      const result = await retry();
-      onConfirmed();
-      return result;
+      try {
+        const result = await retry();
+        onConfirmed();
+        return result;
+      } catch (retryError) {
+        if ((rolloutRetryDelay(retryError) !== null || clientReleaseMismatch(retryError) !== null)
+            && dominantAmbiguity !== null) {
+          throw dominantAmbiguity;
+        }
+        throw retryError;
+      }
     }
+  }
+
+  function rolloutRetryDelay(error) {
+    const failure = error instanceof LocalChatNotSentError ? error.cause : error;
+    if (failure?.code !== ROLLOUT_IN_PROGRESS_CODE || failure?.status !== 503) return null;
+    return Number.isSafeInteger(failure.retryAfterMs)
+        && failure.retryAfterMs >= ROLLOUT_RETRY_DEFAULT_MS
+        && failure.retryAfterMs <= ROLLOUT_RETRY_MAXIMUM_MS
+      ? failure.retryAfterMs
+      : ROLLOUT_RETRY_DEFAULT_MS;
+  }
+
+  function restoreAgentActivityAfterRollout() {
+    const status = state.agentRunStatus;
+    if (status === null || status === undefined) {
+      elements.workspace.dataset.status = "idle";
+      elements.run_state.textContent = "Idle";
+    } else {
+      elements.workspace.dataset.status = status;
+      elements.run_state.textContent = statusLabel(status);
+    }
+    elements.stop_run.hidden = true;
+    elements.resume_run.hidden = true;
   }
 
   function isAuthoritativeChatRejection(error) {
@@ -4271,13 +4339,47 @@ export function createBrowserApp({
     const session = state.session;
     const agent = state.agent;
     const current = () => state.session === session && state.agent === agent && state.session.authenticated;
-    const exactMutation = async (operation) => {
-      try { return await operation(); }
+    const exactMutation = async (operation, {
+      inheritedAmbiguity = null,
+      onAmbiguous = () => {},
+      onConfirmed = () => {},
+    } = {}) => {
+      let dominantAmbiguity = inheritedAmbiguity;
+      try {
+        const result = await operation();
+        onConfirmed();
+        return result;
+      }
       catch (error) {
+        if (clientReleaseMismatch(error) !== null && dominantAmbiguity !== null) {
+          throw dominantAmbiguity;
+        }
         if (error?.retryable !== true) throw error;
-        connection("Confirming Agent request", false);
-        await wait(250);
-        return await operation();
+        const rolloutDelay = rolloutRetryDelay(error);
+        if (rolloutDelay === null && dominantAmbiguity === null) {
+          dominantAmbiguity = error;
+          onAmbiguous(error);
+        }
+        connection(rolloutDelay === null
+          ? "Confirming Agent request"
+          : "App update finishing · retrying Agent shortly", false);
+        await wait(rolloutDelay ?? 250);
+        try {
+          const result = await operation();
+          onConfirmed();
+          return result;
+        } catch (retryError) {
+          if ((rolloutRetryDelay(retryError) !== null || clientReleaseMismatch(retryError) !== null)
+              && dominantAmbiguity !== null) {
+            throw dominantAmbiguity;
+          }
+          if (rolloutRetryDelay(retryError) === null && retryError?.retryable === true
+              && dominantAmbiguity === null) {
+            dominantAmbiguity = retryError;
+            onAmbiguous(retryError);
+          }
+          throw retryError;
+        }
       }
     };
     let threadId = state.agentThreadId;
@@ -4293,13 +4395,18 @@ export function createBrowserApp({
       );
       let result;
       try {
-        result = await exactMutation(create);
+        result = await exactMutation(create, {
+          inheritedAmbiguity: agentThreadCreateAmbiguities.get(pendingCreate) ?? null,
+          onAmbiguous(error) { agentThreadCreateAmbiguities.set(pendingCreate, error); },
+          onConfirmed() { agentThreadCreateAmbiguities.delete(pendingCreate); },
+        });
       } catch (error) {
         // A bounded non-retryable 4xx proves that this exact create was not
         // accepted, including a release-fence rejection. Do not retain an
         // ambiguity fence that would prevent the required app refresh.
-        if (isAuthoritativeAgentRejection(error)
+        if ((isAuthoritativeAgentRejection(error) || rolloutRetryDelay(error) !== null)
             && state.agentPendingThreadCreate === pendingCreate) {
+          agentThreadCreateAmbiguities.delete(pendingCreate);
           state.agentPendingThreadCreate = null;
         }
         throw error;
@@ -4351,13 +4458,53 @@ export function createBrowserApp({
   }
 
   async function exactRunMutation(chat, workflow, dispatch, retry) {
+    let dominantAmbiguity = workflow.ambiguousMutation === "run_dispatch"
+      ? workflow.ambiguousError
+      : null;
+    const markAmbiguous = (error) => {
+      workflow.ambiguousMutation = "run_dispatch";
+      if (dominantAmbiguity === null || dominantAmbiguity === undefined) {
+        dominantAmbiguity = error;
+        workflow.ambiguousError = error;
+      }
+    };
+    const clearAmbiguous = () => {
+      if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
+      workflow.ambiguousError = null;
+      dominantAmbiguity = null;
+    };
+    let exactAbsenceProven = false;
     try {
       const result = await dispatch();
-      if (workflow.ambiguousMutation === "run_dispatch") workflow.ambiguousMutation = null;
+      clearAmbiguous();
       return result;
     } catch (error) {
+      if (clientReleaseMismatch(error) !== null && dominantAmbiguity !== null) {
+        throw dominantAmbiguity;
+      }
       if (error?.retryable !== true) throw error;
-      workflow.ambiguousMutation = "run_dispatch";
+      const rolloutDelay = rolloutRetryDelay(error);
+      if (rolloutDelay !== null) {
+        connection("App update finishing · retrying shortly", false);
+        await wait(rolloutDelay);
+        try {
+          const result = await retry();
+          clearAmbiguous();
+          return result;
+        } catch (retryError) {
+          if ((rolloutRetryDelay(retryError) !== null || clientReleaseMismatch(retryError) !== null)
+              && dominantAmbiguity !== null) {
+            throw dominantAmbiguity;
+          }
+          if (rolloutRetryDelay(retryError) === null && retryError?.retryable === true) {
+            markAmbiguous(retryError);
+          } else if (dominantAmbiguity === null) {
+            clearAmbiguous();
+          }
+          throw retryError;
+        }
+      }
+      markAmbiguous(error);
       const hasImages = workflow.runTicket?.attachment !== undefined
         || workflow.runTicket?.attachments !== undefined;
       if (hasImages) {
@@ -4367,22 +4514,38 @@ export function createBrowserApp({
             threadId: workflow.runTicket.threadId,
             generationId: workflow.runTicket.generationId,
           });
-          workflow.ambiguousMutation = null;
+          clearAmbiguous();
           return authoritative;
         } catch (probeError) {
           const definitelyAbsent = probeError instanceof DirectChatTransportError
             && probeError.retryable === false && probeError.status === 404;
           if (!definitelyAbsent) {
             if (isChatAuthenticationAfterAmbiguousDispatch(probeError)) throw probeError;
-            throw error;
+            throw dominantAmbiguity;
           }
+          // This exact generation identifier is authoritatively absent. Keep
+          // the receipt fence through authentication and transport failures,
+          // but a later pre-idempotency rollout/release fence can safely be
+          // attributed to this genuinely new retry.
+          exactAbsenceProven = true;
         }
       }
       connection("Retrying the same durable request", false);
       await wait(250);
-      const result = await retry();
-      workflow.ambiguousMutation = null;
-      return result;
+      try {
+        const result = await retry();
+        clearAmbiguous();
+        return result;
+      } catch (retryError) {
+        if (rolloutRetryDelay(retryError) !== null || clientReleaseMismatch(retryError) !== null) {
+          if (dominantAmbiguity !== null && !exactAbsenceProven) throw dominantAmbiguity;
+          if (exactAbsenceProven) clearAmbiguous();
+        }
+        if (rolloutRetryDelay(retryError) === null && retryError?.retryable === true) {
+          markAmbiguous(retryError);
+        }
+        throw retryError;
+      }
     }
   }
 
@@ -4423,9 +4586,16 @@ export function createBrowserApp({
         firstDispatch,
         () => chat.retryCreateThread(workflow.threadTicket),
         {
-          onAmbiguous() { workflow.ambiguousMutation = "thread_dispatch"; },
+          inheritedAmbiguity: workflow.ambiguousMutation === "thread_dispatch"
+            ? workflow.ambiguousError
+            : null,
+          onAmbiguous(error) {
+            workflow.ambiguousMutation = "thread_dispatch";
+            if (workflow.ambiguousError === null) workflow.ambiguousError = error;
+          },
           onConfirmed() {
             if (workflow.ambiguousMutation === "thread_dispatch") workflow.ambiguousMutation = null;
+            workflow.ambiguousError = null;
           },
         },
       );
@@ -4549,6 +4719,7 @@ export function createBrowserApp({
       recoveryComposer: null,
       failureStage: "before_run_dispatch",
       ambiguousMutation: null,
+      ambiguousError: null,
       onAccepted,
     };
     // The workflow is the only owner until server acceptance. Clear the
@@ -4568,7 +4739,14 @@ export function createBrowserApp({
         throw error;
       }
       const authoritativeRejection = isAuthoritativeChatRejection(error);
+      const rolloutRejected = rolloutRetryDelay(error) !== null;
+      const historicalAmbiguity = workflow.ambiguousMutation !== null;
+      if (rolloutRejected && !historicalAmbiguity) {
+        workflow.ambiguousMutation = null;
+        workflow.ambiguousError = null;
+      }
       const notSent = error instanceof LocalChatNotSentError || authoritativeRejection
+        || (rolloutRejected && !historicalAmbiguity)
         || (!workflow.runDispatched && (!workflow.threadDispatched || workflow.thread !== null));
       if (notSent) {
         if (state.chatPendingSend === workflow) state.chatPendingSend = null;
@@ -4788,6 +4966,32 @@ export function createBrowserApp({
         showToast("A newer app release is ready. Your unsent prompt and images are being protected before refresh.");
         return;
       }
+      const rolloutRejected = rolloutRetryDelay(error) !== null;
+      const rolloutAfterChatAmbiguity = state.mode === "chat"
+        && state.chatPendingSend?.ambiguousMutation !== null
+        && state.chatPendingSend?.ambiguousMutation !== undefined;
+      if (rolloutRejected && !rolloutAfterChatAmbiguity) {
+        elements.message_input.value = draft;
+        if (state.mode === "chat") {
+          const workflow = state.chatPendingSend;
+          if (workflow !== null) {
+            workflow.ambiguousMutation = null;
+            workflow.ambiguousError = null;
+            state.chatPendingSend = null;
+          }
+          const imageRestored = restoreDetachedImage(detachedImage);
+          if (imageRestored) detachedImage = null;
+        } else {
+          state.agentPendingThreadCreate = null;
+          restoreAgentActivityAfterRollout();
+        }
+        elements.resume_run.hidden = true;
+        connection("App update finishing", false);
+        showToast(selected.length > 0
+          ? `An app update is finishing. Your prompt and ${selected.length === 1 ? "image is" : "images are"} still ready; retry shortly.`
+          : "An app update is finishing. Your prompt is still ready; retry shortly.");
+        return;
+      }
       if (state.mode === "chat" && state.chatPendingSend) {
         state.chatPendingSend.recoveryComposer = Object.freeze({ draft, images: selected });
       }
@@ -4915,6 +5119,7 @@ export function createBrowserApp({
         recoveryWorkflow.lockedComposer = null;
         recoveryWorkflow.recoveryComposer = null;
         recoveryWorkflow.ambiguousMutation = null;
+        recoveryWorkflow.ambiguousError = null;
       }
       state.authRecoveryPending = false;
       state.authRecoveryUsername = null;
@@ -5582,6 +5787,7 @@ export function createBrowserApp({
     elements.resume_run.disabled = true;
     updateImageControl();
     let ownsAgentResume = null;
+    let agentResumeTicket = null;
     let reconnectDescriptor = null;
     let releaseRefreshTarget = null;
     try {
@@ -5725,10 +5931,12 @@ export function createBrowserApp({
             || resumeTicket.runId !== requestedRunId
             || resumeTicket.threadId !== requestedThreadId
             || resumeTicket.epoch !== requestedEpoch) {
+          agentResumeAmbiguities.delete(resumeTicket);
           state.agentPendingResume = null;
           showToast("The pending Agent resume no longer owns this view. Reopen the conversation before resuming.");
           return;
         }
+        agentResumeTicket = resumeTicket;
         ownsAgentResume = () => state.session === requestedSession
           && state.session.authenticated
           && state.agent === requestedAgent
@@ -5750,6 +5958,7 @@ export function createBrowserApp({
           previousRunId: requestedRunId,
           threadId: requestedThreadId,
         });
+        agentResumeAmbiguities.delete(resumeTicket);
         if (state.agentPendingResume === resumeTicket) state.agentPendingResume = null;
         if (resumeTicket.text !== undefined) {
           if (elements.message_input.value === resumeTicket.draft) elements.message_input.value = "";
@@ -5764,17 +5973,31 @@ export function createBrowserApp({
     } catch (error) {
       if (reconnectDescriptor !== null && !currentAgentReconnect(reconnectDescriptor)) return;
       if (ownsAgentResume !== null && !ownsAgentResume()) return;
+      const inheritedResumeAmbiguity = agentResumeTicket === null
+        ? null
+        : (agentResumeAmbiguities.get(agentResumeTicket) ?? null);
+      if (inheritedResumeAmbiguity !== null
+          && (rolloutRetryDelay(error) !== null || clientReleaseMismatch(error) !== null)) {
+        error = inheritedResumeAmbiguity;
+      } else if (agentResumeTicket !== null && error?.retryable === true
+          && rolloutRetryDelay(error) === null && inheritedResumeAmbiguity === null) {
+        agentResumeAmbiguities.set(agentResumeTicket, error);
+      }
       releaseRefreshTarget = clientReleaseMismatch(error);
       if (releaseRefreshTarget !== null) {
         // The release fence is an authoritative pre-mutation rejection. The
         // same draft/search remain in the composer and will be encrypted into
         // the successor handoff, so this obsolete resume ticket must not block
         // the version hop.
-        state.agentPendingResume = null;
+        if (state.agentPendingResume !== null) {
+          agentResumeAmbiguities.delete(state.agentPendingResume);
+          state.agentPendingResume = null;
+        }
         connection("Migrating protected work to the newer app", false);
       } else if (state.agentPendingResume !== null && error?.retryable === false
           && Number.isSafeInteger(error?.status) && error.status >= 400 && error.status < 499
           && error?.code !== "AGINTI_ABORTED") {
+        agentResumeAmbiguities.delete(state.agentPendingResume);
         state.agentPendingResume = null;
       } else {
         const authenticatedReadRecovery = state.mode === "chat" ? state.authRecoveryGeneration : null;

@@ -2,6 +2,7 @@
 
 import { pathToFileURL } from 'node:url';
 
+import { rolloutAdmissionSocketPathForRuntimeDirectory } from './rollout-admission.js';
 import { loadServiceConfig } from './service-config.js';
 import {
   checkStandaloneServiceHealth,
@@ -34,7 +35,15 @@ function parseArguments(argv, env) {
   if (typeof env.CREDENTIALS_DIRECTORY !== 'string' || !env.CREDENTIALS_DIRECTORY) {
     throw new TypeError('CREDENTIALS_DIRECTORY is required');
   }
-  return Object.freeze({ command, configPath, credentialsDirectory: env.CREDENTIALS_DIRECTORY });
+  const rolloutAdmissionSocketPath = command === 'serve'
+    ? rolloutAdmissionSocketPathForRuntimeDirectory(env.RUNTIME_DIRECTORY)
+    : undefined;
+  return Object.freeze({
+    command,
+    configPath,
+    credentialsDirectory: env.CREDENTIALS_DIRECTORY,
+    ...(rolloutAdmissionSocketPath === undefined ? {} : { rolloutAdmissionSocketPath })
+  });
 }
 
 function writeJson(stream, value) {
@@ -98,7 +107,10 @@ export async function runCli({
     return ready ? 0 : 1;
   }
 
-  const service = await serviceFactory({ loadedConfig });
+  const service = await serviceFactory({
+    loadedConfig,
+    rolloutAdmissionSocketPath: command.rolloutAdmissionSocketPath
+  });
   try {
     const endpoint = await service.start();
     writeJson(stdout, {

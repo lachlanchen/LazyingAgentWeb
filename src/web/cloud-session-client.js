@@ -39,6 +39,7 @@ export class CloudBrowserTransportError extends Error {
     code = "cloud_unavailable",
     status = 503,
     retryable = true,
+    retryAfterMs,
     serverRelease,
   } = {}) {
     super(message);
@@ -46,6 +47,7 @@ export class CloudBrowserTransportError extends Error {
     this.code = code;
     this.status = status;
     this.retryable = retryable;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
     if (serverRelease !== undefined) this.serverRelease = optionalWebRelease(serverRelease);
   }
 }

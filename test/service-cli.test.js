@@ -16,7 +16,8 @@ function outputCollector() {
 function environment() {
   return {
     CREDENTIALS_DIRECTORY: '/run/credentials/lazying-agent-web.service',
-    LAZYING_AGENT_CONFIG: '/etc/lazying-agent-web/service.json'
+    LAZYING_AGENT_CONFIG: '/etc/lazying-agent-web/service.json',
+    RUNTIME_DIRECTORY: '/run/lazying-agent-web'
   };
 }
 
@@ -171,7 +172,10 @@ test('serve binds through the service only and always performs graceful shutdown
     stdout,
     configLoader: () => Object.freeze({ kind: 'loaded' }),
     configChecker() { throw new Error('config checker must not run'); },
-    async serviceFactory() { return service; },
+    async serviceFactory(input) {
+      assert.equal(input.rolloutAdmissionSocketPath, '/run/lazying-agent-web/admission.sock');
+      return service;
+    },
     async terminationWaiter(value) {
       assert.equal(value, service);
       waited += 1;
@@ -205,6 +209,11 @@ test('rejects secret-bearing or unsupported argv and shuts down after start fail
   await assert.rejects(runCli({ ...common, argv: ['serve', '--password', 'secret'] }), TypeError);
   await assert.rejects(runCli({ ...common, argv: ['hash-password'] }), TypeError);
   await assert.rejects(runCli({ ...common, argv: ['serve', '--token', 'secret'] }), TypeError);
+  for (const runtimeDirectory of [undefined, 'relative/run', '/run/one:/run/two', '/']) {
+    const env = { ...environment(), RUNTIME_DIRECTORY: runtimeDirectory };
+    if (runtimeDirectory === undefined) delete env.RUNTIME_DIRECTORY;
+    await assert.rejects(runCli({ ...common, argv: ['serve'], env }), TypeError);
+  }
 
   let shutdowns = 0;
   await assert.rejects(runCli({

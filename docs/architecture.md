@@ -143,6 +143,40 @@ The HTTP server does not terminate public TLS, manage Caddy or LazyEdge, launch
 LocalLLM, start AgInTi, or create a sandbox. Those remain independently operated
 components.
 
+### Rollout admission latch
+
+The standalone service owns one linearizable new-work latch. Direct Chat
+`runs/start`, its background generation child, recovery dispatch attempted by
+`runs/status` or `runs/events`, and Agent `runs/start`/`runs/resume` all cross
+that latch. Reads, event delivery, status, and cancellation remain responsive.
+When closed, a newly authenticated start/resume is rejected before its JSON body
+is read with HTTP 503, `error.code = rollout_in_progress`, `Retry-After: 1`, and
+the normal no-store, Pragma, Expires, and immutable release headers.
+
+The owner-only control socket is `/run/lazying-agent-web/admission.sock` in
+production. `serve` derives the fixed `admission.sock` basename from systemd's
+exact single absolute `RUNTIME_DIRECTORY`; malformed or multiple directories
+fail before listening. The directory is mode 0700 and the socket is mode 0600;
+every response reports the actual uid, gid, mode, and exact web release. It
+accepts one newline-terminated JSON object per connection under schema
+`lazying-agent-web/admission-control/v1`:
+
+- `status` is read-only.
+- `close` requires a caller-generated `operationId`. It durably writes a private
+  closed marker beside the configured Cloud Index database, then returns a fresh
+  opaque `generation`.
+- `drain` requires the exact `operationId` and `expectedGeneration` and replies
+  only after every pre-close admission and inherited Direct Chat generation has
+  released.
+- `open` requires the same CAS pair, a completed drain, and zero active
+  admissions. It durably removes the marker before reopening.
+
+Closed status includes the persisted operation and generation, so a service
+restart begins closed and an operator can resume the same rollout safely. A
+stale timer cannot open a newer close generation. A control-client timeout or
+disconnect during drain never changes latch state; the server-side drain
+continues, and the operator polls status before issuing the CAS-protected open.
+
 ## Persistence
 
 Cloud-authoritative storage is divided so ownership is visible in the schema:

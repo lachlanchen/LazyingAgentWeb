@@ -22,6 +22,9 @@ const STREAM_LIMIT = 8 * 1024 * 1024;
 const SSE_BLOCK_LIMIT = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_STREAM_WALL_MS = 70_000;
+const ROLLOUT_IN_PROGRESS_CODE = "rollout_in_progress";
+const ROLLOUT_RETRY_DEFAULT_SECONDS = 1;
+const ROLLOUT_RETRY_MAXIMUM_SECONDS = 5;
 const TERMINAL_EVENTS = new Set(["run.completed", "run.failed", "run.cancelled"]);
 const FORBIDDEN_BROWSER_HEADERS = new Set([
   "authorization",
@@ -36,12 +39,19 @@ const FORBIDDEN_BROWSER_HEADERS = new Set([
 ]);
 
 export class AgintiTransportError extends Error {
-  constructor(message, { code = "AGINTI_UNAVAILABLE", status = 503, retryable = true, serverRelease } = {}) {
+  constructor(message, {
+    code = "AGINTI_UNAVAILABLE",
+    status = 503,
+    retryable = true,
+    retryAfterMs,
+    serverRelease,
+  } = {}) {
     super(message);
     this.name = "AgintiTransportError";
     this.code = code;
     this.status = status;
     this.retryable = retryable;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
     if (serverRelease !== undefined) this.serverRelease = optionalWebRelease(serverRelease);
   }
 }
@@ -215,8 +225,20 @@ async function readBoundedText(response, maximum) {
 }
 
 function safeUpstreamCode(value) {
+  if (value === ROLLOUT_IN_PROGRESS_CODE) return value;
   if (typeof value !== "string" || !/^[A-Z][A-Z0-9_]{0,79}$/u.test(value)) return "AGINTI_REQUEST_FAILED";
   return value;
+}
+
+function rolloutRetryAfterMs(response) {
+  const value = response.headers.get("retry-after");
+  const seconds = typeof value === "string" && /^\d+$/u.test(value)
+    ? Number(value)
+    : ROLLOUT_RETRY_DEFAULT_SECONDS;
+  const bounded = Number.isSafeInteger(seconds)
+    ? Math.min(ROLLOUT_RETRY_MAXIMUM_SECONDS, Math.max(1, seconds))
+    : ROLLOUT_RETRY_DEFAULT_SECONDS;
+  return bounded * 1_000;
 }
 
 async function responseError(response) {
@@ -234,6 +256,9 @@ async function responseError(response) {
     code,
     status: response.status,
     retryable,
+    ...(response.status === 503 && code === ROLLOUT_IN_PROGRESS_CODE
+      ? { retryAfterMs: rolloutRetryAfterMs(response) }
+      : {}),
   });
 }
 

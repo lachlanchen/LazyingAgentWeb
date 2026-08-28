@@ -69,6 +69,17 @@ export {
   resolveTrustedClientAddress
 } from './cloud-server.js';
 export {
+  DEFAULT_ROLLOUT_ADMISSION_SOCKET,
+  ROLLOUT_ADMISSION_CONTROL_SCHEMA,
+  ROLLOUT_ADMISSION_MARKER_SCHEMA,
+  ROLLOUT_IN_PROGRESS_CODE,
+  RolloutAdmissionError,
+  RolloutAdmissionLatch,
+  createRolloutAdmissionControlServer,
+  rolloutAdmissionSocketPathForRuntimeDirectory,
+  validateRolloutAdmissionSocketPath
+} from './rollout-admission.js';
+export {
   AGENT_ARTIFACT_CONTENT_PREFIX,
   AGENT_ROUTE_MAP,
   AGENT_TRANSPORT_PREFIX,

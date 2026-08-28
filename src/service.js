@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
 
 import {
   createAgintiAgentAdapter,
@@ -15,6 +16,11 @@ import { createCloudServer } from './cloud-server.js';
 import { createDeterministicContextSummarizer } from './deterministic-context-summarizer.js';
 import { createLocalLlmConnector } from './localllm-connector.js';
 import { LATEST_SCHEMA_VERSION, SQLITE_APPLICATION_ID } from './migrations.js';
+import {
+  DEFAULT_ROLLOUT_ADMISSION_SOCKET,
+  RolloutAdmissionLatch,
+  validateRolloutAdmissionSocketPath
+} from './rollout-admission.js';
 import {
   OPERATOR_HEALTH_TIMEOUT_MS,
   createOperatorHealthReport
@@ -237,6 +243,7 @@ export async function createStandaloneService({
   fetchImpl,
   localSummarizer,
   serverFactory = createCloudServer,
+  rolloutAdmissionSocketPath = DEFAULT_ROLLOUT_ADMISSION_SOCKET,
   clock
 } = {}) {
   if (typeof serverFactory !== 'function') throw new TypeError('serverFactory must be a function');
@@ -249,6 +256,7 @@ export async function createStandaloneService({
     throw new TypeError('localSummarizer must be a local-only Direct Chat summarizer');
   }
   if (clock !== undefined && typeof clock !== 'function') throw new TypeError('clock must be a function');
+  const admissionSocketPath = validateRolloutAdmissionSocketPath(rolloutAdmissionSocketPath);
 
   const materialized = await materializeInputs(loadedConfig);
   const config = materialized.loaded.config;
@@ -296,6 +304,13 @@ export async function createStandaloneService({
           ...(fetchImpl === undefined ? {} : { fetchImpl })
         })
       : null;
+    const rolloutAdmissionMarker = join(
+      dirname(config.state.cloudIndexDatabase),
+      'rollout-admission.closed.json'
+    );
+    const rolloutAdmission = new RolloutAdmissionLatch({
+      closedMarkerPath: rolloutAdmissionMarker
+    });
     server = serverFactory({
       releaseId: materialized.assetMap.releaseVersion,
       assetMap: materialized.assetMap,
@@ -314,6 +329,8 @@ export async function createStandaloneService({
       visionEnabled: config.localLlm.vision.enabled,
       visionModelAlias: config.localLlm.vision.modelAlias,
       agintiAdapter,
+      rolloutAdmission,
+      rolloutAdmissionSocketPath: admissionSocketPath,
       requestOutcomeObserver(outcome) {
         if (outcome.result === 'rejected') {
           console.warn(JSON.stringify({ event: 'cloud_request_outcome', ...outcome }));
@@ -333,35 +350,68 @@ export async function createStandaloneService({
     const start = () => {
       if (stopped) return Promise.reject(new Error('standalone service is already stopped'));
       if (startPromise) return startPromise;
-      startPromise = new Promise((resolve, reject) => {
-        const onError = (error) => {
-          server.removeListener('error', onError);
-          reject(error);
-        };
-        server.once('error', onError);
-        server.listen(config.listen.port, '127.0.0.1', () => {
-          server.removeListener('error', onError);
-          const address = server.address();
-          if (!address || typeof address !== 'object' || address.address !== '127.0.0.1'
-              || address.port !== config.listen.port) {
-            void shutdown();
-            reject(new Error('server did not bind the exact configured loopback endpoint'));
-            return;
-          }
-          resolve(Object.freeze({ address: '127.0.0.1', port: address.port }));
+      startPromise = (async () => {
+        if (typeof server.startAdmissionControl === 'function') {
+          await server.startAdmissionControl();
+        }
+        if (stopped || shutdownPromise !== null) {
+          throw new Error('standalone service was stopped during startup');
+        }
+        return await new Promise((resolve, reject) => {
+          let settled = false;
+          const cleanup = () => {
+            server.removeListener('error', onError);
+            server.removeListener('close', onClose);
+          };
+          const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          };
+          const onError = (error) => {
+            fail(error);
+          };
+          const onClose = () => fail(new Error('standalone service stopped during HTTP startup'));
+          server.once('error', onError);
+          server.once('close', onClose);
+          server.listen(config.listen.port, '127.0.0.1', () => {
+            if (stopped || shutdownPromise !== null) {
+              fail(new Error('standalone service was stopped during HTTP startup'));
+              return;
+            }
+            const address = server.address();
+            if (!address || typeof address !== 'object' || address.address !== '127.0.0.1'
+                || address.port !== config.listen.port) {
+              void shutdown();
+              fail(new Error('server did not bind the exact configured loopback endpoint'));
+              return;
+            }
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(Object.freeze({ address: '127.0.0.1', port: address.port }));
+          });
         });
-      });
+      })();
       return startPromise;
     };
     const shutdown = () => {
       if (shutdownPromise) return shutdownPromise;
       stopped = true;
+      const pendingStart = startPromise;
       shutdownPromise = (async () => {
         const failures = [];
         try {
           await server.shutdown();
         } catch (error) {
           failures.push(error);
+        }
+        if (pendingStart !== null) {
+          try { await pendingStart; }
+          catch {
+            // Shutdown owns startup cancellation; its rejection is expected.
+          }
         }
         try {
           closeStores(controlStore, directChatStore);
@@ -389,6 +439,8 @@ export async function createStandaloneService({
       directChatSummarizer,
       directChatConnector,
       agintiAdapter,
+      rolloutAdmission,
+      rolloutAdmissionMarker,
       start,
       shutdown
     });

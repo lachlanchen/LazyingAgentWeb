@@ -736,6 +736,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-source-metadata { margin: .35rem 0 0; color: var(--muted); font-size: .78rem; }
 .artifact-file-metadata { margin: 0 0 .6rem; overflow-wrap: anywhere; font-weight: 650; }
 .artifact-file-controls { display: flex; min-width: 0; flex-wrap: wrap; gap: .55rem; }
+.artifact-export-controls { margin-top: .65rem; }
 .artifact-file-action { min-width: min(100%, 7.5rem); min-height: 44px; display: inline-flex; align-items: center; justify-content: center; padding: .65rem .9rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--accent-strong); font-weight: 700; text-decoration: none; touch-action: manipulation; }
 .artifact-file-action:hover { border-color: var(--accent); background: var(--accent-soft); }
 .artifact-file-download { background: var(--accent); color: white; }

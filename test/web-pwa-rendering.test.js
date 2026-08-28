@@ -208,6 +208,10 @@ function artifact(kind, spec) {
   return { id: ARTIFACT_ID, title: "Safe result", kind, spec };
 }
 
+function threadOpenControl(row) {
+  return row?.className === "thread-row" ? row.children[0] : row;
+}
+
 function eventTarget() {
   const listeners = new Map();
   return {
@@ -1306,6 +1310,114 @@ test("Direct Chat deletion confirms, locks unsafe rows, retries one ticket, and 
   await Promise.resolve();
   assert.equal(threadList.children[0].children[0].focused, true, "focus moves to the next conversation after removal");
   assert.equal(agentDeleteCalls, 0, "Direct Chat deletion never calls the Agent client");
+});
+
+test("Agent conversation cleanup uses only the Agent delete API and clears the selected presentation", async () => {
+  const threadId = "thr_11111111-2222-4333-8444-555555555555";
+  const thread = emptyAgentPwaThread({ id: threadId, title: "Disposable Agent test" });
+  const deletions = [];
+  const confirmationMessages = [];
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability(); },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requestedThreadId) {
+      assert.equal(requestedThreadId, threadId);
+      return { schemaVersion: "1", thread };
+    },
+    async deleteThread(requestedThreadId, options) {
+      deletions.push({ requestedThreadId, options });
+      return { schemaVersion: "1", deleted: true, threadId };
+    },
+    async *streamRunEvents() {},
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    confirmThreadDeletion(message) {
+      confirmationMessages.push(message);
+      return true;
+    },
+  });
+  await harness.app.initialize();
+  await settlePwaActions();
+
+  const list = harness.document.getElementById("thread-list");
+  assert.equal(list.children.length, 1);
+  assert.equal(list.children[0].className, "thread-row");
+  assert.equal(list.children[0].dataset.mode, "agent");
+  assert.equal(list.children[0].children[0].getAttribute("aria-current"), "true");
+  assert.equal(list.children[0].children[1].textContent, "Delete");
+  assert.match(list.children[0].children[1].getAttribute("aria-label"), /Agent conversation Disposable Agent test/u);
+
+  assert.equal(await harness.app.deleteAgentThread(threadId), true);
+  assert.equal(confirmationMessages.length, 1);
+  assert.match(confirmationMessages[0], /messages, execution history, and artifacts/u);
+  assert.equal(deletions.length, 1);
+  assert.equal(deletions[0].requestedThreadId, threadId);
+  assert.match(deletions[0].options.idempotency, /^agent_delete_/u);
+  assert.equal(list.children.length, 0);
+  assert.equal(harness.document.getElementById("messages").children.length, 0);
+  assert.equal(harness.document.getElementById("conversation-title").textContent, "New conversation");
+  assert.match(harness.document.getElementById("toast").textContent, /Agent conversation deleted/u);
+});
+
+test("ambiguous Agent cleanup retains one idempotency key until an exact manual retry succeeds", async () => {
+  const threadId = "thr_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const thread = emptyAgentPwaThread({ id: threadId, title: "Interrupted Agent cleanup" });
+  const idempotencyKeys = [];
+  let deleteCalls = 0;
+  let confirmations = 0;
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability(); },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requestedThreadId) {
+      assert.equal(requestedThreadId, threadId);
+      return { schemaVersion: "1", thread };
+    },
+    async deleteThread(requestedThreadId, options) {
+      assert.equal(requestedThreadId, threadId);
+      deleteCalls += 1;
+      idempotencyKeys.push(options.idempotency);
+      if (deleteCalls < 3) throw Object.assign(new Error("response interrupted"), { retryable: true });
+      return { schemaVersion: "1", deleted: true, threadId };
+    },
+    async *streamRunEvents() {},
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    wait: async () => {},
+    confirmThreadDeletion() { confirmations += 1; return true; },
+  });
+  await harness.app.initialize();
+  await settlePwaActions();
+
+  assert.equal(await harness.app.deleteAgentThread(threadId), false);
+  const list = harness.document.getElementById("thread-list");
+  assert.equal(list.children[0].children[1].textContent, "Retry");
+  assert.equal(list.children[0].children[0].disabled, true);
+  assert.equal(harness.document.getElementById("message-input").disabled, true);
+  assert.equal(confirmations, 1);
+  assert.equal(deleteCalls, 2);
+  assert.equal(new Set(idempotencyKeys).size, 1);
+
+  assert.equal(await harness.app.deleteAgentThread(threadId), true);
+  assert.equal(confirmations, 1, "manual retry does not repeat destructive confirmation for the same request");
+  assert.equal(deleteCalls, 3);
+  assert.equal(new Set(idempotencyKeys).size, 1, "every retry reuses the exact accepted idempotency key");
+  assert.equal(list.children.length, 0);
 });
 
 function completedDeletionRaceFixture() {
@@ -2482,6 +2594,86 @@ test("a same-origin worker with a protocol-invalid release label cannot autoacti
   assert.equal(invalidController.messages.length >= 2, true);
 });
 
+test("accepted Agent prompts bind to their run before streaming and reset old collapsed activity", async () => {
+  const threadId = "thr_13572468-2468-4135-8246-135724681357";
+  const runId = "run_13572468-2468-4135-8246-135724681357";
+  const instant = "2026-08-28T12:00:00.000Z";
+  const envelope = {
+    schemaVersion: "1",
+    id: `${runId}.1`,
+    seq: 1,
+    type: "run.completed",
+    threadId,
+    runId,
+    createdAt: instant,
+    payload: {},
+    previousHash: "0".repeat(64),
+  };
+  const terminalEvent = await verifyAgentEvent({
+    ...envelope,
+    hash: createHash("sha256").update(canonicalJson(envelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId,
+    expectedThreadId: threadId,
+    afterSeq: 0,
+    previousHash: "0".repeat(64),
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+  let releaseStream;
+  const streamGate = new Promise((resolve) => { releaseStream = resolve; });
+  let announceStream;
+  const streamStarted = new Promise((resolve) => { announceStream = resolve; });
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability(); },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async createThread() { return { thread: { id: threadId, title: "Bound accepted run" } }; },
+    async startRun() { return { run: { id: runId, threadId, status: "starting" } }; },
+    async *streamRunEvents() {
+      announceStream();
+      await streamGate;
+      yield { event: terminalEvent, cursor: { seq: 1, hash: terminalEvent.hash } };
+    },
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+  });
+  await harness.app.initialize();
+  const oldPlan = harness.document.createElement("li");
+  oldPlan.textContent = "Completed old plan";
+  harness.document.getElementById("agent-plan").appendChild(oldPlan);
+  const oldEvent = harness.document.createElement("li");
+  oldEvent.textContent = "Completed old activity";
+  harness.document.getElementById("agent-timeline").appendChild(oldEvent);
+  const oldArtifact = harness.document.createElement("section");
+  oldArtifact.textContent = "Completed old artifact";
+  harness.document.getElementById("agent-artifacts").appendChild(oldArtifact);
+  harness.document.getElementById("agent-artifacts").hidden = false;
+  harness.document.getElementById("activity-disclosure").open = true;
+  harness.document.getElementById("message-input").value = "Run this accepted task in the same conversation";
+
+  const submission = harness.app.submitMessage({ preventDefault() {} });
+  await streamStarted;
+  const userMessage = [...harness.document.getElementById("messages").children]
+    .find((message) => message.dataset.role === "user");
+  assert.equal(userMessage?.dataset.runId, runId, "the visible prompt owns the accepted run before its first event");
+  assert.equal(harness.document.getElementById("activity-disclosure").open, false);
+  assert.equal(harness.document.getElementById("agent-plan").children.length, 0);
+  assert.equal(harness.document.getElementById("agent-timeline").children.length, 0);
+  assert.equal(harness.document.getElementById("agent-artifacts").children.length, 0);
+  assert.equal(harness.document.getElementById("agent-artifacts").hidden, true);
+
+  releaseStream();
+  await submission;
+  assert.equal(harness.document.getElementById("workspace").dataset.status, "completed");
+});
+
 test("authoritative terminal Agent states remain update-safe while retaining their run identity", async () => {
   const threadId = "thr_12345678-1234-4123-8123-123456789abc";
   const runId = "run_12345678-1234-4123-8123-123456789abc";
@@ -3129,7 +3321,7 @@ test("an Agent draft keeps its exact mode and thread across a versioned full-pag
   const retryThread = [...replayFailure.document.getElementById("thread-list").children]
     .find((entry) => entry.dataset.threadId === threadId);
   assert.ok(retryThread, "the exact owned retry target remains visible after list and ledger outages");
-  retryThread.dispatch("click");
+  threadOpenControl(retryThread).dispatch("click");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(replayGetAttempts, 2);
   assert.equal(replayFailure.document.getElementById("message-input").disabled, false);
@@ -3167,7 +3359,7 @@ test("an Agent draft keeps its exact mode and thread across a versioned full-pag
   assert.equal(reads.restored, 1, "the handoff reopens the owned Agent thread exactly once");
   const restoredThreadButton = [...restored.document.getElementById("thread-list").children]
     .find((entry) => entry.dataset.threadId === threadId);
-  assert.equal(restoredThreadButton?.getAttribute("aria-current"), "true",
+  assert.equal(threadOpenControl(restoredThreadButton)?.getAttribute("aria-current"), "true",
     "the directly verified thread is restored even when the sidebar list request failed");
   assert.equal(successfulResumeCalls, 0, "restoring the draft is read-only");
   assert.equal(store.records.size, 0);
@@ -3928,7 +4120,7 @@ test("a legacy v2 existing-Agent choice survives same-account expiry before Sear
   const chosenThread = [...harness.document.getElementById("thread-list").children]
     .find((entry) => entry.dataset.threadId === threadId);
   assert.ok(chosenThread);
-  chosenThread.dispatch("click");
+  threadOpenControl(chosenThread).dispatch("click");
   await settlePwaActions();
   assert.equal(exactReads, 1);
   assert.equal(harness.document.getElementById("conversation-title").textContent, thread.title);
@@ -3953,7 +4145,7 @@ test("a legacy v2 existing-Agent choice survives same-account expiry before Sear
   assert.equal(harness.document.getElementById("send-message").disabled, false);
   const replayedThread = [...harness.document.getElementById("thread-list").children]
     .find((entry) => entry.dataset.threadId === threadId);
-  assert.equal(replayedThread?.getAttribute("aria-current"), "true");
+  assert.equal(threadOpenControl(replayedThread)?.getAttribute("aria-current"), "true");
   assert.equal(store.records.size, 1);
   assert.equal(mutations, 0);
 
@@ -4301,7 +4493,7 @@ test("same-account reauthentication preserves an uninstalled conflict and a pend
     const chosenThread = [...harness.document.getElementById("thread-list").children]
       .find((entry) => entry.dataset.threadId === threadId);
     assert.ok(chosenThread);
-    chosenThread.dispatch("click");
+    threadOpenControl(chosenThread).dispatch("click");
     await settlePwaActions();
     assert.equal(exactReads, 1);
     assert.equal(store.records.size, 1, "the chosen destination still awaits an explicit Search choice");
@@ -6298,6 +6490,16 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(swatches.length, 1);
   assert.equal(swatches[0].className.includes("artifact-swatch-0"), true);
   assert.equal(plotNodes.some((node) => node.attributes.has("style") || Object.keys(node.style).length > 0), false);
+  const svgDownload = plotNodes.find((node) => node.tagName === "a" && node.textContent === "Download SVG");
+  assert.ok(svgDownload);
+  assert.equal(svgDownload.getAttribute("download"), "safe-result-aaaaaaaa.svg");
+  assert.match(svgDownload.getAttribute("href"), /^data:image\/svg\+xml;charset=utf-8,/u);
+  const exportedSvg = decodeURIComponent(svgDownload.getAttribute("href").split(",", 2)[1]);
+  assert.match(exportedSvg, /^<\?xml version="1\.0" encoding="UTF-8"\?>\n<svg /u);
+  assert.match(exportedSvg, /xmlns="http:\/\/www\.w3\.org\/2000\/svg"/u);
+  assert.match(exportedSvg, /<style>\.plot-grid\{stroke:var\(--line,#d5d9de\)\}/u);
+  assert.match(exportedSvg, /Safe result/u);
+  assert.doesNotMatch(exportedSvg, /<script|onload=|javascript:/iu);
 
   const numericTarget = document.createElement("section");
   const maximum = Number.MAX_SAFE_INTEGER;
@@ -6321,9 +6523,25 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(renderer.renderArtifact(target, artifact("table", {
     schemaVersion: "1",
     columns: [{ key: "name", label: "Name" }, { key: "value", label: "Value" }],
-    rows: [{ name: "A", value: 2 }],
+    rows: [{ name: "=2+2", value: "a,\"b\"\nline" }],
   })), true);
   assert.equal(target.walk().some((node) => node.tagName === "table"), true);
+  const csvDownload = target.walk().find((node) => node.tagName === "a" && node.textContent === "Download CSV");
+  assert.ok(csvDownload);
+  assert.equal(csvDownload.getAttribute("download"), "safe-result-aaaaaaaa.csv");
+  assert.match(csvDownload.getAttribute("href"), /^data:text\/csv;charset=utf-8,/u);
+  assert.equal(
+    decodeURIComponent(csvDownload.getAttribute("href").split(",", 2)[1]),
+    '\ufeff"Name","Value"\r\n"\'=2+2","a,""b""\nline"\r\n',
+  );
+  const repeatedTable = document.createElement("section");
+  renderer.renderArtifact(repeatedTable, artifact("table", {
+    schemaVersion: "1",
+    columns: [{ key: "name", label: "Name" }, { key: "value", label: "Value" }],
+    rows: [{ name: "=2+2", value: "a,\"b\"\nline" }],
+  }));
+  const repeatedCsv = repeatedTable.walk().find((node) => node.tagName === "a" && node.textContent === "Download CSV");
+  assert.equal(repeatedCsv.getAttribute("href"), csvDownload.getAttribute("href"), "same table yields byte-identical CSV");
 
   assert.equal(renderer.renderArtifact(target, artifact("markdown", {
     schemaVersion: "1",

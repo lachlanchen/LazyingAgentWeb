@@ -9,6 +9,18 @@ const MAX_INLINE_DEPTH = 12;
 const MAX_BLOCK_DEPTH = 8;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PLOT_COLORS = Object.freeze(["#147d75", "#4472ca", "#c55c37", "#8c5bbd", "#73802d", "#bb4f7b", "#427f9e", "#9b6b2f"]);
+const DOWNLOADABLE_SVG_ELEMENTS = new Set([
+  "circle", "desc", "g", "line", "path", "rect", "svg", "text", "title", "tspan",
+]);
+const STANDALONE_PLOT_STYLE = [
+  ".plot-grid{stroke:var(--line,#d5d9de)}",
+  ".plot-axis{stroke:var(--muted,#66727f)}",
+  ".plot-grid,.plot-axis,.plot-series path{vector-effect:non-scaling-stroke}",
+  ".plot-tick{fill:var(--muted,#66727f);font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;font-size:13px}",
+  ".plot-axis-label{font-size:14px;font-weight:650}",
+  ".plot-axis-offset{font-size:11px;font-variant-numeric:tabular-nums}",
+  ".plot-label-compact{display:none}",
+].join("");
 
 function browserDocument(value) {
   if (!value || typeof value.createElement !== "function" || typeof value.createTextNode !== "function"
@@ -39,6 +51,97 @@ function createSvg(document, name, attributes = {}) {
 
 function appendText(document, parent, value) {
   parent.appendChild(document.createTextNode(value));
+}
+
+function xmlText(value) {
+  return String(value).replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;");
+}
+
+function xmlAttribute(value) {
+  return xmlText(value).replace(/"/gu, "&quot;").replace(/'/gu, "&apos;");
+}
+
+function svgAttributeEntries(node) {
+  const entries = [];
+  const attributes = node?.attributes;
+  if (attributes instanceof Map) {
+    for (const [name, value] of attributes) entries.push([String(name), String(value)]);
+  } else if (typeof attributes?.[Symbol.iterator] === "function") {
+    for (const attribute of attributes) entries.push([String(attribute.name), String(attribute.value)]);
+  } else if (Number.isSafeInteger(attributes?.length)) {
+    for (let index = 0; index < attributes.length; index += 1) {
+      const attribute = attributes.item?.(index) ?? attributes[index];
+      if (attribute) entries.push([String(attribute.name), String(attribute.value)]);
+    }
+  }
+  const className = typeof node?.className === "string"
+    ? node.className
+    : (typeof node?.className?.baseVal === "string" ? node.className.baseVal : "");
+  if (className && !entries.some(([name]) => name === "class")) entries.push(["class", className]);
+  const unique = new Map();
+  for (const [name, value] of entries) {
+    if (!/^[A-Za-z_:][A-Za-z0-9_.:-]*$/u.test(name)) throw new TypeError("SVG attribute name is invalid");
+    unique.set(name, value);
+  }
+  return [...unique].sort(([left], [right]) => (left < right ? -1 : (left > right ? 1 : 0)));
+}
+
+function serializeSafeSvgNode(node) {
+  if (node?.nodeType === 3 || node?.tagName === "#text") return xmlText(node.nodeValue ?? node.textContent ?? "");
+  const name = String(node?.localName ?? node?.tagName ?? "").toLowerCase();
+  if (!DOWNLOADABLE_SVG_ELEMENTS.has(name)) throw new TypeError("SVG export contains an unsupported element");
+  const attributes = svgAttributeEntries(node)
+    .map(([key, value]) => ` ${key}="${xmlAttribute(value)}"`)
+    .join("");
+  const children = Array.from(node.childNodes ?? node.children ?? []);
+  return `<${name}${attributes}>${children.map(serializeSafeSvgNode).join("")}</${name}>`;
+}
+
+function serializeStandalonePlot(svg) {
+  const serialized = serializeSafeSvgNode(svg);
+  const rootEnd = serialized.indexOf(">");
+  if (rootEnd < 0) throw new TypeError("SVG export root is invalid");
+  return `${serialized.slice(0, rootEnd + 1)}<style>${xmlText(STANDALONE_PLOT_STYLE)}</style>${serialized.slice(rootEnd + 1)}`;
+}
+
+function artifactDownloadFilename(artifact, fallback, extension) {
+  const stem = artifact.title.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 48) || fallback;
+  return `${stem}-${artifact.id.slice(4, 12)}.${extension}`;
+}
+
+function dataDownloadHref(mediaType, content) {
+  return `data:${mediaType};charset=utf-8,${encodeURIComponent(content)}`;
+}
+
+function appendArtifactDownload(document, target, { label, filename, mediaType, content }) {
+  const controls = createNode(document, "div", "artifact-export-controls artifact-file-controls");
+  const download = createNode(document, "a", "artifact-export-action artifact-file-action");
+  download.setAttribute("href", dataDownloadHref(mediaType, content));
+  download.setAttribute("download", filename);
+  download.setAttribute("rel", "noopener");
+  download.setAttribute("aria-label", `${label}: ${filename}`);
+  appendText(document, download, label);
+  controls.appendChild(download);
+  target.appendChild(controls);
+}
+
+function csvCell(value) {
+  let text = value === null ? "" : String(value);
+  if (typeof value === "string" && /^[\t ]*[=+@-]/u.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/gu, '""')}"`;
+}
+
+function tableCsv(spec) {
+  const rows = [
+    spec.columns.map(({ label }) => csvCell(label)),
+    ...spec.rows.map((row) => spec.columns.map(({ key }) => csvCell(row[key]))),
+  ];
+  return `\ufeff${rows.map((row) => row.join(",")).join("\r\n")}\r\n`;
 }
 
 function escapedAt(value, index) {
@@ -511,6 +614,7 @@ function renderPlot(document, target, artifact) {
   });
   const descriptionId = `plot-description-${artifact.id.slice(4)}`;
   const svg = createSvg(document, "svg", {
+    xmlns: SVG_NS,
     viewBox: `0 0 ${dimensions.width} ${dimensions.height}`,
     width: dimensions.width,
     height: dimensions.height,
@@ -659,6 +763,12 @@ function renderPlot(document, target, artifact) {
     legend.appendChild(item);
   });
   target.appendChild(legend);
+  appendArtifactDownload(document, target, {
+    label: "Download SVG",
+    filename: artifactDownloadFilename(artifact, "agent-plot", "svg"),
+    mediaType: "image/svg+xml",
+    content: `<?xml version="1.0" encoding="UTF-8"?>\n${serializeStandalonePlot(svg)}\n`,
+  });
 }
 
 function renderTable(document, target, artifact) {
@@ -687,6 +797,12 @@ function renderTable(document, target, artifact) {
   table.appendChild(body);
   wrapper.appendChild(table);
   target.appendChild(wrapper);
+  appendArtifactDownload(document, target, {
+    label: "Download CSV",
+    filename: artifactDownloadFilename(artifact, "agent-table", "csv"),
+    mediaType: "text/csv",
+    content: tableCsv(artifact.spec),
+  });
 }
 
 function renderSources(document, target, artifact) {

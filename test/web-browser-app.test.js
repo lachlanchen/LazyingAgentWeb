@@ -2062,7 +2062,7 @@ test("verified Agent failure refreshes and renders its public reason as literal 
   assert.equal(statuses, 1);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
   const assistant = browser.document.getElementById("messages").children
-    .find((node) => node.dataset.runId === RUN_ID);
+    .find((node) => node.dataset.role === "assistant" && node.dataset.runId === RUN_ID);
   const body = assistant.children.find((node) => node.className === "message-content");
   assert.equal(body.children.length, 1);
   assert.equal(body.children[0].tagName, "p");
@@ -2819,7 +2819,9 @@ test("live Agent artifacts render inline beneath their exact assistant run", asy
 
   const messages = browser.document.getElementById("messages");
   assert.equal(messages.children.length, 2);
-  const assistant = messages.children.find((node) => node.dataset.runId === RUN_ID);
+  const assistant = messages.children.find((node) => (
+    node.dataset.role === "assistant" && node.dataset.runId === RUN_ID
+  ));
   assert(assistant);
   assert.match(assistant.textContent, /Live answer/u);
   assert.match(assistant.textContent, /Live table/u);

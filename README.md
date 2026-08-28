@@ -62,8 +62,11 @@ boundary, and replaceable-node contract are specified in
   browser-password-manager integration, durable thread restoration, resumable
   streaming, explicit cancellation, optional one-to-four-image Direct Chat input,
   Markdown, KaTeX math, and safe declarative plot/table/Markdown rendering,
+  deterministic client-only SVG/CSV downloads for inline plots and tables,
   plus capability-gated text-only source cards that never fetch automatically
-  and safe Open/Download controls for AgInTi-owned PDF/TeX files.
+  and safe Open/Download controls for AgInTi-owned PDF/TeX files. Agent threads
+  have a separately confirmed AgInTi-owned cleanup control; it never calls the
+  Direct Chat deletion route.
 - A root-only Node HTTP/BFF with exact routes, host/origin/fetch-metadata/CSRF
   enforcement, opaque remembered sessions, bounded request/stream/job
   admission, owner-safe response projections, and graceful job draining.
@@ -114,6 +117,8 @@ stateless. Agent mode is only another frontend for AgInTi: the cloud database
 must not contain AgInTi messages, summaries, plans, tool calls/results,
 commands, workspace paths, runtime policy, artifact bodies, or sandbox state.
 Removing a cloud Agent index cannot delete its authoritative AgInTi thread.
+Only the explicit confirmed Agent cleanup control calls AgInTi's thread-delete
+RPC, and interrupted retries retain one exact idempotency key.
 
 ## PWA releases and latest-version reload
 

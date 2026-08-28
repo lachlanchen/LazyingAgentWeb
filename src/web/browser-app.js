@@ -1,4 +1,4 @@
-import { AgintiBrowserClient, selectDefaultMode } from "./aginti-client.js";
+import { AgintiBrowserClient, AgintiTransportError, selectDefaultMode } from "./aginti-client.js";
 import {
   AgintiProtocolError,
   FAIL_CLOSED_AGENT_CAPABILITIES,
@@ -1221,6 +1221,7 @@ export function createBrowserApp({
     chatOutput: "",
     chatPendingSend: null,
     chatPendingDeletion: null,
+    agentPendingDeletion: null,
     chatFinalization: null,
     chatHistoryRestoration: null,
     chatFailureDiagnostic: null,
@@ -1541,6 +1542,7 @@ export function createBrowserApp({
     state.chatGeneration = null;
     state.chatPendingSend = workflow;
     state.chatPendingDeletion = null;
+    state.agentPendingDeletion = null;
     state.chatFinalization = null;
     state.runId = null;
     state.agentRunStatus = null;
@@ -1573,7 +1575,8 @@ export function createBrowserApp({
     return state.mode === "agent" && (state.busy
       || state.agentHistoryRestoring || state.agentReplayValidating
       || state.agentCancelPending
-      || state.agentPendingThreadCreate !== null || state.agentPendingResume !== null);
+      || state.agentPendingThreadCreate !== null || state.agentPendingResume !== null
+      || state.agentPendingDeletion !== null);
   }
 
   function flushDeferredSessionRevalidation() {
@@ -1726,7 +1729,7 @@ export function createBrowserApp({
     elements.search_toggle.setAttribute("aria-pressed", state.agentSearchSelected ? "true" : "false");
     elements.search_options.hidden = !available || !state.agentSearchSelected;
     elements.search_limit.max = String(maximum);
-    const disabled = !available || interactionLocked();
+    const disabled = !available || interactionLocked() || state.agentPendingDeletion !== null;
     elements.search_toggle.disabled = disabled;
     elements.search_mode.disabled = disabled || !state.agentSearchSelected;
     elements.search_limit.disabled = disabled || !state.agentSearchSelected;
@@ -1789,6 +1792,7 @@ export function createBrowserApp({
       && state.chatCapabilities.visionInput === true;
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
+    const pendingAgentDeletion = state.mode === "agent" && state.agentPendingDeletion !== null;
     const locked = interactionLocked();
     const pendingAgentResume = state.mode === "agent" && state.agentPendingResume !== null;
     const agentDispatchFenced = state.mode === "agent" && state.agentReplayFailed;
@@ -1812,22 +1816,25 @@ export function createBrowserApp({
       || (state.selectedImages.length === 0 && !state.imagePreparing);
     elements.message_input.disabled = !state.session.authenticated || (locked && !pendingAgentResume)
       || state.imagePreparing || pendingChatSend
-      || pendingChatDeletion
+      || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft || state.retainedUpdateRecoveryPending
       || state.agentAuthenticationRecoveryPending;
     elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
-      || pendingChatDeletion
+      || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft || agentDispatchFenced
       || (state.legacyUpdateRecoveryPending && !searchChoiceReady)
       || (state.retainedUpdateRecoveryPending && !searchChoiceReady)
       || (state.agentAuthenticationRecoveryPending && !searchChoiceReady);
-    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend || pendingChatDeletion
+    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend
+      || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft;
     elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
-      || pendingChatDeletion || preservingAuthenticationDraft;
+      || pendingChatDeletion || pendingAgentDeletion || preservingAuthenticationDraft;
     elements.chat_mode.disabled = !state.session.authenticated || locked || pendingChatDeletion
+      || pendingAgentDeletion
       || preservingAuthenticationDraft;
-    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
+    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend
+      || pendingChatDeletion || pendingAgentDeletion
       ? "true" : "false");
     elements.workspace.setAttribute("aria-busy", state.chatFinalization === null ? "false" : "true");
     for (const row of elements.thread_list.children ?? []) {
@@ -1836,7 +1843,7 @@ export function createBrowserApp({
         button.disabled = locked || pendingChatSend || button.dataset.threadBlocked === "true"
           || (state.agentSearchRecoveryChoicePending
             && !agentRecoveryThreadRetryAllowed(button.dataset.threadId))
-          || (pendingChatDeletion && button.dataset.threadDeleteRetry !== "true");
+          || ((pendingChatDeletion || pendingAgentDeletion) && button.dataset.threadDeleteRetry !== "true");
       }
     }
     updateSearchControl();
@@ -1886,6 +1893,10 @@ export function createBrowserApp({
     }
     if (changed && state.mode === "agent" && state.agentPendingThreadCreate !== null) {
       showToast("Retry the ready prompt to confirm its exact Agent conversation before changing modes.");
+      return;
+    }
+    if (changed && state.mode === "agent" && state.agentPendingDeletion !== null) {
+      showToast("Retry the pending Agent conversation deletion before changing modes.");
       return;
     }
     if (changed && state.mode === "chat" && state.chatPendingDeletion) {
@@ -2399,7 +2410,7 @@ export function createBrowserApp({
     elements.thread_list.replaceChildren();
     const mode = state.mode;
     const selected = currentThreadId();
-    const pendingDeletion = mode === "chat" ? state.chatPendingDeletion : null;
+    const pendingDeletion = mode === "agent" ? state.agentPendingDeletion : state.chatPendingDeletion;
     currentThreads().forEach((thread) => {
       const threadId = mode === "agent" ? thread.id : thread.threadId;
       const title = thread.title || "New conversation";
@@ -2407,32 +2418,42 @@ export function createBrowserApp({
       open.className = "thread-open";
       open.disabled = interactionLocked() || (mode === "chat"
         && (state.chatPendingSend !== null || pendingDeletion !== null))
+        || (mode === "agent" && pendingDeletion !== null)
         || (mode === "agent" && state.agentSearchRecoveryChoicePending
           && !agentRecoveryThreadRetryAllowed(threadId));
       open.dataset.threadId = threadId;
       open.dataset.mode = mode;
       open.setAttribute("aria-current", threadId === selected ? "true" : "false");
-      if (mode === "agent") {
-        elements.thread_list.appendChild(open);
-        return;
-      }
       const row = document.createElement("div");
       row.className = "thread-row";
       row.dataset.threadId = threadId;
-      row.dataset.mode = "chat";
+      row.dataset.mode = mode;
       const retryingDeletion = pendingDeletion?.threadId === threadId
-        && pendingDeletion.session === state.session && pendingDeletion.chat === state.chat;
+        && pendingDeletion.session === state.session
+        && (mode === "agent" ? pendingDeletion.agent === state.agent : pendingDeletion.chat === state.chat);
       const remove = makeButton(document, retryingDeletion ? "Retry" : "Delete", () => {
-        void deleteChatThread(threadId);
+        if (mode === "agent") void deleteAgentThread(threadId);
+        else void deleteChatThread(threadId);
       });
       remove.className = "thread-delete";
-      remove.setAttribute("aria-label", `${retryingDeletion ? "Retry deleting" : "Delete"} ${title}`);
-      remove.setAttribute("title", `${retryingDeletion ? "Retry deleting" : "Delete"} ${title}`);
+      const deleteLabel = `${retryingDeletion ? "Retry deleting" : "Delete"}${mode === "agent" ? " Agent conversation" : ""} ${title}`;
+      remove.setAttribute("aria-label", deleteLabel);
+      remove.setAttribute("title", deleteLabel);
       remove.dataset.threadDeleteRetry = retryingDeletion ? "true" : "false";
-      remove.dataset.threadBlocked = thread.currentGenerationId !== null
-        || (pendingDeletion !== null && !retryingDeletion) ? "true" : "false";
-      remove.disabled = interactionLocked() || state.chatPendingSend !== null
-        || thread.currentGenerationId !== null || (pendingDeletion !== null && !retryingDeletion);
+      const agentRunActive = mode === "agent" && state.runId !== null
+        && !TERMINAL.has(state.agentRunStatus);
+      const threadHasActiveWork = mode === "agent"
+        ? thread.status !== "idle" || agentRunActive
+        : thread.currentGenerationId !== null;
+      const recoveryBlocksAgentDeletion = mode === "agent"
+        && (state.retainedUpdateRecoveryPending || state.agentAuthenticationRecoveryPending
+          || state.legacyUpdateRecoveryPending || state.agentSearchRecoveryChoicePending
+          || state.agentReplayFailed);
+      const deletionBlocked = (!retryingDeletion && (threadHasActiveWork || pendingDeletion !== null
+        || recoveryBlocksAgentDeletion));
+      remove.dataset.threadBlocked = deletionBlocked ? "true" : "false";
+      remove.disabled = interactionLocked() || (mode === "chat" && state.chatPendingSend !== null)
+        || deletionBlocked;
       row.appendChild(open);
       row.appendChild(remove);
       elements.thread_list.appendChild(row);
@@ -3432,6 +3453,209 @@ export function createBrowserApp({
     });
   }
 
+  function currentAgentThreadDeletion(pending) {
+    return pending !== null && pending !== undefined
+      && pending.session === state.session && pending.agent === state.agent
+      && state.session.authenticated && state.mode === "agent";
+  }
+
+  function agentDeletionAlreadyAbsent(error) {
+    return error instanceof AgintiTransportError && error.status === 404;
+  }
+
+  function definitiveAgentDeletionRejection(error) {
+    return error instanceof AgintiTransportError && error.retryable === false
+      && Number.isSafeInteger(error.status) && error.status >= 400 && error.status < 500
+      && error.status !== 404;
+  }
+
+  function finishAgentThreadDeletion(pending) {
+    if (!currentAgentThreadDeletion(pending)) return false;
+    const threadId = pending.threadId;
+    const previousIndex = state.agentThreads.findIndex((thread) => thread.id === threadId);
+    state.agentThreads = state.agentThreads.filter((thread) => thread.id !== threadId);
+    if (state.agentPendingDeletion === pending) state.agentPendingDeletion = null;
+    if (state.agentThreadId === threadId) {
+      state.viewEpoch += 1;
+      state.streamAbort?.abort();
+      state.streamAbort = null;
+      state.streamKind = null;
+      state.agentThreadId = null;
+      state.runId = null;
+      state.agentRunStatus = null;
+      state.agentPendingResume = null;
+      state.agentReplayFailed = false;
+      clearConversation();
+      elements.conversation_title.textContent = "New conversation";
+    }
+    connection("Connected");
+    renderThreads();
+    focusSoon(() => focusAfterThreadDeletion(previousIndex));
+    showToast("Agent conversation deleted.");
+    return true;
+  }
+
+  async function reconcileAgentThreadDeletion(pending) {
+    let authoritative;
+    try {
+      const response = await pending.agent.getThread(pending.threadId);
+      authoritative = response.thread;
+    } catch (error) {
+      if (!currentAgentThreadDeletion(pending)) return false;
+      if (agentDeletionAlreadyAbsent(error)) return finishAgentThreadDeletion(pending);
+      if (isChatAuthenticationAfterAmbiguousDispatch(error)) {
+        if (state.agentPendingDeletion === pending) state.agentPendingDeletion = null;
+        requireFreshAuthentication({ agentRecovery: null });
+        return false;
+      }
+      renderThreads();
+      focusSoon(() => focusThreadDeleteControl(pending.threadId));
+      connection("Agent deletion confirmation paused", false);
+      showToast("The Agent deletion response is still uncertain. Retry reuses the exact same request.");
+      return false;
+    }
+    if (!currentAgentThreadDeletion(pending) || authoritative.id !== pending.threadId) return false;
+    const index = state.agentThreads.findIndex((thread) => thread.id === pending.threadId);
+    if (index >= 0) {
+      state.agentThreads = state.agentThreads.map((thread, candidate) => (
+        candidate === index ? authoritative : thread
+      ));
+    }
+    if (authoritative.status !== "deleting"
+        && (authoritative.status !== "idle" || authoritative.revision !== pending.revision
+          || authoritative.lastRunId !== pending.lastRunId)) {
+      if (state.agentPendingDeletion === pending) state.agentPendingDeletion = null;
+      renderThreads();
+      focusSoon(() => focusThreadDeleteControl(pending.threadId));
+      connection("Connected");
+      showToast("Agent deletion stopped because this conversation changed or started new work.");
+      return false;
+    }
+    renderThreads();
+    focusSoon(() => focusThreadDeleteControl(pending.threadId));
+    connection("Agent deletion confirmation paused", false);
+    showToast(authoritative.status === "deleting"
+      ? "Agent deletion is still completing. Retry confirms the exact same request."
+      : "The Agent deletion response is still uncertain. Retry reuses the exact same request.");
+    return false;
+  }
+
+  async function deleteAgentThread(threadId) {
+    if (interactionLocked() || !state.session.authenticated || state.mode !== "agent") return false;
+    let retained = state.agentPendingDeletion;
+    if (retained !== null && (!currentAgentThreadDeletion(retained) || retained.threadId !== threadId)) {
+      if (!currentAgentThreadDeletion(retained)) {
+        state.agentPendingDeletion = null;
+        retained = null;
+      } else {
+        showToast("Retry the pending Agent conversation deletion before deleting another conversation.");
+        focusSoon(() => focusThreadDeleteControl(retained.threadId));
+        return false;
+      }
+    }
+    const thread = state.agentThreads.find((item) => item.id === threadId);
+    if (!thread) {
+      return retained !== null && retained.threadId === threadId
+        ? finishAgentThreadDeletion(retained)
+        : false;
+    }
+    const anyRunActive = state.runId !== null && !TERMINAL.has(state.agentRunStatus);
+    if (retained === null && (thread.status !== "idle" || anyRunActive || state.agentReplayFailed
+        || state.retainedUpdateRecoveryPending || state.agentAuthenticationRecoveryPending
+        || state.legacyUpdateRecoveryPending || state.agentSearchRecoveryChoicePending)) {
+      showToast("Finish or verify current Agent work before deleting a conversation.");
+      return false;
+    }
+
+    const session = state.session;
+    const agent = state.agent;
+    state.busy = true;
+    updateImageControl();
+    renderThreads();
+    let releaseRefreshTarget = null;
+    try {
+      let pending = retained;
+      if (pending === null) {
+        let confirmed = false;
+        try {
+          confirmed = await confirmThreadDeletion(
+            `Delete Agent conversation “${thread.title || "New conversation"}” and all of its messages, execution history, and artifacts? This cannot be undone.`,
+          ) === true;
+        } catch {
+          confirmed = false;
+        }
+        if (!confirmed || state.session !== session || state.agent !== agent
+            || !state.session.authenticated || state.mode !== "agent") return false;
+        const current = state.agentThreads.find((item) => item.id === threadId);
+        if (!current || current.status !== "idle" || current.revision !== thread.revision
+            || current.lastRunId !== thread.lastRunId
+            || (state.runId !== null && !TERMINAL.has(state.agentRunStatus))) {
+          showToast("This Agent conversation changed before deletion. Reopen it and try again.");
+          return false;
+        }
+        requiredMethod(agent, "deleteThread", "agent client");
+        requiredMethod(agent, "getThread", "agent client");
+        pending = Object.freeze({
+          session,
+          agent,
+          threadId,
+          revision: thread.revision,
+          lastRunId: thread.lastRunId,
+          idempotency: createBrowserOpaqueId("agent_delete"),
+        });
+        state.agentPendingDeletion = pending;
+      }
+
+      let result = null;
+      let ambiguous = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          result = await pending.agent.deleteThread(pending.threadId, {
+            idempotency: pending.idempotency,
+          });
+          ambiguous = null;
+          break;
+        } catch (error) {
+          if (!currentAgentThreadDeletion(pending)) return false;
+          if (agentDeletionAlreadyAbsent(error)) return finishAgentThreadDeletion(pending);
+          if (definitiveAgentDeletionRejection(error)) throw error;
+          ambiguous = error;
+          if (attempt === 0) {
+            connection("Retrying the same Agent deletion", false);
+            await wait(250);
+          }
+        }
+      }
+      if (result !== null) {
+        if (!currentAgentThreadDeletion(pending) || result.deleted !== true
+            || result.threadId !== pending.threadId) return false;
+        return finishAgentThreadDeletion(pending);
+      }
+      if (ambiguous !== null) return await reconcileAgentThreadDeletion(pending);
+      return false;
+    } catch (error) {
+      releaseRefreshTarget = clientReleaseMismatch(error);
+      const pending = state.agentPendingDeletion;
+      if (pending !== null && currentAgentThreadDeletion(pending)) state.agentPendingDeletion = null;
+      if (releaseRefreshTarget !== null) {
+        connection("Refreshing browser app", false);
+      } else if (isChatAuthenticationAfterAmbiguousDispatch(error)) {
+        requireFreshAuthentication({ agentRecovery: null });
+      } else if (error instanceof AgintiTransportError && error.status === 409) {
+        showToast("Agent deletion stopped because this conversation changed or still has unresolved work.");
+      } else {
+        showToast("Agent conversation deletion was rejected before it could be confirmed.");
+      }
+      return false;
+    } finally {
+      state.busy = false;
+      updateImageControl();
+      renderThreads();
+      flushDeferredSessionRevalidation();
+      if (releaseRefreshTarget !== null) await refreshForReleaseMismatch(releaseRefreshTarget);
+    }
+  }
+
   function currentThreadDeletion(pending) {
     return pending !== null && pending !== undefined
       && pending.session === state.session && pending.chat === state.chat
@@ -3913,6 +4137,11 @@ export function createBrowserApp({
       showToast("Retry the ready prompt to confirm its exact Agent conversation before opening another one.");
       return;
     }
+    if (mode === "agent" && state.agentPendingDeletion !== null) {
+      showToast("Retry the pending Agent conversation deletion before opening another conversation.");
+      focusSoon(() => focusThreadDeleteControl(state.agentPendingDeletion.threadId));
+      return;
+    }
     if (mode === "chat" && state.chatPendingDeletion) {
       showToast("Retry the pending conversation deletion before opening another conversation.");
       return;
@@ -4107,7 +4336,10 @@ export function createBrowserApp({
       state.agentSearchSelected = false;
       updateSearchControl();
     }
-    messageNode("user", text);
+    // Bind the accepted turn before the event stream starts. This keeps the
+    // visible prompt, the assistant placeholder, and every follow-up on the
+    // same server-owned run even if the first SSE read pauses or reconnects.
+    messageNode("user", text, { runId: accepted.id });
     await streamAgentRun(accepted, { expectedThreadId: threadId });
   }
 
@@ -4451,6 +4683,11 @@ export function createBrowserApp({
       showToast("Retry the pending conversation deletion before sending another message.");
       return;
     }
+    if (state.mode === "agent" && state.agentPendingDeletion) {
+      showToast("Retry the pending Agent conversation deletion before sending another message.");
+      focusSoon(() => focusThreadDeleteControl(state.agentPendingDeletion.threadId));
+      return;
+    }
     if (state.mode === "agent" && (state.agentHistoryRestoring || state.agentReplayFailed)) {
       showToast(state.agentHistoryRestoring
         ? "Wait for verified Agent history to finish restoring before creating more work."
@@ -4659,6 +4896,7 @@ export function createBrowserApp({
       && recoveryRetainedRecord !== null
       && !retainedUpdateRecoveryInstallationCurrent(recoveryRetainedRecord);
     state.chatPendingDeletion = null;
+    state.agentPendingDeletion = null;
     purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
     if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
@@ -4713,6 +4951,7 @@ export function createBrowserApp({
       state.chatOutput = sameAccountRecoveryGeneration?.output ?? "";
       state.chatPendingSend = sameAccountRecoveryWorkflow;
       state.chatPendingDeletion = null;
+      state.agentPendingDeletion = null;
       state.chatFinalization = null;
       state.runId = null;
       state.agentRunStatus = null;
@@ -5184,6 +5423,7 @@ export function createBrowserApp({
     state.chatGeneration = null;
     state.chatPendingSend = null;
     state.chatPendingDeletion = null;
+    state.agentPendingDeletion = null;
     state.chatFinalization = null;
     state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
     clearSelectedImage();
@@ -5607,6 +5847,11 @@ export function createBrowserApp({
       showToast("Retry the ready prompt to confirm its exact Agent conversation before creating another one.");
       return;
     }
+    if (state.mode === "agent" && state.agentPendingDeletion !== null) {
+      showToast("Retry the pending Agent conversation deletion before creating another conversation.");
+      focusSoon(() => focusThreadDeleteControl(state.agentPendingDeletion.threadId));
+      return;
+    }
     if (state.mode === "agent" && state.agentReplayFailed
         && !detachingRetainedAgentRecovery && !detachingAuthenticationAgentRecovery
         && !state.legacyUpdateRecoveryPending) {
@@ -5692,6 +5937,7 @@ export function createBrowserApp({
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentReplayFailed || state.agentCancelPending
       || state.agentPendingResume !== null || state.agentPendingThreadCreate !== null
+      || state.agentPendingDeletion !== null
       || state.legacyUpdateRecoveryPending || state.unavailableAgentUpdateRecovery
       || state.agentSearchRecoveryChoicePending
       || state.retainedUpdateRecoveryPending
@@ -6758,6 +7004,7 @@ export function createBrowserApp({
     stop,
     resume,
     openThread,
+    deleteAgentThread,
     deleteChatThread,
     setMode,
   });

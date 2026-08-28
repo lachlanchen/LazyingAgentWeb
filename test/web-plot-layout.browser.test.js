@@ -183,7 +183,7 @@ const BROWSER_FIXTURE = `<!doctype html>
 <meta name="lazying-agent-release" content="release-${"f".repeat(64)}">
 <style>${BRIGHT_APP_CSS}</style></head><body>
 <div class="app-view">
-  <aside id="sidebar" class="sidebar"><header class="brand">Private conversations</header><nav id="thread-list" class="thread-list"><button class="thread-open" aria-current="true">A deliberately long Agent conversation title</button></nav></aside><button class="sidebar-scrim" hidden></button>
+  <aside id="sidebar" class="sidebar"><header class="brand">Private conversations</header><nav id="thread-list" class="thread-list"><div class="thread-row" data-mode="agent"><button class="thread-open" aria-current="true">A deliberately long Agent conversation title</button><button class="thread-delete" aria-label="Delete Agent conversation">Delete</button></div></nav></aside><button class="sidebar-scrim" hidden></button>
   <section id="workspace" class="workspace">
     <header class="topbar"><button id="open-sidebar" class="icon-button" type="button" aria-label="Open conversations">☰</button><div class="conversation-meta"><strong id="conversation-title">An intentionally very long adversarial Agent conversation title that must stay on one row</strong><span class="connection-state" role="status">Connected · Agent available</span></div><div class="mode-switch" role="group" aria-label="Conversation mode"><button type="button" aria-pressed="true">Agent</button><button type="button" aria-pressed="false">Chat</button></div><label class="theme-label">Theme<select><option>Bright</option></select></label><details id="topbar-info" class="topbar-info"><summary aria-label="Show app and capability information">Info</summary><p id="capability-note" class="capability-note">Agent capabilities and local storage information.</p></details></header><div hidden></div><div hidden></div>
     <div class="chat-scroll"><section class="messages"><article class="message" data-role="assistant">
@@ -309,7 +309,12 @@ const GEOMETRY_EXPRESSION = `(() => {
   const fileTargetRect = rectangle(fileTarget);
   const fileControlsRect = rectangle(fileControls);
   const sidebar = document.querySelector('#sidebar');
-  const agentThreadOpenHeight = document.querySelector('#thread-list > .thread-open').getBoundingClientRect().height;
+  const agentThreadRow = document.querySelector('#thread-list > .thread-row');
+  const agentThreadOpen = agentThreadRow.querySelector('.thread-open');
+  const agentThreadDelete = agentThreadRow.querySelector('.thread-delete');
+  const agentThreadRowRect = rectangle(agentThreadRow);
+  const agentThreadOpenRect = rectangle(agentThreadOpen);
+  const agentThreadDeleteRect = rectangle(agentThreadDelete);
   sidebar.hidden = true;
   const maskedWorkspace = rectangle(document.querySelector('#workspace'));
   sidebar.hidden = false;
@@ -366,7 +371,14 @@ const GEOMETRY_EXPRESSION = `(() => {
       minimumActionHeight: Math.min(...fileActions.map((node) => node.getBoundingClientRect().height)),
       hrefs: fileActions.map((node) => node.href),
     },
-    agentThreadOpenHeight,
+    agentThread: {
+      row: agentThreadRowRect,
+      open: agentThreadOpenRect,
+      remove: agentThreadDeleteRect,
+      controlsInsideRow: contains(agentThreadRowRect, agentThreadOpenRect)
+        && contains(agentThreadRowRect, agentThreadDeleteRect),
+      controlsOverlap: overlaps([agentThreadOpen, agentThreadDelete]),
+    },
     maskPreserved: workspace.left === maskedWorkspace.left && workspace.width === maskedWorkspace.width,
     pageOverflow: document.documentElement.scrollWidth > innerWidth,
     categorical: chart(categoricalTarget),
@@ -479,7 +491,12 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.equal(result.file.actionsInsideControls, true);
       assert.equal(result.file.actionsOverlap, false);
       assert.ok(result.file.minimumActionHeight >= 44);
-      assert.ok(result.agentThreadOpenHeight >= 44);
+      assert.equal(result.agentThread.controlsInsideRow, true);
+      assert.equal(result.agentThread.controlsOverlap, false);
+      assert.ok(result.agentThread.open.height >= 44);
+      assert.ok(result.agentThread.remove.height >= 44);
+      assert.ok(result.agentThread.open.right <= result.agentThread.remove.left,
+        `${label} Agent title and Delete controls overlap: ${JSON.stringify(result.agentThread)}`);
       assert.deepEqual(result.file.hrefs, [
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}`,
         `http://127.0.0.1:${new URL(origin).port}/api/agent/artifacts/art_${"e".repeat(64)}/content?v=release-${"f".repeat(64)}&download=1`,
@@ -523,8 +540,8 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       })) {
         assert.equal(chart.ticksClipped, false, `${label} ${name} ticks clip`);
         assert.equal(chart.xTicksOverlap, false, `${label} ${name} x ticks overlap: ${JSON.stringify(chart.xTickRects)}`);
-        assert.equal(chart.xTickAnchors[0], "start");
-        assert.equal(chart.xTickAnchors.at(-1), "end");
+        assert.equal(chart.xTickAnchors[0], "start", `${label} ${name} first x tick: ${JSON.stringify(chart)}`);
+        assert.equal(chart.xTickAnchors.at(-1), "end", `${label} ${name} last x tick: ${JSON.stringify(chart)}`);
       }
       assert.equal(result.narrowOffsetOverlapsLabel, false, `${label} narrow offset overlaps the x-axis label`);
       assert.equal(new Set(result.narrowScientific.xTickTexts).size, 5, `${label} narrow ticks are not distinct`);

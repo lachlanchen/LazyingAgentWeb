@@ -29,7 +29,11 @@ resume mutations use immutable idempotency keys; one retry may resolve an
 uncertain transport result without duplicating a run. A rejected prompt remains
 editable and is not rendered as accepted history. Plot artifacts explicitly
 occupy the workspace column and scale to the available message width, with
-readable mobile ticks, non-scaling strokes, and wrapping legends.
+readable mobile ticks, non-scaling strokes, and wrapping legends. The browser
+can export that already-validated SVG and validated table rows as deterministic
+client-only SVG/CSV data downloads. Export performs no fetch or cloud write;
+CSV text cells that could be interpreted as spreadsheet formulas are prefixed
+as literal text.
 When a release fence requires a full-page refresh while an Agent follow-up is
 still unsent, the encrypted handoff retains the Agent mode and owned thread ID.
 The successor page reloads and verifies that thread, derives its authoritative
@@ -291,6 +295,12 @@ Direct Chat:
   only after authoritative success. A transport ambiguity retries the identical
   prepared ticket. The server's durable receipt permits exact replay while
   permanently preventing reuse of the deleted thread ID.
+- Agent-thread cleanup is a separate confirmed AgInTi mutation. The browser
+  refuses it during active or unverified Agent work, never calls the Direct Chat
+  deletion route, and clears the selected presentation only after authoritative
+  success or an authenticated 404. An interrupted response retains one exact
+  idempotency key; an exact thread read either proves absence, preserves the
+  retry fence, or stops deletion when the thread changed.
 - Before calling LocalLLM, one cloud worker claims a durable lease with a
   monotonic fence and marks dispatch started. Append, finalize, failure, and
   renewal require that proof. A restarted or stale worker cannot continue after

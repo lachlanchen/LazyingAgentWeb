@@ -755,7 +755,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .icon-button { display: none; }
 .sidebar-scrim { display: none; }
 .install-app { width: 100%; }
-.toast { position: fixed; left: 50%; bottom: 1rem; z-index: 8; transform: translateX(-50%); padding: .7rem 1rem; border-radius: 12px; background: var(--text); color: var(--surface); }
+.toast { position: fixed; left: 50%; bottom: 1rem; z-index: 8; width: max-content; max-width: min(calc(100% - 2rem), 36rem); transform: translateX(-50%); padding: .7rem 1rem; border-radius: 12px; background: var(--text); color: var(--surface); line-height: 1.4; overflow-wrap: anywhere; pointer-events: none; text-align: center; white-space: normal; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 [hidden] { display: none !important; }
 @media (max-width: 760px) {
@@ -783,6 +783,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .composer-actions { justify-content: flex-end; }
   .message { max-width: 94%; }
   .message[data-role="assistant"] { width: 94%; max-width: 94%; }
+  .toast { top: calc(max(56px, env(safe-area-inset-top) + 48px) + .5rem); bottom: auto; max-width: calc(100% - 1rem); }
   .plot-tick { font-size: 24px; }
   .plot-y-tick { font-size: 22px; }
   .plot-axis-label { font-size: 24px; }

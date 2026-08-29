@@ -1010,6 +1010,31 @@ test("the compact topbar is one row with an ellipsized title and collapsed capab
   assert.match(noteRule[1], /white-space:\s*normal;/u);
 });
 
+test("toasts never block controls and move below the one-row mobile header", () => {
+  const toastRule = /(?:^|\n)\.toast \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(toastRule);
+  assert.match(toastRule[1], /bottom:\s*1rem;/u);
+  assert.match(toastRule[1], /width:\s*max-content;/u);
+  assert.match(toastRule[1], /max-width:\s*min\(calc\(100% - 2rem\), 36rem\);/u);
+  assert.match(toastRule[1], /overflow-wrap:\s*anywhere;/u);
+  assert.match(toastRule[1], /pointer-events:\s*none;/u);
+  assert.match(toastRule[1], /white-space:\s*normal;/u);
+
+  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
+  assert.ok(mobileStart >= 0);
+  assert.ok(mobileEnd > mobileStart);
+  const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
+  const mobileToastRule = /\.toast \{([^}]*)\}/u.exec(mobileCss);
+  assert.ok(mobileToastRule);
+  assert.match(
+    mobileToastRule[1],
+    /top:\s*calc\(max\(56px, env\(safe-area-inset-top\) \+ 48px\) \+ \.5rem\);/u,
+  );
+  assert.match(mobileToastRule[1], /bottom:\s*auto;/u);
+  assert.match(mobileToastRule[1], /max-width:\s*calc\(100% - 1rem\);/u);
+});
+
 test("mobile thread rows reserve non-overlapping title and full Delete control rectangles", () => {
   const rowRule = /\.thread-row \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
   const openRule = /\.thread-open \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);

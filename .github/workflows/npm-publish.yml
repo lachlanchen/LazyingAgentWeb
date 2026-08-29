@@ -72,13 +72,6 @@ jobs:
           test "$(node -p "require('./package.json').publishConfig.registry")" = 'https://registry.npmjs.org/'
           test "$(node -p "require('./package.json').publishConfig.access")" = public
 
-      - name: Install and test exact tag
-        run: |
-          set -euo pipefail
-          npm ci --ignore-scripts
-          npm run check
-          npm test
-
       - name: Reproduce and authenticate release package
         id: package
         shell: bash
@@ -88,12 +81,29 @@ jobs:
           set -euo pipefail
           npm pack --json --ignore-scripts > "$RUNNER_TEMP/npm-pack.json"
           TARBALL="$(node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8'));const x=Array.isArray(p)?p:Object.values(p);if(x.length!==1||typeof x[0].filename!=='string')process.exit(1);process.stdout.write(x[0].filename)" "$RUNNER_TEMP/npm-pack.json")"
-          test "$TARBALL" = "lazyingart-agent-web-${RELEASE_TAG#v}.tgz"
+          EXPECTED_TARBALL="lazyingart-agent-web-${RELEASE_TAG#v}.tgz"
+          if [[ "$TARBALL" != "$EXPECTED_TARBALL" ]]; then
+            echo "npm pack returned '$TARBALL'; expected '$EXPECTED_TARBALL'." >&2
+            exit 1
+          fi
           mkdir "$RUNNER_TEMP/release-asset"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$TARBALL" --dir "$RUNNER_TEMP/release-asset"
-          cmp --silent "$TARBALL" "$RUNNER_TEMP/release-asset/$TARBALL"
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          sha256sum "$TARBALL"
+          RELEASE_TARBALL="$RUNNER_TEMP/release-asset/$TARBALL"
+          LOCAL_SHA256="$(sha256sum "$TARBALL" | cut -d ' ' -f 1)"
+          RELEASE_SHA256="$(sha256sum "$RELEASE_TARBALL" | cut -d ' ' -f 1)"
+          printf 'Reproduced SHA-256: %s\nRelease asset SHA-256: %s\n' "$LOCAL_SHA256" "$RELEASE_SHA256"
+          if [[ "$LOCAL_SHA256" != "$RELEASE_SHA256" ]] || ! cmp --silent "$TARBALL" "$RELEASE_TARBALL"; then
+            echo "Fresh immutable-tag pack differs from the published release asset; refusing publication." >&2
+            exit 1
+          fi
+          echo "tarball=$RELEASE_TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Install and test exact tag
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm run check
+          npm test
 
       - name: Publish exact package with npm trusted publishing
         shell: bash
@@ -102,4 +112,4 @@ jobs:
         run: |
           set -euo pipefail
           npm ping
-          node scripts/npm-publish-idempotent.mjs "./$TARBALL"
+          node scripts/npm-publish-idempotent.mjs "$TARBALL"

@@ -117,12 +117,21 @@ jobs:
             echo "Package contains a link or special filesystem entry; refusing publication." >&2
             exit 1
           fi
-          LC_ALL=C find "$FRESH_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/fresh-package.manifest"
-          LC_ALL=C find "$RELEASE_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/release-package.manifest"
+          if [[ -n "$(find "$FRESH_TREE/package" -perm /7022 -print -quit)" ]] \
+            || [[ -n "$(find "$RELEASE_TREE/package" -perm /7022 -print -quit)" ]]; then
+            echo "Package contains a special or group/world-writable mode; refusing publication." >&2
+            exit 1
+          fi
+          LC_ALL=C find "$FRESH_TREE/package" -printf '%y\t%m\t%s\t%P\n' \
+            | awk -F '\t' 'BEGIN { OFS="\t" } { $2=substr($2, 1, 1); print }' \
+            | LC_ALL=C sort > "$RUNNER_TEMP/fresh-package.manifest"
+          LC_ALL=C find "$RELEASE_TREE/package" -printf '%y\t%m\t%s\t%P\n' \
+            | awk -F '\t' 'BEGIN { OFS="\t" } { $2=substr($2, 1, 1); print }' \
+            | LC_ALL=C sort > "$RUNNER_TEMP/release-package.manifest"
           PACKAGE_MATCH=yes
           if ! cmp --silent "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest"; then
             PACKAGE_MATCH=no
-            echo "Package path/type/mode/size manifest difference:" >&2
+            echo "Package path/type/owner-mode/size manifest difference:" >&2
             diff --unified "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest" || true
           fi
           if ! diff --no-dereference --recursive --brief "$FRESH_TREE/package" "$RELEASE_TREE/package"; then
@@ -134,7 +143,7 @@ jobs:
             echo "Fresh immutable-tag package files differ from the release asset; refusing publication." >&2
             exit 1
           fi
-          echo "The immutable tag and release asset have identical paths, modes, sizes, and file bytes."
+          echo "The immutable tag and release asset have identical paths, owner modes, sizes, and file bytes."
           echo "tarball=$RELEASE_TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: Install and test exact tag

@@ -95,13 +95,33 @@ jobs:
           RELEASE_PAYLOAD_SHA256="$(gzip --decompress --stdout "$RELEASE_TARBALL" | sha256sum | cut -d ' ' -f 1)"
           printf 'Reproduced SHA-256: %s\nRelease asset SHA-256: %s\n' "$LOCAL_SHA256" "$RELEASE_SHA256"
           printf 'Reproduced tar payload SHA-256: %s\nRelease tar payload SHA-256: %s\n' "$LOCAL_PAYLOAD_SHA256" "$RELEASE_PAYLOAD_SHA256"
-          if [[ "$LOCAL_PAYLOAD_SHA256" != "$RELEASE_PAYLOAD_SHA256" ]]; then
-            echo "Fresh immutable-tag package payload differs from the published release asset; refusing publication." >&2
+          FRESH_TREE="$RUNNER_TEMP/fresh-package-tree"
+          RELEASE_TREE="$RUNNER_TEMP/release-package-tree"
+          mkdir "$FRESH_TREE" "$RELEASE_TREE"
+          for ARCHIVE in "$TARBALL" "$RELEASE_TARBALL"; do
+            if ! tar --list --gzip --file "$ARCHIVE" | awk '!/^package\// || /(^|\/)\.\.(\/|$)/ { exit 1 }'; then
+              echo "Package contains a path outside its package/ root; refusing publication." >&2
+              exit 1
+            fi
+            if ! tar --list --verbose --gzip --file "$ARCHIVE" | awk '{ kind=substr($1, 1, 1); if (kind != "-" && kind != "d") exit 1 }'; then
+              echo "Package contains a link or special archive entry; refusing publication." >&2
+              exit 1
+            fi
+          done
+          tar --extract --gzip --file "$TARBALL" --directory "$FRESH_TREE" --no-same-owner
+          tar --extract --gzip --file "$RELEASE_TARBALL" --directory "$RELEASE_TREE" --no-same-owner
+          test -d "$FRESH_TREE/package"
+          test -d "$RELEASE_TREE/package"
+          if [[ -n "$(find "$FRESH_TREE/package" ! -type f ! -type d -print -quit)" ]] \
+            || [[ -n "$(find "$RELEASE_TREE/package" ! -type f ! -type d -print -quit)" ]]; then
+            echo "Package contains a link or special filesystem entry; refusing publication." >&2
             exit 1
           fi
-          if [[ "$LOCAL_SHA256" != "$RELEASE_SHA256" ]]; then
-            echo "The npm/Node runtime changed only gzip encoding; publishing the authenticated release asset."
-          fi
+          LC_ALL=C find "$FRESH_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/fresh-package.manifest"
+          LC_ALL=C find "$RELEASE_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/release-package.manifest"
+          cmp --silent "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest"
+          diff --no-dereference --recursive --brief "$FRESH_TREE/package" "$RELEASE_TREE/package"
+          echo "The immutable tag and release asset have identical paths, modes, sizes, and file bytes."
           echo "tarball=$RELEASE_TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: Install and test exact tag

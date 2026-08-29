@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.29 candidate; v0.1.27 production):** production is promoted
+> **Deployment status (v0.1.55 candidate; v0.1.54 production):** production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
 > through the accepted native AgInTi capability proof; if that proof is absent
@@ -16,6 +16,11 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > completed Agent conversations truly multi-turn: later prompts resume the exact
 > terminal predecessor, retry an uncertain mutation once with the same idempotency
 > key, and keep any rejected prompt editable without an optimistic duplicate.
+> The v0.1.55 candidate keeps the verified Agent thread immediately usable after
+> a definitive pre-run rejection, while ambiguous transport failures remain
+> fenced for reconciliation. It also removes redundant full-image validation
+> passes immediately before an iPhone upload without weakening validation of
+> caller-supplied or cloned requests.
 > Direct Chat remembers the user's non-private workspace-mode preference across
 > a full reload, while
 > confirmed sign-out fences stale history reads. The accepted v0.1.23 release also

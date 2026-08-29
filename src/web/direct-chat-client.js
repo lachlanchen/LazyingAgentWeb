@@ -26,6 +26,7 @@ const ROLLOUT_IN_PROGRESS_CODE = "rollout_in_progress";
 const ROLLOUT_RETRY_DEFAULT_SECONDS = 1;
 const ROLLOUT_RETRY_MAXIMUM_SECONDS = 5;
 const PREPARED_RUN_BODIES = new WeakMap();
+const PREPARED_RUN_ATTACHMENTS = new WeakSet();
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._~-]{16,160}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
@@ -347,6 +348,11 @@ function responseMessage(value, expectedThreadId) {
 }
 
 function requestAttachment(value) {
+  // Canonical browser attachments are frozen below after their generated
+  // base64 has passed this exact validator once. Reusing that same object in
+  // runTicket() must not rescan several megabytes of image text on an iPhone;
+  // cloned or caller-supplied objects still take the full fail-closed path.
+  if (PREPARED_RUN_ATTACHMENTS.has(value)) return value;
   const attachment = exactObject(value, ["attachmentId", "mediaType", "data"], [
     "attachmentId", "mediaType", "data",
   ], "prepared run attachment", { input: true });
@@ -433,11 +439,13 @@ function canonicalAttachment(value) {
       || attachment.width * attachment.height > 16 * 1024 * 1024) {
     throw new TypeError("canonical image attachment is invalid");
   }
-  return requestAttachment({
+  const prepared = requestAttachment({
     attachmentId: attachment.attachmentId,
     mediaType: attachment.mediaType,
     data: bytesToBase64(attachment.bytes),
   });
+  PREPARED_RUN_ATTACHMENTS.add(prepared);
+  return prepared;
 }
 
 function canonicalAttachments(value) {
@@ -1330,7 +1338,11 @@ export class DirectChatBrowserClient {
 
   async startRun(prepared, options = {}) {
     const { signal } = exactObject(options, ["signal"], [], "start run options", { input: true });
-    const ticket = runTicket(prepared);
+    // prepareRun() already returned an immutable, fully validated ticket and
+    // bound its exact serialized body in this module-private WeakMap. Avoid a
+    // second O(base64 bytes) validation pass immediately before mobile fetch;
+    // any foreign or cloned ticket remains fully revalidated.
+    const ticket = PREPARED_RUN_BODIES.has(prepared) ? prepared : runTicket(prepared);
     const { idempotencyKey: key, ...body } = ticket;
     const serializedBody = PREPARED_RUN_BODIES.get(prepared) ?? serializedRunBody(ticket);
     const response = exactObject(await this.#post(DIRECT_CHAT_ROUTES.runsStart, body, {

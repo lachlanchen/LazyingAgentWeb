@@ -5040,9 +5040,21 @@ export function createBrowserApp({
       } else {
         if (state.mode === "agent") {
           if (elements.message_input.value === "") elements.message_input.value = draft;
-          elements.run_state.textContent = "Interrupted";
-          elements.workspace.dataset.status = "failed";
-          if (state.agentThreadId !== null) {
+          const definitivelyNotAccepted = isAuthoritativeAgentRejection(error);
+          if (definitivelyNotAccepted) {
+            // A bounded non-retryable 4xx proves the exact mutation did not
+            // reach an Agent run. Keep the verified thread head usable so the
+            // corrected prompt can be sent immediately in this same session.
+            restoreAgentActivityAfterRollout();
+            connection("Agent request not sent", false);
+            showToast(state.agentThreadId === null
+              ? "AgInTi rejected the new conversation before it ran. Your prompt is still ready; edit it or retry."
+              : "AgInTi rejected this request before it ran. Your prompt is still ready; edit it or retry in this conversation.");
+          } else {
+            elements.run_state.textContent = "Interrupted";
+            elements.workspace.dataset.status = "failed";
+          }
+          if (!definitivelyNotAccepted && state.agentThreadId !== null) {
             // Until a fresh authoritative read succeeds, the dispatch may have
             // reached AgInTi even though its response was unusable. Reuse the
             // existing fail-closed history fence so another send cannot create
@@ -5050,12 +5062,14 @@ export function createBrowserApp({
             // take the settled-view no-op path.
             state.agentReplayFailed = true;
           }
-          connection("Request interrupted", false);
-          showToast(state.agentThreadId !== null
-            ? "AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying."
-            : state.agentPendingThreadCreate !== null
-              ? "AgInTi did not confirm the new conversation. Your prompt is still ready; retry it to confirm the same exact conversation without creating a duplicate."
-              : "AgInTi rejected the new conversation. Your prompt is still ready; edit it or retry when the service is available.");
+          if (!definitivelyNotAccepted) {
+            connection("Request interrupted", false);
+            showToast(state.agentThreadId !== null
+              ? "AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying."
+              : state.agentPendingThreadCreate !== null
+                ? "AgInTi did not confirm the new conversation. Your prompt is still ready; retry it to confirm the same exact conversation without creating a duplicate."
+                : "AgInTi rejected the new conversation. Your prompt is still ready; edit it or retry when the service is available.");
+          }
         } else if (state.chatPendingSend) {
           connection("Send confirmation pending", false);
           showToast("The durable send is awaiting confirmation. Resume reuses it without dispatching a duplicate.");

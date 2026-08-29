@@ -1077,6 +1077,15 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
     ["output.delta", { text: "Confirmed follow-up" }],
     ["run.completed", {}],
   ], { runId: SECOND_RUN_ID });
+  const thirdHistory = await verifiedEvents([
+    ["output.delta", { text: "Accepted after definitive rejection" }],
+    ["run.completed", {}],
+  ], { runId: THIRD_RUN_ID });
+  const histories = new Map([
+    [RUN_ID, firstHistory],
+    [SECOND_RUN_ID, secondHistory],
+    [THIRD_RUN_ID, thirdHistory],
+  ]);
   let thread = agentThread({
     lastRunId: RUN_ID,
     messages: [
@@ -1095,10 +1104,10 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
     async getThread() { threadReads += 1; return { thread }; },
     async runStatus(runId) {
       statusReads.push(runId);
-      const events = runId === RUN_ID ? firstHistory : secondHistory;
+      const events = histories.get(runId);
       return { run: terminalRun("completed", events, {
         id: runId,
-        previousRunId: runId === RUN_ID ? null : RUN_ID,
+        previousRunId: runId === RUN_ID ? null : (runId === SECOND_RUN_ID ? RUN_ID : SECOND_RUN_ID),
       }) };
     },
     async startRun() { throw new Error("a retained thread must not dispatch runs/start"); },
@@ -1119,11 +1128,25 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
         });
         return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
       }
-      throw Object.assign(new Error("request rejected"), { retryable: false });
+      if (resumeCalls.length === 3) {
+        throw Object.assign(new Error("request rejected"), {
+          retryable: false,
+          status: 409,
+        });
+      }
+      thread = agentThread({
+        lastRunId: THIRD_RUN_ID,
+        messages: [
+          ...thread.messages,
+          { id: "msg_user_retry_2", role: "user", content: text, runId: THIRD_RUN_ID },
+          { id: "msg_assistant_retry_2", role: "assistant", content: "Stored retry", runId: THIRD_RUN_ID },
+        ],
+      });
+      return { run: run("running", { id: THIRD_RUN_ID, previousRunId: SECOND_RUN_ID }) };
     },
     async *streamRunEvents({ runId }) {
       streamReads.push(runId);
-      const events = runId === RUN_ID ? firstHistory : secondHistory;
+      const events = histories.get(runId);
       for (const event of events) yield { event, cursor: { seq: event.seq, hash: event.hash } };
     },
   };
@@ -1156,18 +1179,21 @@ test("Agent follow-up retry reuses one idempotency key and an unconfirmed prompt
   assert.equal(browser.document.getElementById("message-input").disabled, false);
   assert.equal(messages.textContent.includes(rejectedDraft), false, "an unaccepted prompt never becomes conversation history");
   assert.match(browser.document.getElementById("toast").textContent, /prompt is still ready/u);
-  assert.equal(threadOpenControls(browser.document)[0].disabled, false,
-    "the unverified selected thread remains available for read-only reconciliation");
+  assert.equal(browser.document.getElementById("send-message").disabled, false,
+    "a definitive non-acceptance keeps the same verified thread immediately usable");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
 
-  await browser.app.openThread(THREAD_ID, { mode: "agent" });
+  await browser.app.submitMessage({ preventDefault() {} });
 
-  assert.equal(threadReads, 2, "reopen confirms server state after the unconfirmed mutation");
-  assert.deepEqual(statusReads, [RUN_ID, RUN_ID, SECOND_RUN_ID]);
-  assert.deepEqual(streamReads, [RUN_ID, SECOND_RUN_ID, RUN_ID, SECOND_RUN_ID]);
-  assert.equal(resumeCalls.length, 3, "read-only reconciliation never redispatches the prompt");
-  assert.equal(browser.document.getElementById("message-input").value, rejectedDraft);
+  assert.equal(threadReads, 1, "a definitive non-acceptance needs no forced thread reopen");
+  assert.deepEqual(statusReads, [RUN_ID]);
+  assert.deepEqual(streamReads, [RUN_ID, SECOND_RUN_ID, THIRD_RUN_ID]);
+  assert.equal(resumeCalls.length, 4);
+  assert.notEqual(resumeCalls[2].options.idempotency, resumeCalls[3].options.idempotency,
+    "the safe user retry creates a new exact mutation receipt");
+  assert.equal(browser.document.getElementById("message-input").value, "");
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
-  assert.match(browser.document.getElementById("messages").textContent, /Confirmed follow-up/u);
+  assert.match(browser.document.getElementById("messages").textContent, /Accepted after definitive rejection/u);
 });
 
 test("an existing Agent continuation honors rollout delay and a repeated rollout stays immediately retryable", async () => {

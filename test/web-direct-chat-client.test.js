@@ -518,7 +518,7 @@ test("a local large-body serialization failure occurs before any ambiguous netwo
   assert.equal(fetchCalls, 0);
 });
 
-test("maximum-size image base64 uses bounded mobile intermediates and stays canonical", () => {
+test("maximum-size image base64 uses bounded mobile intermediates and skips trusted redispatch rescans", async () => {
   const bytes = new Uint8Array(4 * 1024 * 1024);
   Object.defineProperty(bytes, "toBase64", { value: undefined });
   for (let index = 0; index < bytes.byteLength; index += 1) bytes[index] = index & 0xff;
@@ -531,7 +531,16 @@ test("maximum-size image base64 uses bounded mobile intermediates and stays cano
       maximumInput = Math.max(maximumInput, value.length);
       return originalBtoa(value);
     };
-    const client = new DirectChatBrowserClient(clientOptions());
+    const client = new DirectChatBrowserClient(clientOptions({
+      fetchImpl: async (_url, options) => {
+        const body = JSON.parse(options.body);
+        return jsonResponse({ generation: publicGeneration({
+          threadId: body.threadId,
+          generationId: body.generationId,
+          assistantMessageId: body.assistantMessageId,
+        }) }, { status: 202 });
+      },
+    }));
     const request = client.prepareRun({
       threadId: "chat_0001_xxxxxxxxxxxxxxxxxxxxxxxx",
       content: "Describe the maximum-size image.",
@@ -550,6 +559,28 @@ test("maximum-size image base64 uses bounded mobile intermediates and stays cano
     assert.ok(maximumInput <= 12 * 1024, `largest btoa input was ${maximumInput} bytes`);
     assert.equal(request.attachment.data.length, Math.ceil(bytes.byteLength / 3) * 4);
     assert.deepEqual(Buffer.from(request.attachment.data, "base64"), Buffer.from(bytes));
+
+    const originalCharCodeAt = String.prototype.charCodeAt;
+    let largeBase64Rescans = 0;
+    try {
+      String.prototype.charCodeAt = function observedCharCodeAt(index) {
+        if (this.length > 1024 * 1024) largeBase64Rescans += 1;
+        return originalCharCodeAt.call(this, index);
+      };
+      await client.startRun(request);
+    } finally {
+      String.prototype.charCodeAt = originalCharCodeAt;
+    }
+    assert.equal(largeBase64Rescans, 0,
+      "the frozen ticket is not rescanned immediately before the iPhone upload fetch");
+
+    await assert.rejects(client.startRun({
+      ...request,
+      attachment: {
+        ...request.attachment,
+        data: `${request.attachment.data.slice(0, -1)}*`,
+      },
+    }), /invalid/u, "a cloned ticket still takes the full fail-closed validation path");
   } finally {
     globalThis.btoa = originalBtoa;
   }

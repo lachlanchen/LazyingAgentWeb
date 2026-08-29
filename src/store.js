@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import {
@@ -35,6 +35,10 @@ const DEFAULT_CLOCK = () => new Date();
 export const IDEMPOTENCY_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_IDEMPOTENCY_RECEIPTS_PER_ACCOUNT = 256;
 export const MAX_BROWSER_SESSIONS_PER_ACCOUNT = 32;
+export const MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT = MAX_BROWSER_SESSIONS_PER_ACCOUNT + 1;
+
+const AGENT_SCOPE_DIGEST = /^[a-f0-9]{64}$/u;
+const AGENT_RESOURCE_KINDS = new Set(['thread', 'run', 'artifact']);
 
 function addMilliseconds(timestamp, milliseconds) {
   return new Date(new Date(timestamp).getTime() + milliseconds).toISOString();
@@ -75,6 +79,42 @@ function sessionView(row) {
     lastSeenAt: row.last_seen_at,
     revokedAt: row.revoked_at
   };
+}
+
+function agentScopeView(row) {
+  if (!row) return null;
+  return {
+    accountId: row.account_id,
+    scopeDigest: row.scope_digest,
+    kind: row.scope_kind,
+    createdAt: row.created_at
+  };
+}
+
+function agentBindingView(row) {
+  if (!row) return null;
+  return {
+    accountId: row.account_id,
+    resourceKind: row.resource_kind,
+    resourceId: row.resource_id,
+    scopeDigest: row.scope_digest,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function assertAgentScopeDigest(value, name = 'scopeDigest') {
+  if (typeof value !== 'string' || !AGENT_SCOPE_DIGEST.test(value)) {
+    throw new ValidationError(`${name} must be a lowercase 64-character hexadecimal digest.`);
+  }
+  return value;
+}
+
+function assertAgentResourceKind(value) {
+  if (typeof value !== 'string' || !AGENT_RESOURCE_KINDS.has(value)) {
+    throw new ValidationError('resourceKind is not a supported Agent authority resource type.');
+  }
+  return value;
 }
 
 function threadView(row) {
@@ -322,6 +362,39 @@ export class CloudIndexStore {
     if (!row) throw new NotFoundError();
   }
 
+  #ensureDefaultAgentScope(accountId) {
+    const existing = this.#database.prepare(`
+      SELECT * FROM agent_authority_scopes
+      WHERE account_id = ? AND scope_kind IN ('default_pending', 'default')
+    `).get(accountId);
+    if (existing) return agentScopeView(existing);
+    const timestamp = nowIso(this.#clock);
+    // A uniqueness collision is cryptographically negligible, but retrying a
+    // bounded number of times keeps the operation total without weakening the
+    // database's cross-account uniqueness invariant.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const scopeDigest = randomBytes(32).toString('hex');
+      try {
+        this.#database.prepare(`
+          INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+          VALUES (?, ?, 'default', ?)
+        `).run(accountId, scopeDigest, timestamp);
+        return agentScopeView(this.#database.prepare(`
+          SELECT * FROM agent_authority_scopes
+          WHERE account_id = ? AND scope_digest = ?
+        `).get(accountId, scopeDigest));
+      } catch (error) {
+        if (!isConstraintError(error)) throw error;
+        const raced = this.#database.prepare(`
+          SELECT * FROM agent_authority_scopes
+          WHERE account_id = ? AND scope_kind IN ('default_pending', 'default')
+        `).get(accountId);
+        if (raced) return agentScopeView(raced);
+      }
+    }
+    throw new StorageCorruptionError('A unique Agent authority scope could not be allocated.');
+  }
+
   provisionAccount(input) {
     assertExactKeys(
       input,
@@ -347,6 +420,7 @@ export class CloudIndexStore {
         const byId = this.#database.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
         if (byId) {
           if (byId.issuer !== issuer || byId.subject !== subject) throw new ConflictError();
+          this.#ensureDefaultAgentScope(accountId);
           return accountView(byId);
         }
         const byIdentity = this.#database.prepare(`
@@ -363,11 +437,13 @@ export class CloudIndexStore {
           if (isConstraintError(error)) throw new ConflictError();
           throw error;
         }
+        this.#ensureDefaultAgentScope(accountId);
         return accountView(this.#database.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId));
       },
       () => {
         const row = accountView(this.#database.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId));
         if (!row) throw new ConflictError('The idempotent account resource is no longer present.');
+        this.#ensureDefaultAgentScope(accountId);
         return row;
       }
     );
@@ -387,6 +463,182 @@ export class CloudIndexStore {
     return accountView(this.#database.prepare(`
       SELECT * FROM accounts WHERE issuer = ? AND subject = ?
     `).get(issuer, subject));
+  }
+
+  getDefaultAgentAuthorityScope(accountId) {
+    this.#assertOpen();
+    assertIdentifier(accountId, 'accountId');
+    const row = this.#database.prepare(`
+      SELECT * FROM agent_authority_scopes
+      WHERE account_id = ? AND scope_kind IN ('default_pending', 'default')
+    `).get(accountId);
+    if (!row) throw new StorageCorruptionError('The account has no durable Agent authority scope.');
+    return agentScopeView(row);
+  }
+
+  primeDefaultAgentAuthorityScope(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'legacyScopeDigest'] },
+      'Agent authority scope priming'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const legacyScopeDigest = assertAgentScopeDigest(input.legacyScopeDigest, 'legacyScopeDigest');
+    return this.#transaction(() => {
+      const current = this.#database.prepare(`
+        SELECT * FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_kind IN ('default_pending', 'default')
+      `).get(accountId);
+      if (!current) throw new StorageCorruptionError('The account has no durable Agent authority scope.');
+      if (current.scope_kind === 'default') return agentScopeView(current);
+
+      const legacy = this.#database.prepare(`
+        SELECT * FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_digest = ? AND scope_kind = 'legacy_session'
+      `).get(accountId, legacyScopeDigest);
+      if (legacy) {
+        this.#database.prepare(`
+          UPDATE agent_authority_scopes
+          SET scope_kind = 'legacy_session'
+          WHERE account_id = ? AND scope_digest = ? AND scope_kind = 'default_pending'
+        `).run(accountId, current.scope_digest);
+        this.#database.prepare(`
+          UPDATE agent_authority_scopes
+          SET scope_kind = 'default'
+          WHERE account_id = ? AND scope_digest = ? AND scope_kind = 'legacy_session'
+        `).run(accountId, legacyScopeDigest);
+      } else {
+        // A login created after the migration cannot own pre-upgrade Agent
+        // resources. Finalize the random scope; the copied legacy scopes remain
+        // available for bounded resource discovery.
+        this.#database.prepare(`
+          UPDATE agent_authority_scopes
+          SET scope_kind = 'default'
+          WHERE account_id = ? AND scope_digest = ? AND scope_kind = 'default_pending'
+        `).run(accountId, current.scope_digest);
+      }
+      const primed = this.#database.prepare(`
+        SELECT * FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_kind = 'default'
+      `).get(accountId);
+      if (!primed) throw new StorageCorruptionError('Agent authority scope priming did not commit exactly one default.');
+      return agentScopeView(primed);
+    });
+  }
+
+  listAgentAuthorityScopes(input) {
+    this.#assertOpen();
+    assertExactKeys(input, { required: ['accountId'], optional: ['limit'] }, 'Agent authority scope list');
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const limit = input.limit === undefined
+      ? MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT
+      : assertInteger(input.limit, 'limit', { min: 1, max: MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT });
+    const count = Number(this.#database.prepare(`
+      SELECT count(*) AS count FROM agent_authority_scopes WHERE account_id = ?
+    `).get(accountId)?.count);
+    if (!Number.isSafeInteger(count) || count < 1 || count > MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT) {
+      throw new StorageCorruptionError('The account Agent authority scope set is outside its durable bound.');
+    }
+    return this.#database.prepare(`
+      SELECT * FROM agent_authority_scopes
+      WHERE account_id = ?
+      ORDER BY CASE scope_kind WHEN 'default' THEN 0 WHEN 'default_pending' THEN 0 ELSE 1 END,
+               created_at DESC, scope_digest DESC
+      LIMIT ?
+    `).all(accountId, limit).map(agentScopeView);
+  }
+
+  getAgentResourceBinding(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'resourceKind', 'resourceId'] },
+      'Agent resource binding lookup'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const resourceKind = assertAgentResourceKind(input.resourceKind);
+    const resourceId = assertIdentifier(input.resourceId, 'resourceId');
+    return agentBindingView(this.#database.prepare(`
+      SELECT * FROM agent_resource_bindings
+      WHERE account_id = ? AND resource_kind = ? AND resource_id = ?
+    `).get(accountId, resourceKind, resourceId));
+  }
+
+  bindAgentResource(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'resourceKind', 'resourceId', 'scopeDigest'] },
+      'Agent resource binding'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const resourceKind = assertAgentResourceKind(input.resourceKind);
+    const resourceId = assertIdentifier(input.resourceId, 'resourceId');
+    const scopeDigest = assertAgentScopeDigest(input.scopeDigest);
+    return this.#transaction(() => {
+      const scope = this.#database.prepare(`
+        SELECT 1 AS present FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_digest = ?
+      `).get(accountId, scopeDigest);
+      if (!scope) throw new NotFoundError('The Agent authority scope does not belong to this account.');
+      const existing = this.#database.prepare(`
+        SELECT * FROM agent_resource_bindings
+        WHERE resource_kind = ? AND resource_id = ?
+      `).get(resourceKind, resourceId);
+      if (existing) {
+        if (existing.account_id !== accountId || existing.scope_digest !== scopeDigest) {
+          throw new ConflictError('The Agent resource is already bound to a different authority scope.');
+        }
+        return agentBindingView(existing);
+      }
+      const timestamp = nowIso(this.#clock);
+      try {
+        this.#database.prepare(`
+          INSERT INTO agent_resource_bindings(
+            resource_kind, resource_id, account_id, scope_digest, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(resourceKind, resourceId, accountId, scopeDigest, timestamp, timestamp);
+      } catch (error) {
+        if (isConstraintError(error)) throw new ConflictError();
+        throw error;
+      }
+      return agentBindingView(this.#database.prepare(`
+        SELECT * FROM agent_resource_bindings
+        WHERE account_id = ? AND resource_kind = ? AND resource_id = ?
+      `).get(accountId, resourceKind, resourceId));
+    });
+  }
+
+  retireEmptyLegacyAgentAuthorityScope(input) {
+    this.#assertOpen();
+    assertExactKeys(
+      input,
+      { required: ['accountId', 'scopeDigest'] },
+      'legacy Agent authority scope retirement'
+    );
+    const accountId = assertIdentifier(input.accountId, 'accountId');
+    const scopeDigest = assertAgentScopeDigest(input.scopeDigest);
+    return this.#transaction(() => {
+      const scope = this.#database.prepare(`
+        SELECT scope_kind FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_digest = ?
+      `).get(accountId, scopeDigest);
+      if (!scope) return { retired: false };
+      if (scope.scope_kind !== 'legacy_session') {
+        throw new ConflictError('Only a legacy Agent authority scope can be retired.');
+      }
+      const binding = this.#database.prepare(`
+        SELECT 1 AS present FROM agent_resource_bindings
+        WHERE account_id = ? AND scope_digest = ? LIMIT 1
+      `).get(accountId, scopeDigest);
+      if (binding) return { retired: false };
+      const result = this.#database.prepare(`
+        DELETE FROM agent_authority_scopes
+        WHERE account_id = ? AND scope_digest = ? AND scope_kind = 'legacy_session'
+      `).run(accountId, scopeDigest);
+      return { retired: Number(result.changes) === 1 };
+    });
   }
 
   createBrowserSession(input) {

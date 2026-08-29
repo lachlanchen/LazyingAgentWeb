@@ -145,7 +145,7 @@ function safeReport(config, assetMap) {
     publicOrigin: config.publicOrigin,
     releaseId: assetMap.releaseVersion,
     serviceWorkerRoute: assetMap.serviceWorkerRoute,
-    agentEnabled: false,
+    agentEnabled: config.aginti.enabled,
     agentConfigured: config.aginti.enabled,
     directChatEnabled: true
   });
@@ -430,7 +430,7 @@ export async function createStandaloneService({
       listen: Object.freeze({ ...config.listen }),
       publicOrigin: config.publicOrigin,
       account: Object.freeze({ ...account }),
-      agentEnabled: false,
+      agentEnabled: agintiAdapter !== null,
       assetMap: materialized.assetMap,
       server,
       controlStore,

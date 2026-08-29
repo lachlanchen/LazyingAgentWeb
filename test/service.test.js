@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { LATEST_SCHEMA_VERSION } from '../src/index.js';
 import { loadServiceConfig } from '../src/service-config.js';
 import {
   checkStandaloneServiceHealth,
@@ -150,7 +151,7 @@ test('configuration check validates credentials and branded PWA without creating
   assert.deepEqual(report.listen, { host: '127.0.0.1', port: state.config.listen.port });
   assert.equal(report.serviceWorkerRoute, '/sw.js');
   assert.match(report.releaseId, /^service-test-[a-f0-9]{64}$/u);
-  assert.equal(report.agentEnabled, false);
+  assert.equal(report.agentEnabled, true);
   assert.equal(report.agentConfigured, true);
   assert.equal(existsSync(join(state.root, 'state')), false);
   const output = JSON.stringify(report);
@@ -259,7 +260,7 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   assert.equal(options.controlStore, service.controlStore);
   assert.equal(options.sessionStore, service.controlStore);
   assert.equal(options.releaseId, service.releaseId);
-  assert.equal(service.agentEnabled, false);
+  assert.equal(service.agentEnabled, true);
   assert.equal(service.assetMap.serviceWorkerRoute, '/sw.js');
   assert.equal(verifyStandaloneAssetMap(service.assetMap), service.assetMap);
   assert.equal(service.releaseId.endsWith(`-${service.assetMap.contentDigest}`), true);
@@ -393,7 +394,7 @@ test('operator health reads both initialized stores without taking service owner
   assert.equal(report.status, 'ready');
   assert.equal(report.component.releaseId, service.releaseId);
   assert.equal(report.storage.cloudIndexStore.state, 'ready');
-  assert.equal(report.storage.cloudIndexStore.schemaVersion, 1);
+  assert.equal(report.storage.cloudIndexStore.schemaVersion, LATEST_SCHEMA_VERSION);
   assert.equal(report.storage.directChatStore.state, 'ready');
   assert.equal(report.storage.directChatStore.schemaVersion, 5);
   assert.equal(service.controlStore.healthCheck().ready, true);

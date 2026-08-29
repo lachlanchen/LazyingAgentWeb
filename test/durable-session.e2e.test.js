@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
+import { LATEST_SCHEMA_VERSION } from '../src/index.js';
+
 const CLI_PATH = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const REPOSITORY_ROOT = dirname(dirname(CLI_PATH));
 const PASSWORD = 'correct horse battery staple';
@@ -344,7 +346,7 @@ test('real CLI preserves one authenticated browser session and Direct Chat threa
     assert.equal(secondOutput.stderr.includes(secret), false);
   }
 
-  verifyDatabase(state.cloudIndexDatabase, 1, (database) => {
+  verifyDatabase(state.cloudIndexDatabase, LATEST_SCHEMA_VERSION, (database) => {
     assert.equal(Number(database.prepare('SELECT count(*) AS count FROM browser_sessions').get().count), 1);
     const row = database.prepare('SELECT session_digest, csrf_digest, revoked_at FROM browser_sessions').get();
     assert.match(row.session_digest, /^[a-f0-9]{64}$/u);

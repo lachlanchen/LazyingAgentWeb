@@ -121,7 +121,7 @@ export async function runCli({
       port: endpoint.port,
       publicOrigin: service.publicOrigin,
       releaseId: service.releaseId,
-      agentEnabled: false
+      agentEnabled: service.agentEnabled === true
     });
     await terminationWaiter(service);
     return 0;

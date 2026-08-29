@@ -5,13 +5,14 @@ import { createServer as createProbeServer, request as httpRequest } from 'node:
 import { connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { DirectChatStore } from '../src/chat-store.js';
 import { DirectChatContextCoordinator } from '../src/chat-context.js';
-import { createAgintiAgentAdapter } from '../src/aginti-adapter.js';
+import { AgintiAdapterError, createAgintiAgentAdapter } from '../src/aginti-adapter.js';
 import { createCloudServer, resolveTrustedClientAddress } from '../src/cloud-server.js';
-import { CLIENT_RELEASE_HEADER_NAME, CLOUD_HTTP_LIMITS } from '../src/http-contract.js';
+import { CLIENT_RELEASE_HEADER_NAME, CLOUD_HTTP_LIMITS, SESSION_COOKIE_NAME } from '../src/http-contract.js';
 import { RolloutAdmissionLatch } from '../src/rollout-admission.js';
 import { CloudIndexStore } from '../src/store.js';
 import { canonicalJson } from '../src/web/aginti-protocol.js';
@@ -79,13 +80,17 @@ function publicOriginFor(baseUrl) {
   return url.origin;
 }
 
-function testState(t, { connector, adapter, limits, visionEnabled = false, requestOutcomeObserver } = {}) {
+function testState(t, { connector, adapter, limits, visionEnabled = false, requestOutcomeObserver, clock } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-cloud-server-test-'));
-  const controlStore = new CloudIndexStore({ databasePath: join(root, 'control', 'index.sqlite') });
+  const controlStore = new CloudIndexStore({
+    databasePath: join(root, 'control', 'index.sqlite'),
+    ...(clock === undefined ? {} : { clock })
+  });
   const directChatStore = new DirectChatStore({
     databasePath: join(root, 'chat', 'chat.sqlite'),
     modelAlias: 'local-test',
-    enableVisionAttachments: visionEnabled
+    enableVisionAttachments: visionEnabled,
+    ...(clock === undefined ? {} : { clock })
   });
   const directChatContext = new DirectChatContextCoordinator({
     store: directChatStore,
@@ -119,7 +124,8 @@ function testState(t, { connector, adapter, limits, visionEnabled = false, reque
     visionEnabled,
     agintiAdapter: adapter,
     requestOutcomeObserver,
-    limits
+    limits,
+    ...(clock === undefined ? {} : { clock })
   };
   const servers = new Set();
   const additionalStores = new Set();
@@ -1326,6 +1332,448 @@ test('preflights negotiated Agent Search and forwards one exact run without a Lo
   assert.equal(calls.length, beforeInvalid);
 });
 
+test('primes a legacy Agent scope once and preserves list, get, continue, idempotency, and artifacts across logins', async (t) => {
+  const legacyThreadId = 'thr_11111111-1111-4111-8111-111111111111';
+  const legacyRunId = 'run_11111111-1111-4111-8111-111111111111';
+  const resumedRunId = 'run_22222222-2222-4222-8222-222222222222';
+  const createdThreadId = 'thr_22222222-2222-4222-8222-222222222222';
+  const artifactId = `art_${'c'.repeat(64)}`;
+  const artifactContent = Buffer.from('%PDF-1.7\ncross-session artifact\n', 'utf8');
+  const artifactDigest = createHash('sha256').update(artifactContent).digest('hex');
+  const zeroHash = '0'.repeat(64);
+  const timestamp = '2026-08-29T08:00:00.000Z';
+  let legacyScope = null;
+  const calls = [];
+  const scopes = new Map();
+  const idempotent = new Map();
+
+  const threadRecord = ({
+    id,
+    title,
+    lastRunId = null,
+    status = 'idle',
+    updatedAt = timestamp
+  }) => ({
+    id,
+    title,
+    status,
+    revision: 1,
+    createdAt: timestamp,
+    updatedAt,
+    lastRunId,
+    authority: {
+      kind: 'aginti',
+      mapped: true,
+      runtimeRevision: 1,
+      contextDigest: 'a'.repeat(64),
+      lastCompaction: null
+    },
+    replay: { prunedMessageCount: 0, anchorDigest: zeroHash },
+    messages: []
+  });
+  const runRecord = ({ id, threadId, previousRunId = null, status = 'completed' }) => ({
+    id,
+    threadId,
+    previousRunId,
+    status,
+    createdAt: timestamp,
+    startedAt: timestamp,
+    completedAt: status === 'completed' ? timestamp : null,
+    cancelRequestedAt: null,
+    output: status === 'completed' ? 'durable result' : '',
+    error: null,
+    authority: {
+      kind: 'aginti',
+      snapshotHash: 'b'.repeat(64),
+      runtimeRevision: 1,
+      contextDigest: 'a'.repeat(64)
+    },
+    eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: zeroHash, prunedThroughSeq: 0 }
+  });
+  const fileArtifact = {
+    id: artifactId,
+    title: 'Cross-session PDF',
+    kind: 'file',
+    spec: {
+      schemaVersion: '1',
+      filename: 'cross-session.pdf',
+      mime: 'application/pdf',
+      bytes: artifactContent.byteLength,
+      sha256: artifactDigest
+    }
+  };
+  const notFound = () => new AgintiAdapterError('not found', {
+    code: 'AGINTI_UPSTREAM_REJECTED',
+    statusCode: 404,
+    retryable: false
+  });
+  const scopeState = (scope) => {
+    if (!scopes.has(scope)) scopes.set(scope, { threads: new Map(), runs: new Map() });
+    return scopes.get(scope);
+  };
+  const adapter = {
+    async capabilities(context) {
+      calls.push({ path: '/agent/v1/capabilities', context });
+      return {
+        schemaVersion: '1',
+        enabled: true,
+        agent: { kind: 'aginti', label: 'AgInTi Agent' },
+        model: { label: 'LocalLLM' },
+        actions: { cancel: true, resume: true, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ['plot', 'table', 'markdown', 'file'], schemaVersion: '1' }
+      };
+    },
+    async rpc(path, body, context) {
+      calls.push({ path, body, context });
+      const state = scopeState(context.browserSession);
+      if (path === '/agent/v1/threads/list') {
+        const ordered = [...state.threads.values()].sort((left, right) => (
+          right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)
+        ));
+        const start = body.before ? ordered.findIndex(({ id }) => id === body.before) + 1 : 0;
+        const page = ordered.slice(start, start + body.limit);
+        return {
+          schemaVersion: '1',
+          threads: page,
+          nextBefore: start + page.length < ordered.length ? page.at(-1).id : null
+        };
+      }
+      if (path === '/agent/v1/threads/get') {
+        const thread = state.threads.get(body.threadId);
+        if (!thread) throw notFound();
+        return { schemaVersion: '1', thread };
+      }
+      if (path === '/agent/v1/threads/create') {
+        const key = `${context.browserSession}\u0000${path}\u0000${context.idempotencyKey}`;
+        if (!idempotent.has(key)) {
+          const thread = threadRecord({ id: createdThreadId, title: body.title });
+          state.threads.set(thread.id, thread);
+          idempotent.set(key, { schemaVersion: '1', thread });
+        }
+        return idempotent.get(key);
+      }
+      if (path === '/agent/v1/runs/status') {
+        const run = state.runs.get(body.runId);
+        if (!run) throw notFound();
+        return { schemaVersion: '1', run };
+      }
+      if (path === '/agent/v1/runs/resume') {
+        const prior = state.runs.get(body.runId);
+        if (!prior) throw notFound();
+        const key = `${context.browserSession}\u0000${path}\u0000${context.idempotencyKey}`;
+        if (!idempotent.has(key)) {
+          const run = runRecord({
+            id: resumedRunId,
+            threadId: prior.threadId,
+            previousRunId: prior.id,
+            status: 'starting'
+          });
+          state.runs.set(run.id, run);
+          const priorThread = state.threads.get(prior.threadId);
+          state.threads.set(prior.threadId, {
+            ...priorThread,
+            status: 'running',
+            lastRunId: run.id,
+            updatedAt: '2026-08-29T08:01:00.000Z'
+          });
+          idempotent.set(key, { schemaVersion: '1', run });
+        }
+        return idempotent.get(key);
+      }
+      if (path === '/agent/v1/artifacts/list') {
+        if (context.browserSession !== legacyScope
+            || (body.threadId !== legacyThreadId && body.runId !== legacyRunId)) throw notFound();
+        return { schemaVersion: '1', artifacts: [fileArtifact] };
+      }
+      if (path === '/agent/v1/artifacts/get') {
+        if (context.browserSession !== legacyScope || body.artifactId !== artifactId) throw notFound();
+        return { schemaVersion: '1', artifact: fileArtifact };
+      }
+      throw new Error(`unexpected Agent RPC ${path}`);
+    },
+    async artifactContent(input, context) {
+      calls.push({ path: '/agent/v1/artifacts/content', input, context });
+      if (context.browserSession !== legacyScope || input.artifactId !== artifactId) {
+        return Object.freeze({ status: 404 });
+      }
+      const start = input.range?.start ?? 0;
+      const end = input.range?.end ?? artifactContent.byteLength - 1;
+      const selected = artifactContent.subarray(start, end + 1);
+      return Object.freeze({
+        status: input.range === undefined ? 200 : 206,
+        filename: fileArtifact.spec.filename,
+        mime: fileArtifact.spec.mime,
+        totalBytes: artifactContent.byteLength,
+        selectedBytes: selected.byteLength,
+        sha256: artifactDigest,
+        range: input.range === undefined ? null : { start, end, total: artifactContent.byteLength },
+        body: input.metadataOnly === true ? null : new Response(selected).body
+      });
+    }
+  };
+
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start();
+  const first = await login(baseUrl);
+  const firstToken = new RegExp(`(?:^|; )${SESSION_COOKIE_NAME}=([^;]+)`, 'u').exec(first.cookie)?.[1];
+  assert.ok(firstToken);
+  legacyScope = createHash('sha256').update(firstToken, 'utf8').digest('hex');
+
+  // Reproduce the exact post-v1 migration state: the currently authenticated
+  // pre-upgrade scope is a legacy candidate and the random default awaits the
+  // first authenticated Agent request.
+  const database = new DatabaseSync(join(state.root, 'control', 'index.sqlite'));
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.prepare(`
+      UPDATE agent_authority_scopes SET scope_kind = 'default_pending'
+      WHERE account_id = ? AND scope_kind = 'default'
+    `).run(PRINCIPAL_ID);
+    database.prepare(`
+      INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+      VALUES (?, ?, 'legacy_session', ?)
+    `).run(PRINCIPAL_ID, legacyScope, timestamp);
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  } finally {
+    database.close();
+  }
+  const legacyState = scopeState(legacyScope);
+  legacyState.threads.set(legacyThreadId, threadRecord({
+    id: legacyThreadId,
+    title: 'Legacy durable thread',
+    lastRunId: legacyRunId
+  }));
+  legacyState.runs.set(legacyRunId, runRecord({ id: legacyRunId, threadId: legacyThreadId }));
+
+  const firstList = await post(baseUrl, '/api/transport/agent/v1/threads/list', { limit: 100, before: '' }, {
+    cookie: first.cookie,
+    csrf: first.csrf
+  });
+  assert.equal(firstList.status, 200);
+  assert.deepEqual((await firstList.json()).threads.map(({ id }) => id), [legacyThreadId]);
+  assert.equal(
+    state.controlStore.getDefaultAgentAuthorityScope(PRINCIPAL_ID).scopeDigest,
+    legacyScope,
+    'the authenticated live legacy scope is atomically promoted once'
+  );
+  assert.equal(
+    state.controlStore.listAgentAuthorityScopes({ accountId: PRINCIPAL_ID }).length,
+    1,
+    'a successfully-probed empty legacy scope is retired after migration discovery'
+  );
+
+  const firstArtifacts = await post(baseUrl, '/api/transport/agent/v1/artifacts/list', {
+    threadId: legacyThreadId
+  }, { cookie: first.cookie, csrf: first.csrf });
+  assert.equal(firstArtifacts.status, 200);
+  assert.equal((await firstArtifacts.json()).artifacts[0].id, artifactId);
+
+  const second = await login(baseUrl);
+  const secondToken = new RegExp(`(?:^|; )${SESSION_COOKIE_NAME}=([^;]+)`, 'u').exec(second.cookie)?.[1];
+  assert.ok(secondToken);
+  assert.notEqual(createHash('sha256').update(secondToken, 'utf8').digest('hex'), legacyScope);
+
+  const secondGet = await post(baseUrl, '/api/transport/agent/v1/threads/get', {
+    threadId: legacyThreadId
+  }, { cookie: second.cookie, csrf: second.csrf });
+  assert.equal(secondGet.status, 200);
+  assert.equal((await secondGet.json()).thread.id, legacyThreadId);
+
+  const resumed = await post(baseUrl, '/api/transport/agent/v1/runs/resume', {
+    runId: legacyRunId,
+    input: { text: 'Continue this durable task' }
+  }, {
+    cookie: second.cookie,
+    csrf: second.csrf,
+    idempotency: 'cross-session-resume-0001'
+  });
+  assert.equal(resumed.status, 200);
+  assert.equal((await resumed.json()).run.previousRunId, legacyRunId);
+
+  const createdFirst = await post(baseUrl, '/api/transport/agent/v1/threads/create', {
+    title: 'Idempotent across relogin'
+  }, {
+    cookie: first.cookie,
+    csrf: first.csrf,
+    idempotency: 'cross-session-create-0001'
+  });
+  const createdReplay = await post(baseUrl, '/api/transport/agent/v1/threads/create', {
+    title: 'Idempotent across relogin'
+  }, {
+    cookie: second.cookie,
+    csrf: second.csrf,
+    idempotency: 'cross-session-create-0001'
+  });
+  assert.equal(createdFirst.status, 200);
+  assert.equal(createdReplay.status, 200);
+  assert.deepEqual(await createdReplay.json(), await createdFirst.json());
+  const createCalls = calls.filter(({ path }) => path === '/agent/v1/threads/create');
+  assert.equal(createCalls.length, 2);
+  assert.equal(createCalls[0].context.browserSession, legacyScope);
+  assert.equal(createCalls[1].context.browserSession, legacyScope);
+
+  const content = await artifactRequest(baseUrl, artifactId, { cookie: second.cookie });
+  assert.equal(content.status, 200);
+  assert.deepEqual(Buffer.from(await content.arrayBuffer()), artifactContent);
+  assert.equal(calls.at(-1).context.browserSession, legacyScope);
+
+  const logout = await post(baseUrl, '/api/logout', {}, { cookie: first.cookie, csrf: first.csrf });
+  assert.equal(logout.status, 200);
+  const callsBeforeRevokedAttempt = calls.length;
+  const revoked = await post(baseUrl, '/api/transport/agent/v1/threads/get', {
+    threadId: legacyThreadId
+  }, { cookie: first.cookie, csrf: first.csrf });
+  assert.equal(revoked.status, 401);
+  assert.equal(calls.length, callsBeforeRevokedAttempt, 'a revoked login never reaches AgInTi');
+  const stillAuthorized = await post(baseUrl, '/api/transport/agent/v1/threads/get', {
+    threadId: legacyThreadId
+  }, { cookie: second.cookie, csrf: second.csrf });
+  assert.equal(stillAuthorized.status, 200);
+});
+
+test('does not let an expired login reach stable Agent authority', async (t) => {
+  let now = Date.parse('2026-08-29T00:00:00.000Z');
+  const clock = () => new Date(now);
+  let adapterCalls = 0;
+  const adapter = {
+    async rpc() {
+      adapterCalls += 1;
+      throw new Error('an expired login must not reach Agent RPC');
+    },
+    async capabilities() {
+      adapterCalls += 1;
+      return {
+        schemaVersion: '1',
+        enabled: false,
+        agent: { kind: 'aginti', label: 'AgInTi Agent' },
+        model: { label: 'LocalLLM' },
+        actions: { cancel: false, resume: false, retry: false },
+        attachments: { enabled: false },
+        artifacts: { kinds: ['plot', 'table', 'markdown'], schemaVersion: '1' }
+      };
+    }
+  };
+  const state = testState(t, { adapter, clock });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  now += 31 * 24 * 60 * 60 * 1_000;
+  const expired = await post(baseUrl, '/api/transport/agent/v1/capabilities', {}, {
+    cookie: auth.cookie,
+    csrf: auth.csrf
+  });
+  assert.equal(expired.status, 401);
+  assert.equal(adapterCalls, 0);
+});
+
+test('discovers and retires thirty empty legacy scopes within the production dependency deadline', async (t) => {
+  let listCalls = 0;
+  const perScopeDelayMs = 5;
+  const adapter = {
+    async rpc(path) {
+      assert.equal(path, '/agent/v1/threads/list');
+      listCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, perScopeDelayMs));
+      return { schemaVersion: '1', threads: [], nextBefore: null };
+    },
+    async capabilities() { throw new Error('capabilities are not used by thread discovery'); }
+  };
+  const state = testState(t, { adapter });
+  const database = new DatabaseSync(join(state.root, 'control', 'index.sqlite'));
+  const insert = database.prepare(`
+    INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+    VALUES (?, ?, 'legacy_session', ?)
+  `);
+  for (let index = 0; index < 30; index += 1) {
+    insert.run(
+      PRINCIPAL_ID,
+      createHash('sha256').update(`bounded-legacy-scope-${index}`, 'utf8').digest('hex'),
+      new Date(Date.parse('2026-08-29T00:00:00.000Z') + index).toISOString()
+    );
+  }
+  database.close();
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const startedAt = performance.now();
+  const response = await post(baseUrl, '/api/transport/agent/v1/threads/list', {
+    limit: 100,
+    before: ''
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { schemaVersion: '1', threads: [], nextBefore: null });
+  assert.equal(listCalls, 31, 'one stable default plus thirty bounded legacy scopes are probed once');
+  assert.ok(elapsedMs < CLOUD_HTTP_LIMITS.dependencyTimeoutMs, `${elapsedMs}ms exceeded the production dependency timeout`);
+  assert.equal(state.controlStore.listAgentAuthorityScopes({ accountId: PRINCIPAL_ID }).length, 1);
+  t.diagnostic(`30 empty legacy scopes plus the default completed in ${elapsedMs.toFixed(1)}ms; production deadline is ${CLOUD_HTTP_LIMITS.dependencyTimeoutMs}ms`);
+});
+
+test('artifact discovery skips both a thrown adapter 404 and a returned private 404 before binding success', async (t) => {
+  const artifactId = `art_${'e'.repeat(64)}`;
+  const bytes = Buffer.from('%PDF-1.7\nlegacy artifact discovery\n', 'utf8');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const returnedScope = createHash('sha256').update('returned-private-404', 'utf8').digest('hex');
+  const successScope = createHash('sha256').update('artifact-success', 'utf8').digest('hex');
+  const calls = [];
+  let defaultScope;
+  const adapter = {
+    async rpc() { throw new Error('artifact byte discovery does not use JSON RPC'); },
+    async capabilities() { throw new Error('artifact byte discovery does not use capabilities'); },
+    async artifactContent(input, context) {
+      calls.push(context.browserSession);
+      if (context.browserSession === defaultScope) {
+        throw new AgintiAdapterError('private absence', {
+          code: 'AGINTI_UPSTREAM_REJECTED',
+          statusCode: 404,
+          retryable: false
+        });
+      }
+      if (context.browserSession === returnedScope) return Object.freeze({ status: 404 });
+      assert.equal(context.browserSession, successScope);
+      return Object.freeze({
+        status: 200,
+        filename: 'legacy.pdf',
+        mime: 'application/pdf',
+        totalBytes: bytes.byteLength,
+        selectedBytes: bytes.byteLength,
+        sha256,
+        range: null,
+        body: input.metadataOnly === true ? null : new Response(bytes).body
+      });
+    }
+  };
+  const state = testState(t, { adapter });
+  defaultScope = state.controlStore.getDefaultAgentAuthorityScope(PRINCIPAL_ID).scopeDigest;
+  const database = new DatabaseSync(join(state.root, 'control', 'index.sqlite'));
+  const insert = database.prepare(`
+    INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+    VALUES (?, ?, 'legacy_session', ?)
+  `);
+  insert.run(PRINCIPAL_ID, successScope, '2026-08-29T00:00:00.000Z');
+  insert.run(PRINCIPAL_ID, returnedScope, '2026-08-29T00:00:01.000Z');
+  database.close();
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+
+  const first = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie });
+  assert.equal(first.status, 200);
+  assert.deepEqual(Buffer.from(await first.arrayBuffer()), bytes);
+  assert.deepEqual(calls, [defaultScope, returnedScope, successScope]);
+  assert.equal(state.controlStore.getAgentResourceBinding({
+    accountId: PRINCIPAL_ID,
+    resourceKind: 'artifact',
+    resourceId: artifactId
+  }).scopeDigest, successScope);
+
+  const second = await artifactRequest(baseUrl, artifactId, { cookie: auth.cookie });
+  assert.equal(second.status, 200);
+  assert.deepEqual(Buffer.from(await second.arrayBuffer()), bytes);
+  assert.deepEqual(calls, [defaultScope, returnedScope, successScope, successScope]);
+});
+
 test('uses its own AgInTi adapter contract over application-neutral LazyEdge transport', async (t) => {
   const upstreamRequests = [];
   const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
@@ -1551,9 +1999,9 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
 
   const second = await login(baseUrl);
   const foreignSession = await artifactRequest(baseUrl, artifactId, { cookie: second.cookie });
-  assert.equal(foreignSession.status, 404);
-  assert.equal((await foreignSession.json()).error.code, 'not_found');
-  assert.notEqual(calls.at(-1).context.browserSession, ownerSession);
+  assert.equal(foreignSession.status, 200);
+  assert.deepEqual(Buffer.from(await foreignSession.arrayBuffer()), content);
+  assert.equal(calls.at(-1).context.browserSession, ownerSession);
 });
 
 test('an aborted artifact stream releases admission even when a hostile upstream cancel never settles', async (t) => {

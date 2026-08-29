@@ -49,6 +49,8 @@ const DYNAMIC_CACHE_CONTROL = 'no-store';
 const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
 const REMEMBERED_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const EPHEMERAL_SESSION_MAX_AGE_SECONDS = 60;
+const MAX_AGENT_AUTHORITY_SCOPES = 33;
+const MAX_AGENT_THREADS_PER_AUTHORITY_SCOPE = 200;
 const GLOBAL_DISPATCH_RETRY_MS = 250;
 const REQUEST_BODY_TIMEOUT_MARGIN_MS = 30_000;
 const RESPONSE_RELEASE_ID = Symbol('responseReleaseId');
@@ -1042,7 +1044,15 @@ export function createCloudRequestHandler({
   const sessions = requireMethods(sessionStore ?? controlStore, 'sessionStore', [
     'createBrowserSession', 'authenticateBrowserSession', 'authenticateBrowserMutation', 'revokeBrowserSession'
   ]);
-  const controls = requireMethods(controlStore, 'controlStore', ['getAccount']);
+  const controls = requireMethods(controlStore, 'controlStore', [
+    'getAccount',
+    'getDefaultAgentAuthorityScope',
+    'primeDefaultAgentAuthorityScope',
+    'listAgentAuthorityScopes',
+    'getAgentResourceBinding',
+    'bindAgentResource',
+    'retireEmptyLegacyAgentAuthorityScope'
+  ]);
   const chat = requireMethods(directChatStore, 'directChatStore', [
     'createThread', 'getThread', 'listThreads', 'deleteThread', 'startTurn',
     'appendGenerationDelta', 'finalizeGeneration', 'cancelGeneration', 'failGeneration',
@@ -1130,6 +1140,307 @@ export function createCloudRequestHandler({
   function requireAuthentication(value) {
     if (!value) throw new CloudHttpError(401, 'authentication_required', 'A valid browser session is required.');
     return value;
+  }
+
+  function agentAuthorityScopes() {
+    const scopes = controls.listAgentAuthorityScopes({
+      accountId: configuredAccount.principalId,
+      limit: MAX_AGENT_AUTHORITY_SCOPES
+    });
+    if (!Array.isArray(scopes) || scopes.length < 1 || scopes.length > MAX_AGENT_AUTHORITY_SCOPES) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'Agent authority state is unavailable.');
+    }
+    const seen = new Set();
+    for (const scope of scopes) {
+      if (!scope || scope.accountId !== configuredAccount.principalId
+          || !/^[a-f0-9]{64}$/u.test(scope.scopeDigest)
+          || !['default', 'legacy_session'].includes(scope.kind)
+          || seen.has(scope.scopeDigest)) {
+        throw new CloudHttpError(503, 'storage_unavailable', 'Agent authority state is invalid.');
+      }
+      seen.add(scope.scopeDigest);
+    }
+    if (scopes[0].kind !== 'default') {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The default Agent authority scope is unavailable.');
+    }
+    return scopes;
+  }
+
+  function primeAgentAuthority(session) {
+    const scope = controls.primeDefaultAgentAuthorityScope({
+      accountId: configuredAccount.principalId,
+      legacyScopeDigest: session.browserSession
+    });
+    if (!scope || scope.accountId !== configuredAccount.principalId
+        || scope.kind !== 'default' || !/^[a-f0-9]{64}$/u.test(scope.scopeDigest)) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'Agent authority scope priming failed.');
+    }
+    return scope.scopeDigest;
+  }
+
+  function defaultAgentAuthorityScope() {
+    const scope = controls.getDefaultAgentAuthorityScope(configuredAccount.principalId);
+    if (!scope || scope.accountId !== configuredAccount.principalId
+        || scope.kind !== 'default' || !/^[a-f0-9]{64}$/u.test(scope.scopeDigest)) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'The default Agent authority scope is invalid.');
+    }
+    return scope.scopeDigest;
+  }
+
+  function agentContext(scopeDigest, signal, idempotencyKey) {
+    return Object.freeze({
+      principalId: configuredAccount.principalId,
+      browserSession: scopeDigest,
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+      signal
+    });
+  }
+
+  function bindAgentResource(resourceKind, resourceId, scopeDigest) {
+    controls.bindAgentResource({
+      accountId: configuredAccount.principalId,
+      resourceKind,
+      resourceId,
+      scopeDigest
+    });
+  }
+
+  function rememberAgentThread(thread, scopeDigest) {
+    bindAgentResource('thread', thread.id, scopeDigest);
+    const runIds = new Set([
+      ...(thread.lastRunId === null ? [] : [thread.lastRunId]),
+      ...(thread.messages ?? []).map((message) => message.runId)
+    ]);
+    for (const runId of runIds) bindAgentResource('run', runId, scopeDigest);
+  }
+
+  function rememberAgentRun(run, scopeDigest) {
+    bindAgentResource('thread', run.threadId, scopeDigest);
+    bindAgentResource('run', run.id, scopeDigest);
+    if (run.previousRunId !== null) bindAgentResource('run', run.previousRunId, scopeDigest);
+  }
+
+  function rememberAgentArtifact(artifact, scopeDigest) {
+    bindAgentResource('artifact', artifact.id, scopeDigest);
+  }
+
+  function rememberAgentResponse(pathname, response, scopeDigest) {
+    if (pathname === AGINTI_RPC_PATHS.threadsList) {
+      for (const thread of response.threads) rememberAgentThread(thread, scopeDigest);
+      return;
+    }
+    if ([
+      AGINTI_RPC_PATHS.threadsCreate,
+      AGINTI_RPC_PATHS.threadsGet,
+      AGINTI_RPC_PATHS.threadsUpdate
+    ].includes(pathname)) {
+      rememberAgentThread(response.thread, scopeDigest);
+      return;
+    }
+    if (pathname === AGINTI_RPC_PATHS.threadsDelete) {
+      // Keep the tombstoned binding: an idempotent delete replay must use the
+      // exact same authority scope even though a discovery GET now returns 404.
+      bindAgentResource('thread', response.threadId, scopeDigest);
+      return;
+    }
+    if ([
+      AGINTI_RPC_PATHS.runsStart,
+      AGINTI_RPC_PATHS.runsStatus,
+      AGINTI_RPC_PATHS.runsCancel,
+      AGINTI_RPC_PATHS.runsResume
+    ].includes(pathname)) {
+      rememberAgentRun(response.run, scopeDigest);
+      return;
+    }
+    if (pathname === AGINTI_RPC_PATHS.artifactsList) {
+      for (const artifact of response.artifacts) rememberAgentArtifact(artifact, scopeDigest);
+      return;
+    }
+    if (pathname === AGINTI_RPC_PATHS.artifactsGet) {
+      rememberAgentArtifact(response.artifact, scopeDigest);
+    }
+  }
+
+  function rememberAgentEvent(event, scopeDigest) {
+    bindAgentResource('thread', event.threadId, scopeDigest);
+    bindAgentResource('run', event.runId, scopeDigest);
+    if (event.type === 'artifact.created' || event.type === 'artifact.updated') {
+      rememberAgentArtifact(event.payload.artifact, scopeDigest);
+    }
+  }
+
+  function isAgentResourceNotFound(error) {
+    return Number(error?.statusCode) === 404
+      && typeof error?.code === 'string'
+      && error.code.startsWith('AGINTI_');
+  }
+
+  function boundAgentScope(resourceKind, resourceId) {
+    const binding = controls.getAgentResourceBinding({
+      accountId: configuredAccount.principalId,
+      resourceKind,
+      resourceId
+    });
+    if (binding === null) return null;
+    if (binding.accountId !== configuredAccount.principalId
+        || binding.resourceKind !== resourceKind
+        || binding.resourceId !== resourceId
+        || !/^[a-f0-9]{64}$/u.test(binding.scopeDigest)) {
+      throw new CloudHttpError(503, 'storage_unavailable', 'An Agent resource binding is invalid.');
+    }
+    return binding.scopeDigest;
+  }
+
+  async function probeAgentResource(resourceKind, resourceId, signal) {
+    const probes = Object.freeze({
+      thread: Object.freeze({ pathname: AGINTI_RPC_PATHS.threadsGet, input: { threadId: resourceId } }),
+      run: Object.freeze({ pathname: AGINTI_RPC_PATHS.runsStatus, input: { runId: resourceId } }),
+      artifact: Object.freeze({ pathname: AGINTI_RPC_PATHS.artifactsGet, input: { artifactId: resourceId } })
+    });
+    const probe = probes[resourceKind];
+    if (!probe) throw new TypeError('unsupported Agent resource probe');
+    for (const scope of agentAuthorityScopes()) {
+      try {
+        const raw = await agintiAdapter.rpc(
+          probe.pathname,
+          probe.input,
+          agentContext(scope.scopeDigest, signal)
+        );
+        const response = validateAgentResponse(probe.pathname, raw);
+        requireAgentResponseCorrelation(probe.pathname, probe.input, response);
+        rememberAgentResponse(probe.pathname, response, scope.scopeDigest);
+        return Object.freeze({ scopeDigest: scope.scopeDigest, pathname: probe.pathname, response });
+      } catch (error) {
+        if (isAgentResourceNotFound(error)) continue;
+        throw error;
+      }
+    }
+    return null;
+  }
+
+  async function resolveAgentResource(resourceKind, resourceId, signal) {
+    const bound = boundAgentScope(resourceKind, resourceId);
+    if (bound !== null) return Object.freeze({ scopeDigest: bound, probe: null });
+    const scopes = agentAuthorityScopes();
+    if (scopes.length === 1) {
+      // A post-migration account has only its stable default. Let AgInTi
+      // produce the authoritative resource error without an extra discovery
+      // round trip.
+      return Object.freeze({ scopeDigest: scopes[0].scopeDigest, probe: null });
+    }
+    const probe = await probeAgentResource(resourceKind, resourceId, signal);
+    if (probe === null) {
+      throw new CloudHttpError(404, 'not_found', 'The requested Agent resource does not exist.');
+    }
+    return Object.freeze({ scopeDigest: probe.scopeDigest, probe });
+  }
+
+  async function resolveAgentRequestScope(pathname, input, signal) {
+    if ([AGINTI_RPC_PATHS.capabilities, AGINTI_RPC_PATHS.threadsCreate].includes(pathname)) {
+      return Object.freeze({ scopeDigest: defaultAgentAuthorityScope(), probe: null });
+    }
+    if ([
+      AGINTI_RPC_PATHS.threadsGet,
+      AGINTI_RPC_PATHS.threadsUpdate,
+      AGINTI_RPC_PATHS.threadsDelete,
+      AGINTI_RPC_PATHS.runsStart
+    ].includes(pathname)) {
+      return resolveAgentResource('thread', input.threadId, signal);
+    }
+    if ([
+      AGINTI_RPC_PATHS.runsStatus,
+      AGINTI_RPC_PATHS.runsEvents,
+      AGINTI_RPC_PATHS.runsCancel,
+      AGINTI_RPC_PATHS.runsResume
+    ].includes(pathname)) {
+      return resolveAgentResource('run', input.runId, signal);
+    }
+    if (pathname === AGINTI_RPC_PATHS.artifactsList) {
+      return input.threadId === undefined
+        ? resolveAgentResource('run', input.runId, signal)
+        : resolveAgentResource('thread', input.threadId, signal);
+    }
+    if (pathname === AGINTI_RPC_PATHS.artifactsGet) {
+      return resolveAgentResource('artifact', input.artifactId, signal);
+    }
+    throw new TypeError('unsupported Agent authority route');
+  }
+
+  async function listAgentThreadsAcrossScopes(input, signal) {
+    const scopes = agentAuthorityScopes();
+    if (scopes.length === 1) {
+      const raw = await agintiAdapter.rpc(
+        AGINTI_RPC_PATHS.threadsList,
+        input,
+        agentContext(scopes[0].scopeDigest, signal)
+      );
+      const response = validateAgentResponse(AGINTI_RPC_PATHS.threadsList, raw);
+      rememberAgentResponse(AGINTI_RPC_PATHS.threadsList, response, scopes[0].scopeDigest);
+      return response;
+    }
+
+    const byId = new Map();
+    for (const scope of scopes) {
+      let before = '';
+      let fetched = 0;
+      const seenCursors = new Set();
+      while (fetched < MAX_AGENT_THREADS_PER_AUTHORITY_SCOPE) {
+        const pageInput = {
+          limit: Math.min(100, MAX_AGENT_THREADS_PER_AUTHORITY_SCOPE - fetched),
+          before
+        };
+        const raw = await agintiAdapter.rpc(
+          AGINTI_RPC_PATHS.threadsList,
+          pageInput,
+          agentContext(scope.scopeDigest, signal)
+        );
+        const page = validateAgentResponse(AGINTI_RPC_PATHS.threadsList, raw);
+        for (const thread of page.threads) {
+          const prior = byId.get(thread.id);
+          if (prior && prior.scopeDigest !== scope.scopeDigest) {
+            throw new CloudHttpError(502, 'invalid_agent_response', 'An Agent thread identifier is duplicated across authority scopes.');
+          }
+        }
+        rememberAgentResponse(AGINTI_RPC_PATHS.threadsList, page, scope.scopeDigest);
+        for (const thread of page.threads) {
+          byId.set(thread.id, { scopeDigest: scope.scopeDigest, thread });
+        }
+        fetched += page.threads.length;
+        if (page.nextBefore === null) break;
+        if (page.threads.length === 0 || seenCursors.has(page.nextBefore)) {
+          throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned a cyclic thread cursor.');
+        }
+        seenCursors.add(page.nextBefore);
+        before = page.nextBefore;
+        if (fetched >= MAX_AGENT_THREADS_PER_AUTHORITY_SCOPE) {
+          throw new CloudHttpError(503, 'agent_scope_too_large', 'A legacy Agent scope exceeds the bounded migration window.');
+        }
+      }
+      if (scope.kind === 'legacy_session' && fetched === 0) {
+        controls.retireEmptyLegacyAgentAuthorityScope({
+          accountId: configuredAccount.principalId,
+          scopeDigest: scope.scopeDigest
+        });
+      }
+    }
+
+    const threads = [...byId.values()].map(({ thread }) => thread).sort((left, right) => (
+      right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)
+    ));
+    let start = 0;
+    if (input.before) {
+      const index = threads.findIndex((thread) => thread.id === input.before);
+      if (index < 0) {
+        throw new CloudHttpError(400, 'invalid_agent_cursor', 'The Agent thread cursor is not available.');
+      }
+      start = index + 1;
+    }
+    const page = threads.slice(start, start + input.limit);
+    return Object.freeze({
+      schemaVersion: '1',
+      threads: Object.freeze(page),
+      nextBefore: start + page.length < threads.length ? page.at(-1)?.id ?? null : null
+    });
   }
 
   async function handleLogin(req, res, body, requestSignal, clientAddress) {
@@ -1723,21 +2034,14 @@ export function createCloudRequestHandler({
       }
       throw new CloudHttpError(503, 'agent_unavailable', 'AgInTi Agent is unavailable.');
     }
-    const contextFor = (signal) => Object.freeze({
-      principalId: configuredAccount.principalId,
-      browserSession: session.browserSession,
-      ...(mutation ? { idempotencyKey } : {}),
-      signal
-    });
-    const readContextFor = (signal) => Object.freeze({
-      principalId: configuredAccount.principalId,
-      browserSession: session.browserSession,
-      signal
-    });
+    primeAgentAuthority(session);
     const requestedSearch = input.input?.search;
     if (requestedSearch !== undefined) {
       const proof = await withTimeout(
-        (signal) => agintiAdapter.capabilities(readContextFor(signal)),
+        async (signal) => {
+          const authority = await resolveAgentRequestScope(nativePath, input, signal);
+          return agintiAdapter.capabilities(agentContext(authority.scopeDigest, signal));
+        },
         { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi capability check timed out' }
       );
       let capability;
@@ -1754,8 +2058,13 @@ export function createCloudRequestHandler({
     if (nativePath === AGINTI_RPC_PATHS.runsEvents) {
       const streamDeadline = deadlineSignal(requestSignal, limits.sseLifetimeMs, 'Agent event stream reached its reconnect boundary');
       try {
+        const authority = await resolveAgentRequestScope(nativePath, input, streamDeadline.signal);
         const events = await valueWithAbort(
-          agintiAdapter.rpc(nativePath, input, contextFor(streamDeadline.signal)),
+          agintiAdapter.rpc(
+            nativePath,
+            input,
+            agentContext(authority.scopeDigest, streamDeadline.signal)
+          ),
           streamDeadline.signal
         );
         if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
@@ -1774,6 +2083,7 @@ export function createCloudRequestHandler({
           if (event.runId !== input.runId) {
             throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an event for a different run.');
           }
+          rememberAgentEvent(event, authority.scopeDigest);
           await writeSse(res, jsonSseEvent({ event: event.type, id: event.id, data: event }), streamDeadline.signal);
         }
       } catch (error) {
@@ -1786,9 +2096,26 @@ export function createCloudRequestHandler({
     }
     try {
       const response = await withTimeout(
-        (signal) => nativePath === AGINTI_RPC_PATHS.capabilities
-          ? agintiAdapter.capabilities(contextFor(signal))
-          : agintiAdapter.rpc(nativePath, input, contextFor(signal)),
+        async (signal) => {
+          if (nativePath === AGINTI_RPC_PATHS.threadsList) {
+            return listAgentThreadsAcrossScopes(input, signal);
+          }
+          const authority = await resolveAgentRequestScope(nativePath, input, signal);
+          if (!mutation && authority.probe?.pathname === nativePath) {
+            return authority.probe.response;
+          }
+          const raw = nativePath === AGINTI_RPC_PATHS.capabilities
+            ? await agintiAdapter.capabilities(agentContext(authority.scopeDigest, signal))
+            : await agintiAdapter.rpc(
+                nativePath,
+                input,
+                agentContext(authority.scopeDigest, signal, mutation ? idempotencyKey : undefined)
+              );
+          const validated = validateAgentResponse(nativePath, raw);
+          requireAgentResponseCorrelation(nativePath, input, validated);
+          rememberAgentResponse(nativePath, validated, authority.scopeDigest);
+          return validated;
+        },
         { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi request timed out' }
       );
       let validated;
@@ -1816,13 +2143,30 @@ export function createCloudRequestHandler({
       ...(metadataOnly ? { metadataOnly: true } : {}),
       ...(range === undefined ? {} : { range })
     });
-    const contextFor = (signal) => Object.freeze({
-      principalId: configuredAccount.principalId,
-      browserSession: session.browserSession,
-      signal
-    });
+    primeAgentAuthority(session);
     const raw = await withTimeout(
-      (signal) => agintiAdapter.artifactContent(input, contextFor(signal)),
+      async (signal) => {
+        const bound = boundAgentScope('artifact', route.artifactId);
+        if (bound !== null) {
+          return agintiAdapter.artifactContent(input, agentContext(bound, signal));
+        }
+        for (const scope of agentAuthorityScopes()) {
+          let candidate;
+          try {
+            candidate = await agintiAdapter.artifactContent(
+              input,
+              agentContext(scope.scopeDigest, signal)
+            );
+          } catch (error) {
+            if (isAgentResourceNotFound(error)) continue;
+            throw error;
+          }
+          if (candidate?.status === 404) continue;
+          bindAgentResource('artifact', route.artifactId, scope.scopeDigest);
+          return candidate;
+        }
+        return Object.freeze({ status: 404 });
+      },
       { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi artifact request timed out' }
     );
     if (raw?.status === 404) {

@@ -114,6 +114,84 @@ CREATE INDEX idempotency_records_owner_created
   ON idempotency_records(account_id, created_at DESC);
 `;
 
+// AgentWeb originally forwarded the digest of the current login cookie as the
+// AgInTi browser-session authority.  That made durable Agent resources vanish
+// after a login rotation.  Version 2 separates login sessions from Agent
+// authority:
+//
+// - one random, durable default scope owns all newly-created Agent resources;
+// - the bounded set of pre-upgrade browser-session digests remains available
+//   only as legacy discovery scopes; and
+// - discovered resource-to-scope bindings survive expiry/revocation of the
+//   login session that happened to create them.
+//
+// The migration is additive.  It does not rewrite or drop any v1 table, so a
+// rollout can restore its pre-migration SQLite backup without translating
+// presentation data.
+const DURABLE_AGENT_AUTHORITY_SCHEMA = `
+CREATE TABLE agent_authority_scopes (
+  account_id TEXT NOT NULL,
+  scope_digest TEXT NOT NULL CHECK (
+    length(scope_digest) = 64 AND scope_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  scope_kind TEXT NOT NULL CHECK (
+    scope_kind IN ('default_pending', 'default', 'legacy_session')
+  ),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, scope_digest),
+  UNIQUE (scope_digest),
+  FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+) STRICT;
+
+CREATE UNIQUE INDEX agent_authority_scopes_one_default
+  ON agent_authority_scopes(account_id)
+  WHERE scope_kind IN ('default_pending', 'default');
+
+CREATE INDEX agent_authority_scopes_owner_kind
+  ON agent_authority_scopes(account_id, scope_kind, created_at, scope_digest);
+
+CREATE TABLE agent_resource_bindings (
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN ('thread', 'run', 'artifact')),
+  resource_id TEXT NOT NULL CHECK (length(resource_id) BETWEEN 1 AND 128),
+  account_id TEXT NOT NULL,
+  scope_digest TEXT NOT NULL CHECK (
+    length(scope_digest) = 64 AND scope_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (resource_kind, resource_id),
+  UNIQUE (account_id, resource_kind, resource_id),
+  FOREIGN KEY (account_id, scope_digest)
+    REFERENCES agent_authority_scopes(account_id, scope_digest) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX agent_resource_bindings_owner_kind
+  ON agent_resource_bindings(account_id, resource_kind, updated_at, resource_id);
+
+INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+SELECT id,
+       lower(hex(randomblob(32))),
+       CASE WHEN EXISTS (
+         SELECT 1 FROM browser_sessions WHERE browser_sessions.account_id = accounts.id
+       ) THEN 'default_pending' ELSE 'default' END,
+       updated_at
+FROM accounts;
+
+INSERT INTO agent_authority_scopes(account_id, scope_digest, scope_kind, created_at)
+SELECT account_id, session_digest, 'legacy_session', created_at
+FROM (
+  SELECT account_id,
+         session_digest,
+         created_at,
+         row_number() OVER (
+           PARTITION BY account_id ORDER BY created_at DESC, session_digest DESC
+         ) AS scope_rank
+  FROM browser_sessions
+)
+WHERE scope_rank <= 32
+ORDER BY account_id, created_at, session_digest;
+`;
+
 function checksum(sql) {
   return createHash('sha256').update(sql, 'utf8').digest('hex');
 }
@@ -124,6 +202,12 @@ export const MIGRATIONS = Object.freeze([
     name: 'cloud_presentation_index',
     sql: INITIAL_SCHEMA,
     checksum: checksum(INITIAL_SCHEMA)
+  }),
+  Object.freeze({
+    version: 2,
+    name: 'durable_agent_authority',
+    sql: DURABLE_AGENT_AUTHORITY_SCHEMA,
+    checksum: checksum(DURABLE_AGENT_AUTHORITY_SCHEMA)
   })
 ]);
 

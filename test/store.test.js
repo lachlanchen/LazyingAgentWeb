@@ -1,16 +1,23 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 
 import {
   ConflictError,
+  CloudIndexStore,
   IDEMPOTENCY_RECEIPT_TTL_MS,
   IdempotencyConflictError,
+  LATEST_SCHEMA_VERSION,
+  MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT,
   MAX_BROWSER_SESSIONS_PER_ACCOUNT,
   MAX_IDEMPOTENCY_RECEIPTS_PER_ACCOUNT,
+  MIGRATIONS,
   NotFoundError,
+  SQLITE_APPLICATION_ID,
   ValidationError
 } from '../src/index.js';
 import { canonicalJson, digestSecret } from '../src/validation.js';
@@ -158,6 +165,153 @@ test('stores only session and CSRF digests and enforces CSRF on mutations', (t) 
   const bytes = readFileSync(databasePath).toString('latin1');
   assert.doesNotMatch(bytes, new RegExp(SESSION_TOKEN, 'u'));
   assert.doesNotMatch(bytes, new RegExp(CSRF_TOKEN, 'u'));
+});
+
+test('separates durable Agent authority from login sessions and isolates resource bindings by account', (t) => {
+  const { store } = createTestStore(t);
+  provisionAccount(store, 'authority-one');
+  provisionAccount(store, 'authority-two');
+
+  const first = store.getDefaultAgentAuthorityScope('account-authority-one');
+  const second = store.getDefaultAgentAuthorityScope('account-authority-two');
+  assert.equal(first.kind, 'default');
+  assert.equal(second.kind, 'default');
+  assert.match(first.scopeDigest, /^[a-f0-9]{64}$/u);
+  assert.notEqual(first.scopeDigest, second.scopeDigest);
+  assert.equal(
+    store.listAgentAuthorityScopes({ accountId: 'account-authority-one' }).length,
+    1
+  );
+
+  const binding = store.bindAgentResource({
+    accountId: 'account-authority-one',
+    resourceKind: 'thread',
+    resourceId: 'thr_authority_owner',
+    scopeDigest: first.scopeDigest
+  });
+  assert.deepEqual(store.bindAgentResource({
+    accountId: 'account-authority-one',
+    resourceKind: 'thread',
+    resourceId: 'thr_authority_owner',
+    scopeDigest: first.scopeDigest
+  }), binding, 'binding replay is naturally idempotent');
+  assert.equal(store.getAgentResourceBinding({
+    accountId: 'account-authority-two',
+    resourceKind: 'thread',
+    resourceId: 'thr_authority_owner'
+  }), null);
+  assert.throws(() => store.bindAgentResource({
+    accountId: 'account-authority-two',
+    resourceKind: 'thread',
+    resourceId: 'thr_authority_owner',
+    scopeDigest: second.scopeDigest
+  }), ConflictError);
+  assert.throws(() => store.bindAgentResource({
+    accountId: 'account-authority-two',
+    resourceKind: 'run',
+    resourceId: 'run_foreign_scope',
+    scopeDigest: first.scopeDigest
+  }), NotFoundError);
+});
+
+test('migrates v1 sessions into bounded legacy scopes and primes exactly one stable default transactionally', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'lazying-agent-authority-migration-'));
+  const databaseDirectory = join(root, 'private');
+  const databasePath = join(databaseDirectory, 'index.sqlite');
+  const backupPath = join(root, 'index-v1.sqlite');
+  mkdirSync(databaseDirectory, { mode: 0o700 });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const database = new DatabaseSync(databasePath);
+  const v1 = MIGRATIONS[0];
+  database.exec(v1.sql);
+  database.prepare(`
+    INSERT INTO schema_migrations(version, name, checksum, applied_at)
+    VALUES (?, ?, ?, ?)
+  `).run(v1.version, v1.name, v1.checksum, '2026-08-20T00:00:00.000Z');
+  database.exec(`PRAGMA application_id = ${SQLITE_APPLICATION_ID}`);
+  database.exec('PRAGMA user_version = 1');
+  database.prepare(`
+    INSERT INTO accounts(id, issuer, subject, display_name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    'account-migrated',
+    'local-login',
+    'migrated-user',
+    'Migrated',
+    '2026-08-20T00:00:00.000Z',
+    '2026-08-20T00:00:00.000Z'
+  );
+  const legacyTokens = [
+    `legacy-session-one-${'a'.repeat(40)}`,
+    `legacy-session-two-${'b'.repeat(40)}`
+  ];
+  const legacyDigests = legacyTokens.map((token) => digestSecret(token, 'sessionToken'));
+  for (let index = 0; index < legacyDigests.length; index += 1) {
+    database.prepare(`
+      INSERT INTO browser_sessions(
+        session_digest, account_id, csrf_digest, created_at, expires_at, last_seen_at, revoked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      legacyDigests[index],
+      'account-migrated',
+      String(index + 1).repeat(64),
+      `2026-08-2${index}T00:00:00.000Z`,
+      '2099-01-01T00:00:00.000Z',
+      `2026-08-2${index}T00:00:00.000Z`
+    );
+  }
+  database.close();
+  chmodSync(databasePath, 0o600);
+  copyFileSync(databasePath, backupPath);
+  chmodSync(backupPath, 0o600);
+
+  const store = new CloudIndexStore({ databasePath });
+  t.after(() => store.close());
+  const pending = store.listAgentAuthorityScopes({ accountId: 'account-migrated' });
+  assert.equal(pending.length, legacyDigests.length + 1);
+  assert.ok(pending.length <= MAX_AGENT_AUTHORITY_SCOPES_PER_ACCOUNT);
+  assert.equal(pending[0].kind, 'default_pending');
+  assert.deepEqual(
+    new Set(pending.slice(1).map(({ scopeDigest }) => scopeDigest)),
+    new Set(legacyDigests)
+  );
+
+  const primed = store.primeDefaultAgentAuthorityScope({
+    accountId: 'account-migrated',
+    legacyScopeDigest: legacyDigests[1]
+  });
+  assert.equal(primed.kind, 'default');
+  assert.equal(primed.scopeDigest, legacyDigests[1]);
+  assert.equal(store.primeDefaultAgentAuthorityScope({
+    accountId: 'account-migrated',
+    legacyScopeDigest: legacyDigests[0]
+  }).scopeDigest, legacyDigests[1], 'the first authenticated prime wins permanently');
+  assert.equal(store.getDefaultAgentAuthorityScope('account-migrated').scopeDigest, legacyDigests[1]);
+  assert.deepEqual(store.retireEmptyLegacyAgentAuthorityScope({
+    accountId: 'account-migrated',
+    scopeDigest: legacyDigests[0]
+  }), { retired: true });
+  assert.deepEqual(store.retireEmptyLegacyAgentAuthorityScope({
+    accountId: 'account-migrated',
+    scopeDigest: legacyDigests[0]
+  }), { retired: false });
+
+  const migrated = new DatabaseSync(databasePath, { readOnly: true });
+  assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
+  assert.equal(migrated.prepare('SELECT count(*) AS count FROM accounts').get().count, 1);
+  assert.equal(migrated.prepare('SELECT count(*) AS count FROM browser_sessions').get().count, 2);
+  assert.equal(migrated.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  migrated.close();
+
+  // Rollback uses the pre-migration snapshot. Version 2 is additive, and the
+  // exact v1 backup remains a valid untouched rollback target.
+  const rollback = new DatabaseSync(backupPath, { readOnly: true });
+  assert.equal(rollback.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(rollback.prepare('SELECT count(*) AS count FROM accounts').get().count, 1);
+  assert.equal(rollback.prepare('SELECT count(*) AS count FROM browser_sessions').get().count, 2);
+  assert.equal(rollback.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  rollback.close();
 });
 
 test('thread queries and mutations are owner-bound', (t) => {

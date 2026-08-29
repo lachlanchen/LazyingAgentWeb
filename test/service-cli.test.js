@@ -157,6 +157,7 @@ test('serve binds through the service only and always performs graceful shutdown
   let waited = 0;
   const service = {
     server,
+    agentEnabled: true,
     publicOrigin: 'https://llm.test',
     releaseId: `test-${'b'.repeat(64)}`,
     async start() {
@@ -194,7 +195,7 @@ test('serve binds through the service only and always performs graceful shutdown
     port: 18_543,
     publicOrigin: 'https://llm.test',
     releaseId: `test-${'b'.repeat(64)}`,
-    agentEnabled: false
+    agentEnabled: true
   });
 });
 

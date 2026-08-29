@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   COMPONENT_ID,
+  LATEST_SCHEMA_VERSION,
   MAX_BROWSER_SESSIONS_PER_ACCOUNT,
   createCapabilityContract,
   createHealthContract
@@ -44,7 +45,7 @@ test('health contract reports only local storage and never claims upstream healt
 
   assert.equal(health.status, 'ready');
   assert.equal(health.storage.ready, true);
-  assert.equal(health.storage.schemaVersion, 1);
+  assert.equal(health.storage.schemaVersion, LATEST_SCHEMA_VERSION);
   assert.deepEqual(health.dependencies, {
     aginti: 'not_probed',
     localllm: 'not_probed',

@@ -119,8 +119,21 @@ jobs:
           fi
           LC_ALL=C find "$FRESH_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/fresh-package.manifest"
           LC_ALL=C find "$RELEASE_TREE/package" -printf '%y\t%m\t%s\t%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/release-package.manifest"
-          cmp --silent "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest"
-          diff --no-dereference --recursive --brief "$FRESH_TREE/package" "$RELEASE_TREE/package"
+          PACKAGE_MATCH=yes
+          if ! cmp --silent "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest"; then
+            PACKAGE_MATCH=no
+            echo "Package path/type/mode/size manifest difference:" >&2
+            diff --unified "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest" || true
+          fi
+          if ! diff --no-dereference --recursive --brief "$FRESH_TREE/package" "$RELEASE_TREE/package"; then
+            PACKAGE_MATCH=no
+            echo "Package file-byte difference:" >&2
+            diff --no-dereference --recursive --unified "$FRESH_TREE/package" "$RELEASE_TREE/package" || true
+          fi
+          if [[ "$PACKAGE_MATCH" != yes ]]; then
+            echo "Fresh immutable-tag package files differ from the release asset; refusing publication." >&2
+            exit 1
+          fi
           echo "The immutable tag and release asset have identical paths, modes, sizes, and file bytes."
           echo "tarball=$RELEASE_TARBALL" >> "$GITHUB_OUTPUT"
 

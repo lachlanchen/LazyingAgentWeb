@@ -32,8 +32,9 @@ test('npm publishing is release-bound, reproducible, and tokenless', async () =>
     "test \"$(git describe --tags --exact-match HEAD)\" = \"$RELEASE_TAG\"",
     'npm ci --ignore-scripts',
     'const x=Array.isArray(p)?p:Object.values(p)',
-    'cmp --silent "$TARBALL" "$RUNNER_TEMP/release-asset/$TARBALL"',
-    'node scripts/npm-publish-idempotent.mjs "./$TARBALL"',
+    'cmp --silent "$RUNNER_TEMP/fresh-package.manifest" "$RUNNER_TEMP/release-package.manifest"',
+    'diff --no-dereference --recursive --brief "$FRESH_TREE/package" "$RELEASE_TREE/package"',
+    'node scripts/npm-publish-idempotent.mjs "$TARBALL"',
   ]) {
     assert.ok(workflow.includes(required), `missing publishing invariant: ${required}`);
   }

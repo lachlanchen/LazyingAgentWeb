@@ -91,10 +91,16 @@ jobs:
           RELEASE_TARBALL="$RUNNER_TEMP/release-asset/$TARBALL"
           LOCAL_SHA256="$(sha256sum "$TARBALL" | cut -d ' ' -f 1)"
           RELEASE_SHA256="$(sha256sum "$RELEASE_TARBALL" | cut -d ' ' -f 1)"
+          LOCAL_PAYLOAD_SHA256="$(gzip --decompress --stdout "$TARBALL" | sha256sum | cut -d ' ' -f 1)"
+          RELEASE_PAYLOAD_SHA256="$(gzip --decompress --stdout "$RELEASE_TARBALL" | sha256sum | cut -d ' ' -f 1)"
           printf 'Reproduced SHA-256: %s\nRelease asset SHA-256: %s\n' "$LOCAL_SHA256" "$RELEASE_SHA256"
-          if [[ "$LOCAL_SHA256" != "$RELEASE_SHA256" ]] || ! cmp --silent "$TARBALL" "$RELEASE_TARBALL"; then
-            echo "Fresh immutable-tag pack differs from the published release asset; refusing publication." >&2
+          printf 'Reproduced tar payload SHA-256: %s\nRelease tar payload SHA-256: %s\n' "$LOCAL_PAYLOAD_SHA256" "$RELEASE_PAYLOAD_SHA256"
+          if [[ "$LOCAL_PAYLOAD_SHA256" != "$RELEASE_PAYLOAD_SHA256" ]]; then
+            echo "Fresh immutable-tag package payload differs from the published release asset; refusing publication." >&2
             exit 1
+          fi
+          if [[ "$LOCAL_SHA256" != "$RELEASE_SHA256" ]]; then
+            echo "The npm/Node runtime changed only gzip encoding; publishing the authenticated release asset."
           fi
           echo "tarball=$RELEASE_TARBALL" >> "$GITHUB_OUTPUT"
 

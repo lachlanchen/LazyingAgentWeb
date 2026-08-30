@@ -187,6 +187,7 @@ function agentImageCapabilities(overrides = {}) {
       maximumCount: 4,
       maximumBytesEach: 4 * 1024 * 1024,
       maximumBytesTotal: 16 * 1024 * 1024,
+      requestTimeoutMs: 515_000,
       model: "localllm-vision",
       persistence: "retained-reference-v1",
     },

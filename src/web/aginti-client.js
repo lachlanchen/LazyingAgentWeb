@@ -1,4 +1,5 @@
 import {
+  AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS,
   AGINTI_RPC_PATHS,
   AgintiProtocolError,
   FAIL_CLOSED_AGENT_CAPABILITIES,
@@ -175,7 +176,7 @@ function requirePinnedRelease(response, releaseId) {
 
 function deadlineSignal(signal, timeoutMs) {
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError("signal must be an AbortSignal");
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) throw new TypeError("timeoutMs is invalid");
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 600_000) throw new TypeError("timeoutMs is invalid");
   const controller = new AbortController();
   const abortFromCaller = () => controller.abort(signal.reason ?? new DOMException("request aborted", "AbortError"));
   if (signal?.aborted) abortFromCaller();
@@ -407,6 +408,9 @@ export class AgintiBrowserClient {
     this.csrf = normalizedCsrf({ csrfToken, csrfHeader });
     this.releaseId = optionalWebRelease(releaseId);
     this.makeIdempotencyKey = requireFunction(makeIdempotencyKey, "makeIdempotencyKey");
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+      throw new TypeError("timeoutMs is invalid");
+    }
     this.timeoutMs = timeoutMs;
     if (!Number.isSafeInteger(streamWallMs) || streamWallMs < 1_000 || streamWallMs > 120_000) {
       throw new TypeError("streamWallMs is invalid");
@@ -427,7 +431,13 @@ export class AgintiBrowserClient {
     if (!mutation && idempotency !== undefined) throw new TypeError("read RPCs may not carry idempotency keys");
     const mutationKey = mutation ? validateIdempotencyKey(idempotency ?? idempotencyKey(this.makeIdempotencyKey)) : undefined;
     const endpoint = this.endpoint(pathname);
-    const deadline = deadlineSignal(signal, this.timeoutMs);
+    const imageMutation = (pathname === AGINTI_RPC_PATHS.runsStart
+      || pathname === AGINTI_RPC_PATHS.runsResume)
+      && Array.isArray(request.input?.attachments);
+    const deadline = deadlineSignal(
+      signal,
+      imageMutation ? AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS : this.timeoutMs,
+    );
     let response;
     try {
       response = await this.fetch(endpoint, {

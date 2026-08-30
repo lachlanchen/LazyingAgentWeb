@@ -13,6 +13,7 @@ export const AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES = Object.freeze(["image/png", "
 export const AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT = 4;
 export const AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT = 4 * 1024 * 1024;
 export const AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT = 16 * 1024 * 1024;
+export const AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS = 515_000;
 
 export const AGINTI_RPC_PATHS = Object.freeze({
   capabilities: "/agent/v1/capabilities",
@@ -959,7 +960,7 @@ export function validateAgentCapabilities(value) {
   const actions = exact(response.actions, ["cancel", "resume", "retry"], "agent capabilities actions");
   const attachmentFields = [
     "enabled", "transport", "acceptedMediaTypes", "maximumCount", "maximumBytesEach",
-    "maximumBytesTotal", "model", "persistence",
+    "maximumBytesTotal", "requestTimeoutMs", "model", "persistence",
   ];
   const attachments = exact(
     response.attachments,
@@ -990,6 +991,7 @@ export function validateAgentCapabilities(value) {
         || attachments.maximumCount !== AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT
         || attachments.maximumBytesEach !== AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT
         || attachments.maximumBytesTotal !== AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT
+        || attachments.requestTimeoutMs !== AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS
         || attachments.model !== "localllm-vision"
         || attachments.persistence !== "retained-reference-v1") {
       invalid("agent attachment capabilities are invalid");
@@ -1001,6 +1003,7 @@ export function validateAgentCapabilities(value) {
       maximumCount: AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
       maximumBytesEach: AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT,
       maximumBytesTotal: AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT,
+      requestTimeoutMs: AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS,
       model: "localllm-vision",
       persistence: "retained-reference-v1",
     });

@@ -6,6 +6,7 @@ import {
   AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT,
   AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
   AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES,
+  AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS,
   AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT,
   AGINTI_RPC_PATHS,
   AGINTI_SEARCH_MODES,
@@ -76,6 +77,7 @@ function attachmentCapabilities() {
     maximumCount: 4,
     maximumBytesEach: 4 * 1024 * 1024,
     maximumBytesTotal: 16 * 1024 * 1024,
+    requestTimeoutMs: 515_000,
     model: "localllm-vision",
     persistence: "retained-reference-v1",
   };
@@ -393,6 +395,7 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
   assert.equal(AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT, 4);
   assert.equal(AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT, 4 * 1024 * 1024);
   assert.equal(AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT, 16 * 1024 * 1024);
+  assert.equal(AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS, 515_000);
   const searchEnabled = capabilities({
     enabled: true,
     actions: { cancel: true, resume: true, retry: false },
@@ -438,6 +441,7 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     { ...enabled, attachments: { enabled: true } },
     { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), acceptedMediaTypes: ["image/jpeg", "image/png"] } },
     { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), maximumCount: 5 } },
+    { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), requestTimeoutMs: 270_000 } },
     { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), persistence: "browser-cache" } },
     { ...capabilities(), attachments: attachmentCapabilities() },
   ]) {
@@ -927,6 +931,80 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
     transportEndpoint: "/api/%2e%2e/private",
     baseUrl: "https://llm.lazying.art/",
   }), /normalized|absolute-path/u);
+});
+
+test("Agent image mutations outlive the ordinary deadline while preserving abort and idempotency", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const calls = [];
+  let responseDelayMs = 20_000;
+  const client = new AgintiBrowserClient({
+    transportEndpoint: "/api/edge",
+    baseUrl: "https://llm.lazying.art/",
+    csrfToken: "csrf-token-value-long-enough",
+    fetchImpl: (url, options) => new Promise((resolve, reject) => {
+      calls.push({ url, options });
+      const timer = setTimeout(() => resolve(jsonResponse({
+        schemaVersion: "1",
+        run: url.endsWith(AGINTI_RPC_PATHS.runsResume)
+          ? publicRun({ id: SECOND_RUN_ID, previousRunId: RUN_ID })
+          : publicRun(),
+      })), responseDelayMs);
+      const abort = () => {
+        clearTimeout(timer);
+        reject(options.signal.reason ?? new DOMException("request aborted", "AbortError"));
+      };
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener("abort", abort, { once: true });
+    }),
+  });
+
+  const ordinary = client.startRun(THREAD_ID, "Text-only slow request", {
+    idempotency: "ordinary_agent_timeout_0001",
+  });
+  const ordinaryRejected = assert.rejects(ordinary, (error) => error instanceof AgintiTransportError
+    && error.code === "AGINTI_TIMEOUT" && error.retryable === true);
+  t.mock.timers.tick(15_000);
+  await ordinaryRejected;
+
+  const image = client.startRun(THREAD_ID, "Slow image upload", {
+    idempotency: "image_agent_slow_upload_001",
+    attachments: [agentAttachment()],
+  });
+  let imageSettled = false;
+  image.then(() => { imageSettled = true; }, () => { imageSettled = true; });
+  t.mock.timers.tick(15_000);
+  await Promise.resolve();
+  assert.equal(imageSettled, false, "the ordinary 15-second deadline does not abort an image mutation");
+  t.mock.timers.tick(5_000);
+  assert.equal((await image).run.id, RUN_ID, "a slow acknowledged image mutation completes once");
+  assert.equal(calls[1].options.headers.get("idempotency-key"), "image_agent_slow_upload_001");
+
+  responseDelayMs = 600_000;
+  const caller = new AbortController();
+  const aborted = client.resumeRun(RUN_ID, "Abort this image follow-up", {
+    idempotency: "image_agent_caller_abort_01",
+    attachments: [agentAttachment()],
+    signal: caller.signal,
+  });
+  caller.abort(new DOMException("cancelled by caller", "AbortError"));
+  await assert.rejects(aborted, (error) => error instanceof AgintiTransportError
+    && error.code === "AGINTI_ABORTED" && error.retryable === false);
+  assert.equal(calls[2].options.headers.get("idempotency-key"), "image_agent_caller_abort_01");
+
+  const timedOut = client.resumeRun(RUN_ID, "Bound the image follow-up", {
+    idempotency: "image_agent_exact_timeout_1",
+    attachments: [agentAttachment()],
+  });
+  let timedOutSettled = false;
+  timedOut.then(() => { timedOutSettled = true; }, () => { timedOutSettled = true; });
+  t.mock.timers.tick(AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS - 1);
+  await Promise.resolve();
+  assert.equal(timedOutSettled, false);
+  const timeoutRejected = assert.rejects(timedOut, (error) => error instanceof AgintiTransportError
+    && error.code === "AGINTI_TIMEOUT" && error.retryable === true);
+  t.mock.timers.tick(1);
+  await timeoutRejected;
+  assert.equal(calls[3].options.headers.get("idempotency-key"), "image_agent_exact_timeout_1");
 });
 
 test("pinned Agent transport exposes an exact newer release without retrying", async () => {

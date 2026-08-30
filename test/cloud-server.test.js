@@ -1299,6 +1299,7 @@ test('preflights negotiated Agent Search and image input and forwards one exact 
       maximumCount: 4,
       maximumBytesEach: 4 * 1024 * 1024,
       maximumBytesTotal: 16 * 1024 * 1024,
+      requestTimeoutMs: 515_000,
       model: 'localllm-vision',
       persistence: 'retained-reference-v1'
     },

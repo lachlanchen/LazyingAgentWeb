@@ -211,10 +211,15 @@ export class RolloutAdmissionLatch {
   #drained = false;
   #generation = null;
   #operationId = null;
+  #reopenAllowed;
   #state = 'open';
   #waiters = new Set();
 
-  constructor({ closedMarkerPath } = {}) {
+  constructor({ closedMarkerPath, reopenAllowed = true } = {}) {
+    if (typeof reopenAllowed !== 'boolean') {
+      throw new TypeError('reopenAllowed must be boolean');
+    }
+    this.#reopenAllowed = reopenAllowed;
     if (closedMarkerPath !== undefined) {
       this.#closedMarkerPath = exactPrivatePath(closedMarkerPath, 'closedMarkerPath');
       assertOwnerPrivateDirectory(dirname(this.#closedMarkerPath));
@@ -292,6 +297,12 @@ export class RolloutAdmissionLatch {
 
   reopen({ operationId, expectedGeneration }) {
     this.#requireClosedAuthority(operationId, expectedGeneration);
+    if (!this.#reopenAllowed) {
+      throw new RolloutAdmissionError(
+        'admission_restart_required',
+        'A read-only closed startup must stop before admission can reopen.'
+      );
+    }
     if (this.#active !== 0) {
       throw new RolloutAdmissionError(
         'admission_busy',

@@ -14,7 +14,11 @@ import {
   applyMigrations
 } from './migrations.js';
 import { checkOpenSqliteHealth } from './sqlite-health.js';
-import { assertSecureDatabaseFile, prepareSecureDatabasePath } from './storage-path.js';
+import {
+  assertSecureDatabaseFile,
+  prepareSecureDatabasePath,
+  requireSecureExistingDatabasePath
+} from './storage-path.js';
 import {
   assertBoolean,
   assertBoundedString,
@@ -203,41 +207,57 @@ export class CloudIndexStore {
   #database;
   #databasePath;
 
-  constructor({ databasePath, clock = DEFAULT_CLOCK } = {}) {
+  constructor({ databasePath, clock = DEFAULT_CLOCK, readOnly = false } = {}) {
     if (typeof clock !== 'function') throw new ValidationError('clock must be a function.');
+    if (typeof readOnly !== 'boolean') throw new ValidationError('readOnly must be boolean.');
     this.#clock = clock;
-    this.#databasePath = prepareSecureDatabasePath(databasePath);
+    this.#databasePath = readOnly
+      ? requireSecureExistingDatabasePath(databasePath)
+      : prepareSecureDatabasePath(databasePath);
 
     let database;
     try {
-      database = new DatabaseSync(this.#databasePath);
+      database = new DatabaseSync(this.#databasePath, { readOnly });
     } catch (error) {
       throw new StorageCorruptionError('SQLite could not open the control-plane database.', { cause: error });
     }
 
     try {
       database.enableLoadExtension(false);
-      database.exec(`
-        PRAGMA busy_timeout = 5000;
-        PRAGMA foreign_keys = ON;
-        PRAGMA journal_mode = DELETE;
-        PRAGMA synchronous = FULL;
-        PRAGMA temp_store = MEMORY;
-        PRAGMA trusted_schema = OFF;
-        PRAGMA secure_delete = ON;
-      `);
-      applyMigrations(database, nowIso(this.#clock));
-      database.exec('BEGIN IMMEDIATE');
-      try {
-        pruneExpiredRows(database, nowIso(this.#clock));
-        database.exec('COMMIT');
-      } catch (error) {
+      if (readOnly) {
+        database.exec(`
+          PRAGMA busy_timeout = 5000;
+          PRAGMA query_only = ON;
+          PRAGMA foreign_keys = ON;
+          PRAGMA trusted_schema = OFF;
+        `);
+        checkOpenSqliteHealth(database, {
+          expectedApplicationId: SQLITE_APPLICATION_ID,
+          allowedSchemaVersions: [LATEST_SCHEMA_VERSION]
+        });
+      } else {
+        database.exec(`
+          PRAGMA busy_timeout = 5000;
+          PRAGMA foreign_keys = ON;
+          PRAGMA journal_mode = DELETE;
+          PRAGMA synchronous = FULL;
+          PRAGMA temp_store = MEMORY;
+          PRAGMA trusted_schema = OFF;
+          PRAGMA secure_delete = ON;
+        `);
+        applyMigrations(database, nowIso(this.#clock));
+        database.exec('BEGIN IMMEDIATE');
         try {
-          database.exec('ROLLBACK');
-        } catch {
-          // Preserve the retention failure.
+          pruneExpiredRows(database, nowIso(this.#clock));
+          database.exec('COMMIT');
+        } catch (error) {
+          try {
+            database.exec('ROLLBACK');
+          } catch {
+            // Preserve the retention failure.
+          }
+          throw error;
         }
-        throw error;
       }
       assertSecureDatabaseFile(this.#databasePath);
     } catch (error) {

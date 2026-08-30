@@ -40,6 +40,10 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > owning session and client pair, fails closed on a downgrade or outage, and
 > preserves the user's draft plus up to four staged images until capability
 > returns or the user explicitly removes them.
+> The v0.1.59 candidate makes admission-closed deployment starts byte-exact:
+> both durable SQLite stores open read-only, startup migrations, retention, and
+> provisioning are skipped, and the process cannot reopen admission without an
+> offline marker transition followed by a fresh writable restart.
 > Direct Chat remembers the user's non-private workspace-mode preference across
 > a full reload, while
 > confirmed sign-out fences stale history reads. The accepted v0.1.23 release also

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   chmodSync,
@@ -6,14 +7,18 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync
 } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { LATEST_SCHEMA_VERSION } from '../src/index.js';
+import { RolloutAdmissionLatch } from '../src/rollout-admission.js';
 import { loadServiceConfig } from '../src/service-config.js';
 import {
   checkStandaloneServiceHealth,
@@ -26,6 +31,14 @@ import { verifyStandaloneAssetMap } from '../src/web/asset-map.js';
 const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
 const LOCAL_TOKEN = 'service-local-token-0000000000001';
 const AGINTI_TOKEN = 'service-aginti-token-0000000000001';
+
+function fileSha256(filename) {
+  return createHash('sha256').update(readFileSync(filename)).digest('hex');
+}
+
+function databaseDirectoryInventory(filename) {
+  return readdirSync(dirname(filename)).sort();
+}
 
 function serviceFixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-service-test-'));
@@ -439,7 +452,7 @@ test('operator health keeps storage and AgInTi visible when LocalLLM credentials
   assert.equal(JSON.stringify(report).includes(state.credentialsDirectory), false);
 });
 
-test('restarts over the same private databases with idempotent provisioning and closed admission', async (t) => {
+test('restarts closed with byte-exact read-only stores and requires an offline reopen', async (t) => {
   const state = serviceFixture(t);
   const firstHarness = serviceHarness(state.config);
   const first = await createStandaloneService({
@@ -456,6 +469,24 @@ test('restarts over the same private databases with idempotent provisioning and 
   });
   assert.equal(existsSync(first.rolloutAdmissionMarker), true);
   await first.shutdown();
+
+  const writer = new DatabaseSync(state.cloudIndexDatabase);
+  writer.exec('PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;');
+  writer.prepare(`
+    UPDATE idempotency_records
+    SET created_at = ?, expires_at = ?
+    WHERE account_id = ? AND operation = 'account.provision'
+  `).run(
+    '2026-08-20T00:00:00.000Z',
+    '2026-08-21T00:00:00.000Z',
+    state.config.account.principalId
+  );
+  writer.exec('COMMIT;');
+  writer.close();
+  const closedCloudSha = fileSha256(state.cloudIndexDatabase);
+  const closedChatSha = fileSha256(state.directChatDatabase);
+  const closedCloudInventory = databaseDirectoryInventory(state.cloudIndexDatabase);
+  const closedChatInventory = databaseDirectoryInventory(state.directChatDatabase);
 
   const reloaded = loadServiceConfig({
     configPath: state.configPath,
@@ -478,12 +509,37 @@ test('restarts over the same private databases with idempotent provisioning and 
       operationId,
       generation: closed.generation
     });
+    assert.equal(fileSha256(state.cloudIndexDatabase), closedCloudSha);
+    assert.equal(fileSha256(state.directChatDatabase), closedChatSha);
+    assert.deepEqual(databaseDirectoryInventory(state.cloudIndexDatabase), closedCloudInventory);
+    assert.deepEqual(databaseDirectoryInventory(state.directChatDatabase), closedChatInventory);
+    assert.throws(() => second.controlStore.provisionAccount({
+      accountId: state.config.account.principalId,
+      issuer: 'local-login',
+      subject: state.config.account.username,
+      displayName: state.config.account.displayName,
+      idempotencyKey: 'closed-read-only-provision-attempt'
+    }));
+    assert.throws(() => second.directChatStore.cleanupExpiredIdempotency());
+    assert.equal(fileSha256(state.cloudIndexDatabase), closedCloudSha);
+    assert.equal(fileSha256(state.directChatDatabase), closedChatSha);
     await second.rolloutAdmission.drain({ operationId, expectedGeneration: closed.generation });
-    second.rolloutAdmission.reopen({ operationId, expectedGeneration: closed.generation });
-    assert.equal(existsSync(second.rolloutAdmissionMarker), false);
+    assert.throws(
+      () => second.rolloutAdmission.reopen({ operationId, expectedGeneration: closed.generation }),
+      (error) => error?.code === 'admission_restart_required'
+    );
+    assert.equal(existsSync(second.rolloutAdmissionMarker), true);
   } finally {
     await second.shutdown();
   }
+  assert.equal(fileSha256(state.cloudIndexDatabase), closedCloudSha);
+  assert.equal(fileSha256(state.directChatDatabase), closedChatSha);
+  assert.deepEqual(databaseDirectoryInventory(state.cloudIndexDatabase), closedCloudInventory);
+  assert.deepEqual(databaseDirectoryInventory(state.directChatDatabase), closedChatInventory);
+  const offline = new RolloutAdmissionLatch({ closedMarkerPath: second.rolloutAdmissionMarker });
+  await offline.drain({ operationId, expectedGeneration: closed.generation });
+  offline.reopen({ operationId, expectedGeneration: closed.generation });
+  assert.equal(existsSync(second.rolloutAdmissionMarker), false);
 });
 
 test('constructs the real cloud server inertly without opening a listener', async (t) => {

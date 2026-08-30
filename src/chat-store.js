@@ -9,10 +9,16 @@ import {
 } from './errors.js';
 import {
   CHAT_SQLITE_APPLICATION_ID,
+  DEFAULT_CHAT_SCHEMA_VERSION,
+  LATEST_CHAT_SCHEMA_VERSION,
   applyChatMigrations
 } from './chat-migrations.js';
 import { checkOpenSqliteHealth } from './sqlite-health.js';
-import { assertSecureDatabaseFile, prepareSecureDatabasePath } from './storage-path.js';
+import {
+  assertSecureDatabaseFile,
+  prepareSecureDatabasePath,
+  requireSecureExistingDatabasePath
+} from './storage-path.js';
 import {
   assertCanonicalIsoTimestamp,
   assertEventHash,
@@ -988,9 +994,11 @@ export class DirectChatStore {
     modelAlias = 'local-default',
     visionModelAlias = VISION_MODEL_ALIAS,
     enableVisionAttachments = false,
-    clock = DEFAULT_CLOCK
+    clock = DEFAULT_CLOCK,
+    readOnly = false
   } = {}) {
     if (typeof clock !== 'function') throw new ValidationError('clock must be a function.');
+    if (typeof readOnly !== 'boolean') throw new ValidationError('readOnly must be boolean.');
     if (typeof enableVisionAttachments !== 'boolean') {
       throw new ValidationError('enableVisionAttachments must be boolean.');
     }
@@ -998,28 +1006,46 @@ export class DirectChatStore {
     this.#modelAlias = assertModelAlias(modelAlias);
     this.#visionModelAlias = assertModelAlias(visionModelAlias);
     this.#enableVisionAttachments = enableVisionAttachments;
-    this.#databasePath = prepareSecureDatabasePath(databasePath);
+    this.#databasePath = readOnly
+      ? requireSecureExistingDatabasePath(databasePath)
+      : prepareSecureDatabasePath(databasePath);
 
     let database;
     try {
-      database = new DatabaseSync(this.#databasePath);
+      database = new DatabaseSync(this.#databasePath, { readOnly });
     } catch (error) {
       throw new StorageCorruptionError('SQLite could not open the direct-chat database.', { cause: error });
     }
     try {
       database.enableLoadExtension(false);
-      database.exec(`
-        PRAGMA busy_timeout = 5000;
-        PRAGMA foreign_keys = ON;
-        PRAGMA journal_mode = DELETE;
-        PRAGMA synchronous = FULL;
-        PRAGMA temp_store = MEMORY;
-        PRAGMA trusted_schema = OFF;
-        PRAGMA secure_delete = ON;
-      `);
-      this.#schemaVersion = applyChatMigrations(database, nowIso(this.#clock), {
-        enableVisionAttachments
-      });
+      if (readOnly) {
+        database.exec(`
+          PRAGMA busy_timeout = 5000;
+          PRAGMA query_only = ON;
+          PRAGMA foreign_keys = ON;
+          PRAGMA trusted_schema = OFF;
+        `);
+        const allowedSchemaVersions = enableVisionAttachments
+          ? [LATEST_CHAT_SCHEMA_VERSION]
+          : [...new Set([DEFAULT_CHAT_SCHEMA_VERSION, LATEST_CHAT_SCHEMA_VERSION])];
+        this.#schemaVersion = checkOpenSqliteHealth(database, {
+          expectedApplicationId: CHAT_SQLITE_APPLICATION_ID,
+          allowedSchemaVersions
+        }).schemaVersion;
+      } else {
+        database.exec(`
+          PRAGMA busy_timeout = 5000;
+          PRAGMA foreign_keys = ON;
+          PRAGMA journal_mode = DELETE;
+          PRAGMA synchronous = FULL;
+          PRAGMA temp_store = MEMORY;
+          PRAGMA trusted_schema = OFF;
+          PRAGMA secure_delete = ON;
+        `);
+        this.#schemaVersion = applyChatMigrations(database, nowIso(this.#clock), {
+          enableVisionAttachments
+        });
+      }
       DATABASE_METADATA.set(database, Object.freeze({
         schemaVersion: this.#schemaVersion,
         visionModelAlias: this.#visionModelAlias

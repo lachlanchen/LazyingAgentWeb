@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import {
@@ -121,6 +122,16 @@ function accountProvisionKey(config) {
     username: config.account.username,
     displayName: config.account.displayName
   }))}`;
+}
+
+function pathExistsWithoutFollowing(filename) {
+  try {
+    lstatSync(filename);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function closeStores(controlStore, directChatStore) {
@@ -260,12 +271,21 @@ export async function createStandaloneService({
 
   const materialized = await materializeInputs(loadedConfig);
   const config = materialized.loaded.config;
+  const rolloutAdmissionMarker = join(
+    dirname(config.state.cloudIndexDatabase),
+    'rollout-admission.closed.json'
+  );
+  const closedStartup = pathExistsWithoutFollowing(rolloutAdmissionMarker);
+  let rolloutAdmission = closedStartup
+    ? new RolloutAdmissionLatch({ closedMarkerPath: rolloutAdmissionMarker, reopenAllowed: false })
+    : null;
   let controlStore;
   let directChatStore;
   let server;
   try {
     controlStore = new CloudIndexStore({
       databasePath: config.state.cloudIndexDatabase,
+      ...(closedStartup ? { readOnly: true } : {}),
       ...(clock === undefined ? {} : { clock })
     });
     directChatStore = new DirectChatStore({
@@ -273,19 +293,26 @@ export async function createStandaloneService({
       modelAlias: config.localLlm.defaultModelAlias,
       visionModelAlias: config.localLlm.vision.modelAlias,
       enableVisionAttachments: config.localLlm.vision.enabled,
+      ...(closedStartup ? { readOnly: true } : {}),
       ...(clock === undefined ? {} : { clock })
     });
-    const account = controlStore.provisionAccount({
-      accountId: config.account.principalId,
-      issuer: 'local-login',
-      subject: config.account.username,
-      displayName: config.account.displayName,
-      idempotencyKey: accountProvisionKey(config)
-    });
+    const account = closedStartup
+      ? controlStore.getAccount(config.account.principalId)
+      : controlStore.provisionAccount({
+          accountId: config.account.principalId,
+          issuer: 'local-login',
+          subject: config.account.username,
+          displayName: config.account.displayName,
+          idempotencyKey: accountProvisionKey(config)
+        });
+    if (account === null) throw new TypeError('the closed startup account is not provisioned');
     if (account.issuer !== 'local-login' || account.subject !== config.account.username
         || account.displayName !== config.account.displayName) {
       throw new TypeError('provisioned account does not match the immutable service identity config');
     }
+    rolloutAdmission ??= new RolloutAdmissionLatch({
+      closedMarkerPath: rolloutAdmissionMarker
+    });
     const directChatSummarizer = localSummarizer ?? createDeterministicContextSummarizer();
     const directChatContext = new DirectChatContextCoordinator({
       store: directChatStore,
@@ -304,13 +331,6 @@ export async function createStandaloneService({
           ...(fetchImpl === undefined ? {} : { fetchImpl })
         })
       : null;
-    const rolloutAdmissionMarker = join(
-      dirname(config.state.cloudIndexDatabase),
-      'rollout-admission.closed.json'
-    );
-    const rolloutAdmission = new RolloutAdmissionLatch({
-      closedMarkerPath: rolloutAdmissionMarker
-    });
     server = serverFactory({
       releaseId: materialized.assetMap.releaseVersion,
       assetMap: materialized.assetMap,

@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync
@@ -27,6 +30,10 @@ function privateTemp(test) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-agent-web-security-'));
   test.after(() => rmSync(root, { recursive: true, force: true }));
   return root;
+}
+
+function fileSha256(filename) {
+  return createHash('sha256').update(readFileSync(filename)).digest('hex');
 }
 
 test('creates a private directory and database file', (t) => {
@@ -60,6 +67,39 @@ test('rejects a group-accessible database file', (t) => {
   chmodSync(databasePath, 0o640);
 
   assert.throws(() => new CloudIndexStore({ databasePath }), StorageSecurityError);
+});
+
+test('read-only mode never creates a missing database and preserves exact bytes', (t) => {
+  const root = privateTemp(t);
+  const state = join(root, 'state');
+  const databasePath = join(state, 'index.sqlite');
+  mkdirSync(state, { mode: 0o700 });
+
+  assert.throws(() => new CloudIndexStore({ databasePath, readOnly: true }));
+  assert.equal(existsSync(databasePath), false);
+
+  const writer = new CloudIndexStore({ databasePath });
+  writer.provisionAccount({
+    accountId: 'account-read-only',
+    issuer: 'local-login',
+    subject: 'read-only',
+    displayName: 'Read Only',
+    idempotencyKey: 'account-provision-read-only-0001'
+  });
+  writer.close();
+  const before = fileSha256(databasePath);
+
+  const reader = new CloudIndexStore({ databasePath, readOnly: true });
+  assert.equal(reader.getAccount('account-read-only').displayName, 'Read Only');
+  assert.throws(() => reader.provisionAccount({
+    accountId: 'account-read-only',
+    issuer: 'local-login',
+    subject: 'read-only',
+    displayName: 'Changed',
+    idempotencyKey: 'account-provision-read-only-0002'
+  }));
+  reader.close();
+  assert.equal(fileSha256(databasePath), before);
 });
 
 test('rejects symbolic links and hard-linked database files', (t) => {

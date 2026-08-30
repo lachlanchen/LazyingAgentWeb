@@ -60,6 +60,39 @@ function assertNoSymlinkComponents(absolutePath) {
   }
 }
 
+export function requireSecureExistingDatabasePath(databasePath) {
+  if (typeof databasePath !== 'string' || databasePath.length === 0 || !isAbsolute(databasePath)) {
+    throw new ValidationError('databasePath must be a non-empty absolute filesystem path.');
+  }
+  const resolvedPath = resolve(databasePath);
+  const stateDirectory = dirname(resolvedPath);
+  if (stateDirectory === resolvedPath) {
+    throw new StorageSecurityError('databasePath must name a file inside a private state directory.');
+  }
+  assertNoSymlinkComponents(stateDirectory);
+  const directoryStat = lstatSync(stateDirectory);
+  if (!directoryStat.isDirectory()) {
+    throw new StorageSecurityError('The database parent must be a directory.');
+  }
+  assertOwned(directoryStat, 'The database state directory');
+  assertPrivateMode(directoryStat, 'The database state directory');
+  if (realpathSync(stateDirectory) !== stateDirectory) {
+    throw new StorageSecurityError('The database state directory must resolve without indirection.');
+  }
+  assertSecureDatabaseFile(resolvedPath);
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  try {
+    const descriptor = openSync(resolvedPath, constants.O_RDONLY | noFollow);
+    closeSync(descriptor);
+  } catch (error) {
+    throw new StorageSecurityError('The existing database could not be opened read-only without following links.', {
+      cause: error
+    });
+  }
+  assertSecureDatabaseFile(resolvedPath);
+  return resolvedPath;
+}
+
 export function prepareSecureDatabasePath(databasePath) {
   if (typeof databasePath !== 'string' || databasePath.length === 0 || !isAbsolute(databasePath)) {
     throw new ValidationError('databasePath must be a non-empty absolute filesystem path.');

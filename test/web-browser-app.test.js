@@ -140,6 +140,8 @@ class Document {
   constructor({ decodeImage = async () => {} } = {}) {
     this.documentElement = new Node("html");
     this.decodeImage = decodeImage;
+    this.visibilityState = "visible";
+    this.listeners = new Map();
     this.ids = new Map(IDS.map((id) => [id, new Node(id === "composer" || id === "login-form" ? "form" : "div")]));
     this.ids.get("app-view").hidden = true;
     this.ids.get("mode-switch").hidden = true;
@@ -156,6 +158,14 @@ class Document {
     return node;
   }
   createTextNode(value) { return new Node("#text", String(value)); }
+  addEventListener(name, listener) {
+    const current = this.listeners.get(name) ?? [];
+    current.push(listener);
+    this.listeners.set(name, current);
+  }
+  dispatch(name, event = {}) {
+    for (const listener of this.listeners.get(name) ?? []) listener(event);
+  }
 }
 
 function threadOpenControls(document) {
@@ -336,6 +346,8 @@ function harness({
   logout,
   agent = baseAgent(),
   chat,
+  agentFactory,
+  chatFactory,
   credentialSaver = async () => false,
   canonicalizeImage,
   decodeImage,
@@ -368,7 +380,7 @@ function harness({
   };
   if (IntersectionObserver !== undefined) window.IntersectionObserver = IntersectionObserver;
   const sessionClient = {
-    async restore() { return restore; },
+    async restore() { return typeof restore === "function" ? await restore() : await restore; },
     async login(value) { return login ? await login(value) : restore; },
     async logout() { return logout ? await logout() : { signedOut: true, agentCancellationPending: false }; },
   };
@@ -378,8 +390,8 @@ function harness({
     window,
     navigator: { onLine: true },
     sessionClient,
-    createAgentClient: () => agent,
-    createChatClient: () => directChat,
+    createAgentClient: agentFactory ?? (() => agent),
+    createChatClient: chatFactory ?? (() => directChat),
     renderer: {
       renderMarkdown(target, value) { target.textContent = value; },
       renderArtifact(target, value) { target.textContent = value.title; return true; },
@@ -397,6 +409,12 @@ function harness({
     maxAutomaticAgentReconnects,
   });
   return { app, document, sessionClient, window };
+}
+
+async function settleBrowserEvents(turns = 4) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 
 function intersectionHarness() {
@@ -702,6 +720,391 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
   assert.equal(malformed.document.getElementById("connection-state").textContent, "Connected · Chat only");
   assert.match(malformed.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
+});
+
+test("foreground capability refresh exposes an upgraded Agent image input without reloading or changing the draft", async () => {
+  let agentCapability = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+  });
+  let agentReads = 0;
+  let chatReads = 0;
+  const agent = {
+    ...baseAgent(),
+    async capabilities() {
+      agentReads += 1;
+      return agentCapability;
+    },
+  };
+  const chat = baseChat({
+    async capabilities() {
+      chatReads += 1;
+      return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 };
+    },
+  });
+  const browser = harness({ agent, chat });
+  await browser.app.initialize();
+  const draft = browser.document.getElementById("message-input");
+  draft.value = "Describe the images I will attach";
+  assert.equal(browser.document.getElementById("add-image").hidden, true);
+
+  agentCapability = agentImageCapabilities();
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+
+  assert.equal(agentReads, 2);
+  assert.equal(chatReads, 2, "one foreground edge refetches both independent capability contracts");
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(browser.document.getElementById("add-image").hidden, false);
+  assert.equal(draft.value, "Describe the images I will attach");
+  assert.match(browser.document.getElementById("capability-note").textContent, /up to four images/iu);
+});
+
+test("an in-page Agent availability upgrade reveals its mode without reassigning the current Chat view", async () => {
+  let agentCapability = capabilities();
+  const agent = {
+    ...baseAgent(),
+    async capabilities() { return agentCapability; },
+  };
+  const browser = harness({ agent });
+  await browser.app.initialize();
+  const draft = browser.document.getElementById("message-input");
+  draft.value = "Keep this Chat draft while Agent appears";
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(browser.document.getElementById("mode-switch").hidden, true);
+
+  agentCapability = agentImageCapabilities();
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "chat");
+  assert.equal(browser.document.getElementById("mode-switch").hidden, false);
+  assert.equal(browser.document.getElementById("agent-mode").disabled, false);
+  assert.equal(draft.value, "Keep this Chat draft while Agent appears");
+});
+
+test("concurrent pageshow and visibility resume events share one capability refresh and throttle the next duplicate", async () => {
+  const session = { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" };
+  const resumedSession = Promise.withResolvers();
+  let restores = 0;
+  let agentReads = 0;
+  let chatReads = 0;
+  const browser = harness({
+    async restore() {
+      restores += 1;
+      return restores === 1 ? session : await resumedSession.promise;
+    },
+    agent: {
+      ...baseAgent(),
+      async capabilities() { agentReads += 1; return capabilities(); },
+    },
+    chat: baseChat({
+      async capabilities() {
+        chatReads += 1;
+        return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 };
+      },
+    }),
+  });
+  await browser.app.initialize();
+
+  browser.window.dispatch("pageshow", { persisted: true });
+  browser.document.dispatch("visibilitychange");
+  await Promise.resolve();
+  assert.equal(restores, 2, "the visibility duplicate does not start a second session read");
+  resumedSession.resolve(session);
+  await settleBrowserEvents();
+  assert.equal(agentReads, 2);
+  assert.equal(chatReads, 2);
+
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+  assert.equal(restores, 3, "session ownership is still revalidated on the later event");
+  assert.equal(agentReads, 2, "the bounded foreground throttle skips a duplicate Agent probe");
+  assert.equal(chatReads, 2, "the bounded foreground throttle skips a duplicate Chat probe");
+});
+
+test("capability outage retains a staged Chat image fail-closed and an online edge restores it in place", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const draftText = "Keep this exact offline image draft";
+  let outage = false;
+  let agentReads = 0;
+  let chatReads = 0;
+  const revoked = [];
+  const browser = harness({
+    agent: {
+      ...baseAgent(),
+      async capabilities() {
+        agentReads += 1;
+        if (outage) throw new Error("Agent capability offline");
+        return capabilities();
+      },
+    },
+    chat: baseChat({
+      async capabilities() {
+        chatReads += 1;
+        if (outage) throw new Error("Chat capability offline");
+        return {
+          visionInput: true,
+          visionMediaTypes: ["image/jpeg", "image/png"],
+          maximumImageBytes: 4 * 1024 * 1024,
+        };
+      },
+    }),
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_resume_outage_00001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:resume-outage-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "offline.png" }];
+  imageInput.dispatch("change");
+  await settleBrowserEvents(1);
+  messageInput.value = draftText;
+
+  outage = true;
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+  assert.equal(agentReads, 4, "the failed Agent probe is bounded to three resume attempts");
+  assert.equal(chatReads, 4, "the failed Chat probe is bounded to three resume attempts");
+  assert.equal(messageInput.value, draftText);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:resume-outage-image");
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("remove-image").disabled, false);
+  assert.deepEqual(revoked, []);
+  assert.match(browser.document.getElementById("capability-note").textContent, /remain staged/iu);
+
+  outage = false;
+  browser.window.dispatch("online");
+  await settleBrowserEvents();
+  assert.equal(agentReads, 5, "online bypasses the recent-outage throttle for one recovery probe");
+  assert.equal(chatReads, 5);
+  assert.equal(messageInput.value, draftText);
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.deepEqual(revoked, []);
+});
+
+test("authoritative Agent image downgrade retains the exact staged composer and cannot fall through to Chat", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  let agentCapability = agentImageCapabilities();
+  let agentStarts = 0;
+  const revoked = [];
+  const agent = {
+    ...baseAgent(),
+    async capabilities() { return agentCapability; },
+    async createThread() { agentStarts += 1; throw new Error("must not dispatch"); },
+  };
+  const browser = harness({
+    agent,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_agent_downgrade_001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 80,
+        height: 80,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:agent-downgrade-image"; },
+    revokeObjectUrl(value) { revoked.push(value); },
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  const messageInput = browser.document.getElementById("message-input");
+  imageInput.files = [{ name: "agent.png" }];
+  imageInput.dispatch("change");
+  await settleBrowserEvents(1);
+  messageInput.value = "Do not lose or reroute this Agent image";
+
+  agentCapability = capabilities();
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(browser.document.getElementById("mode-switch").hidden, false,
+    "an Agent outage keeps the visible Chat escape path beside the explicitly removable image");
+  assert.equal(messageInput.value, "Do not lose or reroute this Agent image");
+  assert.equal(browser.document.getElementById("image-preview-thumbnail").src, "blob:agent-downgrade-image");
+  assert.equal(browser.document.getElementById("add-image").hidden, true);
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("remove-image").disabled, false);
+  assert.deepEqual(revoked, []);
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(agentStarts, 0);
+  assert.equal(messageInput.value, "Do not lose or reroute this Agent image");
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.match(browser.document.getElementById("toast").textContent, /remain unsent/iu);
+});
+
+test("Agent Search capability refresh never rewrites an unsent selected mode or source limit", async () => {
+  const withSearch = (modes, maximumSources) => capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+    search: { enabled: true, modes, maximumSources },
+    artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" },
+  });
+  let agentCapability = withSearch(["web", "papers", "both"], 20);
+  const browser = harness({
+    agent: {
+      ...baseAgent(),
+      async capabilities() { return agentCapability; },
+    },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("search-toggle").dispatch("click");
+  browser.document.getElementById("search-mode").value = "web";
+  browser.document.getElementById("search-limit").value = "8";
+  browser.document.getElementById("message-input").value = "Preserve this exact Search request";
+
+  agentCapability = withSearch(["papers"], 5);
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents();
+  assert.equal(browser.document.getElementById("search-mode").value, "web");
+  assert.equal(browser.document.getElementById("search-limit").value, "8");
+  assert.equal(browser.document.getElementById("message-input").value, "Preserve this exact Search request");
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.equal(browser.document.getElementById("search-mode").disabled, false,
+    "the user can explicitly select a newly supported mode instead of accepting a silent rewrite");
+});
+
+test("an active Agent mutation defers the whole resume refresh until its ownership fence is released", async () => {
+  const createStarted = Promise.withResolvers();
+  const createResult = Promise.withResolvers();
+  let restoreReads = 0;
+  let agentReads = 0;
+  let chatReads = 0;
+  let agentCapability = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+  });
+  const agent = {
+    ...baseAgent(),
+    async capabilities() { agentReads += 1; return agentCapability; },
+    async createThread() {
+      createStarted.resolve();
+      return await createResult.promise;
+    },
+    async startRun() {
+      throw Object.assign(new Error("authoritative rejection"), { status: 409, retryable: false });
+    },
+  };
+  const browser = harness({
+    async restore() {
+      restoreReads += 1;
+      return { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" };
+    },
+    agent,
+    chat: baseChat({
+      async capabilities() {
+        chatReads += 1;
+        return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 };
+      },
+    }),
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Run this exact Agent task";
+  const submitting = browser.app.submitMessage({ preventDefault() {} });
+  await createStarted.promise;
+
+  agentCapability = capabilities();
+  browser.window.dispatch("pageshow", { persisted: true });
+  await settleBrowserEvents(1);
+  assert.equal(restoreReads, 1, "resume does not even read the session during the owned mutation");
+  assert.equal(agentReads, 1);
+  assert.equal(chatReads, 1);
+
+  createResult.resolve({ thread: agentThread() });
+  await submitting;
+  await settleBrowserEvents();
+  assert.equal(restoreReads, 2, "the deferred refresh runs once after the mutation settles");
+  assert.equal(agentReads, 2);
+  assert.equal(chatReads, 2);
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent",
+    "capability refresh never reassigns the active conversation mode");
+  assert.equal(browser.document.getElementById("message-input").value, "Run this exact Agent task");
+});
+
+test("an Agent mutation that begins during capability reads cannot throttle its required deferred refresh", async () => {
+  const resumeCapabilityStarted = Promise.withResolvers();
+  const resumeCapabilityResult = Promise.withResolvers();
+  const createStarted = Promise.withResolvers();
+  const createResult = Promise.withResolvers();
+  let restoreReads = 0;
+  let agentReads = 0;
+  let chatReads = 0;
+  const enabledCapability = capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+  });
+  const agent = {
+    ...baseAgent(),
+    async capabilities() {
+      agentReads += 1;
+      if (agentReads === 1) return enabledCapability;
+      if (agentReads === 2) {
+        resumeCapabilityStarted.resolve();
+        return await resumeCapabilityResult.promise;
+      }
+      return capabilities();
+    },
+    async createThread() {
+      createStarted.resolve();
+      return await createResult.promise;
+    },
+    async startRun() {
+      throw Object.assign(new Error("authoritative rejection"), { status: 409, retryable: false });
+    },
+  };
+  const browser = harness({
+    async restore() {
+      restoreReads += 1;
+      return { authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" };
+    },
+    agent,
+    chat: baseChat({
+      async capabilities() {
+        chatReads += 1;
+        return { visionInput: false, visionMediaTypes: [], maximumImageBytes: 0 };
+      },
+    }),
+  });
+  await browser.app.initialize();
+
+  browser.window.dispatch("pageshow", { persisted: true });
+  await resumeCapabilityStarted.promise;
+  browser.document.getElementById("message-input").value = "Do not throttle the post-mutation refresh";
+  const submitting = browser.app.submitMessage({ preventDefault() {} });
+  await createStarted.promise;
+
+  resumeCapabilityResult.resolve(capabilities());
+  await settleBrowserEvents();
+  assert.equal(agentReads, 2, "the in-flight result stays unapplied while the mutation owns Agent state");
+  assert.equal(chatReads, 2);
+
+  createResult.resolve({ thread: agentThread() });
+  await submitting;
+  await settleBrowserEvents();
+  assert.equal(restoreReads, 3, "the session is revalidated again after the newly-started mutation settles");
+  assert.equal(agentReads, 3, "an unapplied read never consumes the foreground capability throttle");
+  assert.equal(chatReads, 3);
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(browser.document.getElementById("message-input").value,
+    "Do not throttle the post-mutation refresh");
+  assert.equal(browser.document.getElementById("send-message").disabled, true);
+  assert.match(browser.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
 });
 
 test("Agent multi-image input preserves an iPhone draft after rejection then accepts the same conversation", async () => {

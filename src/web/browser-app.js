@@ -67,6 +67,12 @@ const NEWEST_MESSAGE_PROXIMITY_PX = 96;
 const COMPOSER_IMAGE_COUNT_LIMIT = 4;
 const COMPOSER_IMAGE_BYTES_LIMIT = 16 * 1024 * 1024;
 const COMPOSER_MESSAGE_BYTES_LIMIT = 32 * 1024;
+const CAPABILITY_REFRESH_MINIMUM_INTERVAL_MS = 10_000;
+const FAIL_CLOSED_CHAT_CAPABILITIES = Object.freeze({
+  visionInput: false,
+  visionMediaTypes: Object.freeze([]),
+  maximumImageBytes: 0,
+});
 const updateHandoffEncoder = new TextEncoder();
 const updateHandoffDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -1209,7 +1215,7 @@ export function createBrowserApp({
     logoutPending: false,
     session: Object.freeze({ authenticated: false }),
     capabilities: FAIL_CLOSED_AGENT_CAPABILITIES,
-    chatCapabilities: Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }),
+    chatCapabilities: FAIL_CLOSED_CHAT_CAPABILITIES,
     agent: null,
     chat: null,
     mode: "chat",
@@ -1322,6 +1328,9 @@ export function createBrowserApp({
     updateCheckPendingOnlineTransition: false,
     sessionRevalidationInFlight: false,
     sessionRevalidationPending: false,
+    sessionRevalidationPendingForceCapabilities: false,
+    capabilityRefreshAt: Number.NEGATIVE_INFINITY,
+    capabilityReleaseRefreshPending: false,
     followNewest: true,
   };
   const agentThreadCreateAmbiguities = new WeakMap();
@@ -1563,10 +1572,14 @@ export function createBrowserApp({
     state.streamAbort = null;
     state.streamKind = null;
     state.session = Object.freeze({ authenticated: false });
+    state.sessionRevalidationPending = false;
+    state.sessionRevalidationPendingForceCapabilities = false;
+    state.capabilityRefreshAt = Number.NEGATIVE_INFINITY;
+    state.capabilityReleaseRefreshPending = false;
     state.agent = null;
     state.chat = null;
     state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
-    state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
+    state.chatCapabilities = FAIL_CLOSED_CHAT_CAPABILITIES;
     state.agentThreads = [];
     state.chatThreadListEpoch += 1;
     state.chatThreads = [];
@@ -1606,36 +1619,144 @@ export function createBrowserApp({
   }
 
   function agentMutationBlocksSessionRevalidation() {
-    return state.mode === "agent" && (state.busy
+    return state.imagePreparing || (state.mode === "agent" && (state.busy
       || state.agentHistoryRestoring || state.agentReplayValidating
       || state.agentCancelPending
       || state.agentPendingThreadCreate !== null || state.agentPendingResume !== null
-      || state.agentPendingDeletion !== null);
+      || state.agentPendingDeletion !== null));
+  }
+
+  async function readChatCapability(chat) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return Object.freeze({
+          succeeded: true,
+          value: chatCapabilityEnvelope(await chat.capabilities()),
+        });
+      } catch (error) {
+        if (clientReleaseMismatch(error) !== null) throw error;
+        if (attempt < 2) await wait(250 * (2 ** attempt));
+      }
+    }
+    return Object.freeze({ succeeded: false, value: FAIL_CLOSED_CHAT_CAPABILITIES });
+  }
+
+  async function readAgentCapability(agent) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return Object.freeze({
+          succeeded: true,
+          value: validateAgentCapabilities(await agent.capabilities()),
+        });
+      } catch (error) {
+        if (clientReleaseMismatch(error) !== null) throw error;
+        if (attempt < 2) await wait(250 * (2 ** attempt));
+      }
+    }
+    return Object.freeze({ succeeded: false, value: FAIL_CLOSED_AGENT_CAPABILITIES });
+  }
+
+  async function readCapabilityPair(agent, chat) {
+    // Start both independent reads together, but do not leave the current
+    // composer dispatchable while a companion probe is slow after either
+    // client has already proved that this release is stale. `allSettled`
+    // continues to own the companion rejection, so an early release fence
+    // cannot create an unhandled rejection in the background read.
+    let signalReleaseMismatch;
+    const releaseMismatch = new Promise((resolve) => { signalReleaseMismatch = resolve; });
+    const observeReleaseMismatch = (read) => read.catch((error) => {
+      if (clientReleaseMismatch(error) !== null) signalReleaseMismatch(error);
+      throw error;
+    });
+    const reads = [
+      observeReleaseMismatch(readAgentCapability(agent)),
+      observeReleaseMismatch(readChatCapability(chat)),
+    ];
+    const [agentResult, chatResult] = await Promise.race([
+      Promise.allSettled(reads),
+      releaseMismatch.then((error) => { throw error; }),
+    ]);
+    for (const result of [agentResult, chatResult]) {
+      if (result.status === "rejected" && clientReleaseMismatch(result.reason) !== null) throw result.reason;
+    }
+    return Object.freeze({
+      agent: agentResult.status === "fulfilled"
+        ? agentResult.value
+        : Object.freeze({ succeeded: false, value: FAIL_CLOSED_AGENT_CAPABILITIES }),
+      chat: chatResult.status === "fulfilled"
+        ? chatResult.value
+        : Object.freeze({ succeeded: false, value: FAIL_CLOSED_CHAT_CAPABILITIES }),
+    });
+  }
+
+  function capabilityRefreshIsOwned(session, agent, chat) {
+    return state.session === session && state.session.authenticated
+      && state.agent === agent && state.chat === chat;
+  }
+
+  function releaseCapabilityOnlyImageRecovery() {
+    if (!state.authRecoveryPending || state.authRecoveryWorkflow !== null
+        || state.authRecoveryGeneration !== null || state.authRecoveryAgent !== null
+        || state.authRecoveryLegacyUpdatePending || state.agentAuthenticationRecoveryPending
+        || state.retainedUpdateRecoveryPending || state.selectedImages.length === 0
+        || !imagesSupportedInMode(state.selectedImages, state.mode)) return false;
+    state.authRecoveryPending = false;
+    state.authRecoveryUsername = null;
+    return true;
+  }
+
+  function applyCapabilityRefresh(session, agent, chat, pair) {
+    if (!capabilityRefreshIsOwned(session, agent, chat)) return false;
+    state.capabilityReleaseRefreshPending = false;
+    state.capabilities = pair.agent.value;
+    state.chatCapabilities = pair.chat.value;
+    releaseCapabilityOnlyImageRecovery();
+    updateImageControl();
+    return true;
+  }
+
+  function failClosedCapabilityRefresh(session, agent, chat) {
+    return applyCapabilityRefresh(session, agent, chat, Object.freeze({
+      agent: Object.freeze({ succeeded: false, value: FAIL_CLOSED_AGENT_CAPABILITIES }),
+      chat: Object.freeze({ succeeded: false, value: FAIL_CLOSED_CHAT_CAPABILITIES }),
+    }));
   }
 
   function flushDeferredSessionRevalidation() {
     if (!state.sessionRevalidationPending || state.sessionRevalidationInFlight
         || agentMutationBlocksSessionRevalidation()) return;
+    const forceCapabilities = state.sessionRevalidationPendingForceCapabilities;
     state.sessionRevalidationPending = false;
-    void revalidateSessionOnResume();
+    state.sessionRevalidationPendingForceCapabilities = false;
+    void revalidateSessionOnResume({ forceCapabilities });
   }
 
-  async function revalidateSessionOnResume() {
+  async function revalidateSessionOnResume({ forceCapabilities = false } = {}) {
     if (!state.initialized || !state.session.authenticated
+        || state.agent === null || state.chat === null
         || document?.visibilityState === "hidden" || state.updateReloaded) return false;
     if (agentMutationBlocksSessionRevalidation()) {
       state.sessionRevalidationPending = true;
+      state.sessionRevalidationPendingForceCapabilities ||= forceCapabilities;
       return false;
     }
     if (state.sessionRevalidationInFlight) {
-      state.sessionRevalidationPending = true;
+      // Normal pageshow + visibility events are the same foreground edge and
+      // share one read. An online transition is distinct: if it lands during
+      // a failing read, perform one forced follow-up after that read settles.
+      if (forceCapabilities) {
+        state.sessionRevalidationPending = true;
+        state.sessionRevalidationPendingForceCapabilities = true;
+      }
       return false;
     }
     state.sessionRevalidationInFlight = true;
     const ownedSession = state.session;
+    const ownedAgent = state.agent;
+    const ownedChat = state.chat;
     try {
       const restored = sessionEnvelope(await sessionClient.restore());
-      if (state.session !== ownedSession || !state.session.authenticated) return false;
+      if (!capabilityRefreshIsOwned(ownedSession, ownedAgent, ownedChat)) return false;
       if (!restored.authenticated
           || normalizedSessionUsername(restored.username) !== normalizedSessionUsername(ownedSession.username)
           || restored.csrfToken !== ownedSession.csrfToken) {
@@ -1649,12 +1770,47 @@ export function createBrowserApp({
         });
         return false;
       }
+      if (agentMutationBlocksSessionRevalidation()) {
+        state.sessionRevalidationPending = true;
+        state.sessionRevalidationPendingForceCapabilities ||= forceCapabilities;
+        return false;
+      }
+      const instant = Number(now());
+      const capabilityRefreshDue = forceCapabilities || !Number.isFinite(instant)
+        || !Number.isFinite(state.capabilityRefreshAt) || instant < state.capabilityRefreshAt
+        || instant - state.capabilityRefreshAt >= CAPABILITY_REFRESH_MINIMUM_INTERVAL_MS;
+      if (!capabilityRefreshDue) return true;
+      const pair = await readCapabilityPair(ownedAgent, ownedChat);
+      if (!capabilityRefreshIsOwned(ownedSession, ownedAgent, ownedChat)) return false;
+      if (agentMutationBlocksSessionRevalidation()) {
+        state.sessionRevalidationPending = true;
+        state.sessionRevalidationPendingForceCapabilities ||= forceCapabilities;
+        return false;
+      }
+      if (applyCapabilityRefresh(ownedSession, ownedAgent, ownedChat, pair)
+          && Number.isFinite(instant)) state.capabilityRefreshAt = instant;
       return true;
     } catch (error) {
+      if (agentMutationBlocksSessionRevalidation()) {
+        state.sessionRevalidationPending = true;
+        state.sessionRevalidationPendingForceCapabilities ||= forceCapabilities;
+        return false;
+      }
       const targetRelease = clientReleaseMismatch(error);
       if (targetRelease !== null) {
-        await refreshForReleaseMismatch(targetRelease);
-      } else if (state.session === ownedSession && (isChatAuthenticationRejection(error)
+        if (capabilityRefreshIsOwned(ownedSession, ownedAgent, ownedChat)) {
+          // Keep the last verified capability shape only long enough to
+          // encrypt an exact version handoff. All composer mutations are
+          // locked during that handoff, so stale capability can never dispatch.
+          state.capabilityReleaseRefreshPending = true;
+          updateImageControl();
+        }
+        let refreshing = false;
+        try { refreshing = await refreshForReleaseMismatch(targetRelease); }
+        catch { /* The fail-closed capability state below remains retryable. */ }
+        if (!refreshing) failClosedCapabilityRefresh(ownedSession, ownedAgent, ownedChat);
+      } else if (capabilityRefreshIsOwned(ownedSession, ownedAgent, ownedChat)
+          && (isChatAuthenticationRejection(error)
           || error?.code === "csrf_rejected" || error?.status === 403)) {
         if (agentMutationBlocksSessionRevalidation()) {
           state.sessionRevalidationPending = true;
@@ -1664,6 +1820,8 @@ export function createBrowserApp({
           workflow: state.mode === "chat" ? state.chatPendingSend : null,
           generationRecovery: state.mode === "chat" ? captureChatReadRecovery() : null,
         });
+      } else {
+        failClosedCapabilityRefresh(ownedSession, ownedAgent, ownedChat);
       }
       return false;
     } finally {
@@ -1750,26 +1908,35 @@ export function createBrowserApp({
     const capability = state.capabilities.search;
     const available = state.session.authenticated && state.mode === "agent"
       && state.capabilities.enabled === true && capability?.enabled === true;
-    if (!available) state.agentSearchSelected = false;
+    const unavailableSelection = state.session.authenticated && state.mode === "agent"
+      && state.agentSearchSelected && !available;
     const maximum = available ? capability.maximumSources : 0;
-    if (available && !capability.modes.includes(elements.search_mode.value)) elements.search_mode.value = capability.modes[0];
-    if (available) {
+    if (available && !state.agentSearchSelected && !capability.modes.includes(elements.search_mode.value)) {
+      elements.search_mode.value = capability.modes[0];
+    }
+    if (available && !state.agentSearchSelected) {
       const selectedLimit = Number(elements.search_limit.value);
       if (!Number.isSafeInteger(selectedLimit) || selectedLimit < 1 || selectedLimit > maximum) {
         elements.search_limit.value = String(Math.min(8, maximum));
       }
     }
-    elements.search_controls.hidden = !available;
+    elements.search_controls.hidden = !available && !unavailableSelection;
     elements.search_toggle.setAttribute("aria-pressed", state.agentSearchSelected ? "true" : "false");
     elements.search_options.hidden = !available || !state.agentSearchSelected;
     elements.search_limit.max = String(maximum);
-    const disabled = !available || interactionLocked() || state.agentPendingDeletion !== null;
+    const disabled = (!available && !unavailableSelection) || interactionLocked()
+      || state.capabilityReleaseRefreshPending
+      || state.agentPendingDeletion !== null;
     elements.search_toggle.disabled = disabled;
     elements.search_mode.disabled = disabled || !state.agentSearchSelected;
     elements.search_limit.disabled = disabled || !state.agentSearchSelected;
   }
 
   function updateCapabilityNote() {
+    const stagedImageNotice = state.selectedImages.length > 0
+        && !imagesSupportedInMode(state.selectedImages, state.mode)
+      ? " Selected images remain staged and cannot be sent until image capability returns or you remove them."
+      : "";
     if (state.mode === "agent" && state.capabilities.enabled === true) {
       const fileCreation = state.capabilities.artifacts.kinds.includes("file");
       const search = state.capabilities.search?.enabled === true;
@@ -1789,13 +1956,14 @@ export function createBrowserApp({
         ...additions,
         ...(unavailable.length === 0 ? [] : [`no ${unavailable.join(", ")}`]),
       ];
-      elements.capability_note.textContent = parts.join(" · ") + ".";
+      elements.capability_note.textContent = parts.join(" · ") + "." + stagedImageNotice;
       return;
     }
     const input = state.chatCapabilities.visionInput === true ? "text + up to four images" : "text only";
     const availability = state.capabilities.enabled === true ? "switch to Agent for tools" : "Agent unavailable";
     elements.capability_note.textContent =
-      `Chat · LocalLLM ${input} · no tools, file creation, or web search · ${availability}.`;
+      `Chat · LocalLLM ${input} · no tools, file creation, or web search · ${availability}.`
+      + stagedImageNotice;
   }
 
   function selectedAgentSearch() {
@@ -1826,65 +1994,78 @@ export function createBrowserApp({
 
   function updateImageControl() {
     const available = state.session.authenticated && imageInputAvailable();
+    elements.mode_switch.hidden = state.capabilities.enabled !== true && state.mode !== "agent";
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
     const pendingAgentDeletion = state.mode === "agent" && state.agentPendingDeletion !== null;
     const locked = interactionLocked();
     const pendingAgentResume = state.mode === "agent" && state.agentPendingResume !== null;
     const agentDispatchFenced = state.mode === "agent" && state.agentReplayFailed;
+    const agentCapabilityUnavailable = state.mode === "agent" && state.capabilities.enabled !== true;
+    const releaseRefreshPending = state.capabilityReleaseRefreshPending;
+    const selectedImagesUnsupported = state.selectedImages.length > 0
+      && !imagesSupportedInMode(state.selectedImages, state.mode);
+    const searchCapability = state.capabilities.search;
+    const selectedSearchLimit = Number(elements.search_limit.value);
+    const selectedSearchUnsupported = state.mode === "agent" && state.agentSearchSelected
+      && (state.capabilities.enabled !== true || searchCapability?.enabled !== true
+        || !searchCapability.modes.includes(elements.search_mode.value)
+        || !Number.isSafeInteger(selectedSearchLimit) || selectedSearchLimit < 1
+        || selectedSearchLimit > searchCapability.maximumSources);
     const searchChoiceReady = agentSearchRecoveryChoiceReady();
     const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
-    const preservingAmbiguousImage = state.chatPendingSend?.ambiguousMutation !== null
-      && state.chatPendingSend?.ambiguousMutation !== undefined
-      && state.selectedImages.length > 0;
-    const fencedImage = preservingAuthenticationDraft || preservingAmbiguousImage;
-    if (!available && !fencedImage && (state.imagePreparing || state.selectedImages.length > 0)) clearSelectedImage();
     elements.add_image.hidden = !available;
     elements.add_image.textContent = state.imagePreparing ? "Preparing images…" : "Images";
     elements.add_image.setAttribute(
       "aria-label",
       state.imagePreparing ? "Preparing images…" : "Add images",
     );
-    elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
+    elements.add_image.disabled = !available || locked || releaseRefreshPending
+      || state.imagePreparing || pendingChatSend || pendingChatDeletion
       || pendingAgentDeletion || agentDispatchFenced
       || state.selectedImages.length >= COMPOSER_IMAGE_COUNT_LIMIT;
-    elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
-      || pendingChatDeletion || pendingAgentDeletion
+    elements.remove_image.disabled = locked || releaseRefreshPending
+      || pendingChatSend || pendingChatDeletion || pendingAgentDeletion
       || (state.selectedImages.length === 0 && !state.imagePreparing);
-    elements.message_input.disabled = !state.session.authenticated || (locked && !pendingAgentResume)
+    elements.message_input.disabled = !state.session.authenticated || releaseRefreshPending
+      || (locked && !pendingAgentResume)
       || state.imagePreparing || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft || state.retainedUpdateRecoveryPending
       || state.agentAuthenticationRecoveryPending;
-    elements.send_message.disabled = !state.session.authenticated || locked || state.imagePreparing || pendingChatSend
+    elements.send_message.disabled = !state.session.authenticated || locked || releaseRefreshPending
+      || state.imagePreparing || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
-      || preservingAuthenticationDraft || agentDispatchFenced
+      || preservingAuthenticationDraft || agentDispatchFenced || agentCapabilityUnavailable
+      || selectedImagesUnsupported || selectedSearchUnsupported
       || (state.legacyUpdateRecoveryPending && !searchChoiceReady)
       || (state.retainedUpdateRecoveryPending && !searchChoiceReady)
       || (state.agentAuthenticationRecoveryPending && !searchChoiceReady);
-    elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend
+    elements.new_thread.disabled = !state.session.authenticated || locked || releaseRefreshPending || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft;
     const imageModeLocked = state.imagePreparing || state.selectedImages.length > 0;
     elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
+      || releaseRefreshPending
       || pendingChatDeletion || pendingAgentDeletion || preservingAuthenticationDraft || imageModeLocked;
-    elements.chat_mode.disabled = !state.session.authenticated || locked || pendingChatDeletion
+    elements.chat_mode.disabled = !state.session.authenticated || locked || releaseRefreshPending || pendingChatDeletion
       || pendingAgentDeletion || imageModeLocked
       || preservingAuthenticationDraft;
-    elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend
+    elements.composer.setAttribute("aria-busy", locked || releaseRefreshPending || state.imagePreparing || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
       ? "true" : "false");
     elements.workspace.setAttribute("aria-busy", state.chatFinalization === null ? "false" : "true");
     for (const row of elements.thread_list.children ?? []) {
       const buttons = row.className === "thread-row" ? row.children : [row];
       for (const button of buttons) {
-        button.disabled = locked || pendingChatSend || button.dataset.threadBlocked === "true"
+        button.disabled = locked || releaseRefreshPending || pendingChatSend || button.dataset.threadBlocked === "true"
           || (state.agentSearchRecoveryChoicePending
             && !agentRecoveryThreadRetryAllowed(button.dataset.threadId))
           || ((pendingChatDeletion || pendingAgentDeletion) && button.dataset.threadDeleteRetry !== "true");
       }
     }
     updateSearchControl();
+    updateCapabilityNote();
     scheduleSafeUpdateReload();
   }
 
@@ -4927,12 +5108,17 @@ export function createBrowserApp({
         if (state.imagePreparationAbort === preparationController) state.imagePreparationAbort = null;
       }
       updateImageControl();
+      flushDeferredSessionRevalidation();
     }
   }
 
   async function submitMessage(event) {
     event?.preventDefault?.();
     if (!state.session.authenticated) return;
+    if (state.capabilityReleaseRefreshPending) {
+      showToast("A newer app is protecting this exact prompt and its images. Nothing was sent or changed.");
+      return;
+    }
     if (state.agentSearchRecoveryChoicePending) {
       if (confirmAgentSearchRecoveryChoice()) return;
       if (state.protectedComposerReplacementConfirmation !== null) return;
@@ -4976,6 +5162,10 @@ export function createBrowserApp({
     if (state.imagePreparing) {
       cancelImagePreparation();
       updateImageControl();
+      return;
+    }
+    if (state.mode === "agent" && state.capabilities.enabled !== true) {
+      showToast("Agent capability is unavailable. Your prompt and selected images remain unsent; retry after the connection recovers.");
       return;
     }
     clearChatFailureDiagnostic();
@@ -5049,27 +5239,30 @@ export function createBrowserApp({
     if (submissionMode === "agent") beginAgentSubmissionActivity();
     updateImageControl();
     try {
-      if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text, agentSearch, agentAttachments, {
-        localPreviews,
-        onAccepted() {
-          disposeDetachedImage(detachedImage);
-          detachedImage = null;
-          selected = Object.freeze([]);
-          attachments = Object.freeze([]);
-          agentAttachments = Object.freeze([]);
-          localPreviews = Object.freeze([]);
-        },
-      });
-      else await sendChat(text, attachments, {
-        localPreviews,
-        onAccepted() {
-          disposeDetachedImage(detachedImage);
-          detachedImage = null;
-          selected = Object.freeze([]);
-          attachments = Object.freeze([]);
-          localPreviews = Object.freeze([]);
-        },
-      });
+      if (state.mode === "agent") {
+        await sendAgent(text, agentSearch, agentAttachments, {
+          localPreviews,
+          onAccepted() {
+            disposeDetachedImage(detachedImage);
+            detachedImage = null;
+            selected = Object.freeze([]);
+            attachments = Object.freeze([]);
+            agentAttachments = Object.freeze([]);
+            localPreviews = Object.freeze([]);
+          },
+        });
+      } else {
+        await sendChat(text, attachments, {
+          localPreviews,
+          onAccepted() {
+            disposeDetachedImage(detachedImage);
+            detachedImage = null;
+            selected = Object.freeze([]);
+            attachments = Object.freeze([]);
+            localPreviews = Object.freeze([]);
+          },
+        });
+      }
     } catch (error) {
       const sameOwner = state.session === submissionSession
         && state.session.authenticated
@@ -5243,6 +5436,7 @@ export function createBrowserApp({
     state.agentPendingDeletion = null;
     purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
+    state.capabilityReleaseRefreshPending = false;
     if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
     const discardedCrossAccountDraft = recoveringAuthenticationDraft
       && normalizedSessionUsername(state.session.username) !== recoveryUsername;
@@ -5367,6 +5561,7 @@ export function createBrowserApp({
       }
       state.agent = createAgentClient(state.session);
       state.chat = createChatClient(state.session);
+      state.capabilityRefreshAt = Number.NEGATIVE_INFINITY;
       requiredMethod(state.agent, "capabilities", "agent client");
       requiredMethod(state.agent, "listThreads", "agent client");
       requiredMethod(state.agent, "streamRunEvents", "agent client");
@@ -5375,6 +5570,7 @@ export function createBrowserApp({
         "prepareThreadDeletion", "deleteThread", "retryDeleteThread", "listMessages", "getAttachment",
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
+      const authenticatedAgent = state.agent;
       const authenticatedChat = state.chat;
       const startupChatThreads = Object.freeze({
         session: authenticatedSession,
@@ -5386,43 +5582,16 @@ export function createBrowserApp({
             (error) => Object.freeze({ succeeded: false, error }),
           ),
       });
-      const readChatCapability = async () => {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            const value = chatCapabilityEnvelope(await authenticatedChat.capabilities());
-            return { succeeded: true, value };
-          } catch (error) {
-            if (clientReleaseMismatch(error) !== null) throw error;
-            if (attempt < 2) await wait(250 * (2 ** attempt));
-          }
-        }
-        return {
-          succeeded: false,
-          value: Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 }),
-        };
-      };
-      const readAgentCapability = async () => {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            return { succeeded: true, value: validateAgentCapabilities(await state.agent.capabilities()) };
-          } catch (error) {
-            if (clientReleaseMismatch(error) !== null) throw error;
-            if (attempt < 2) await wait(250 * (2 ** attempt));
-          }
-        }
-        return { succeeded: false, value: FAIL_CLOSED_AGENT_CAPABILITIES };
-      };
-      const [agentCapabilityProbe, chatCapabilityProbe] = await Promise.all([
-        readAgentCapability(),
-        readChatCapability(),
-      ]);
+      const startupCapabilityPair = await readCapabilityPair(authenticatedAgent, authenticatedChat);
+      const agentCapabilityProbe = startupCapabilityPair.agent;
+      const chatCapabilityProbe = startupCapabilityPair.chat;
       const capability = agentCapabilityProbe.value;
       const chatCapabilityVerified = chatCapabilityProbe.succeeded;
       const chatCapability = chatCapabilityProbe.value;
-      if (state.session !== authenticatedSession || !state.session.authenticated) return;
+      if (!capabilityRefreshIsOwned(authenticatedSession, authenticatedAgent, authenticatedChat)) return;
       state.capabilities = capability;
       state.chatCapabilities = chatCapability;
-      if (state.session !== authenticatedSession || !state.session.authenticated) return;
+      if (!capabilityRefreshIsOwned(authenticatedSession, authenticatedAgent, authenticatedChat)) return;
       if (updateHandoff?.mode === "agent") state.agentThreadId = updateHandoff.threadId;
       else if (updateHandoff?.mode === "chat") state.chatThreadId = updateHandoff.threadId;
       const ambiguousLegacyRecovery = sameAccountRecoveryLegacy
@@ -5752,6 +5921,10 @@ export function createBrowserApp({
     state.imagePreparing = false;
     elements.message_input.value = "";
     state.session = Object.freeze({ authenticated: false });
+    state.sessionRevalidationPending = false;
+    state.sessionRevalidationPendingForceCapabilities = false;
+    state.capabilityRefreshAt = Number.NEGATIVE_INFINITY;
+    state.capabilityReleaseRefreshPending = false;
     state.authRecoveryPending = false;
     state.authRecoveryUsername = null;
     state.authRecoveryWorkflow = null;
@@ -5776,7 +5949,7 @@ export function createBrowserApp({
     state.chatPendingDeletion = null;
     state.agentPendingDeletion = null;
     state.chatFinalization = null;
-    state.chatCapabilities = Object.freeze({ visionInput: false, visionMediaTypes: Object.freeze([]), maximumImageBytes: 0 });
+    state.chatCapabilities = FAIL_CLOSED_CHAT_CAPABILITIES;
     clearSelectedImage();
     updateImageControl();
     state.runId = null;
@@ -7067,7 +7240,11 @@ export function createBrowserApp({
       state.installPrompt = null;
       elements.install_app.hidden = true;
     });
-    window?.addEventListener?.("online", () => { elements.offline_banner.hidden = true; connection("Connected"); });
+    window?.addEventListener?.("online", () => {
+      elements.offline_banner.hidden = true;
+      connection("Connected");
+      void revalidateSessionOnResume({ forceCapabilities: true });
+    });
     window?.addEventListener?.("offline", () => { elements.offline_banner.hidden = false; connection("Offline", false); });
     window?.addEventListener?.("pagehide", (event) => {
       if (event?.persisted !== true) purgeAttachmentMemory();

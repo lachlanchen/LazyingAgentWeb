@@ -428,10 +428,17 @@ user explicitly chooses the destination conversation and separately confirms
 schema-v3 payload instead restores its exact mode, owned thread, and Search
 choice, subject to current account ownership and capability verification.
 
-`pageshow` and visible-state resume revalidate the server session. A revoked
-session returns to sign-in while keeping unsent composer work in page memory;
-an exact newer release uses a version-addressed navigation and the encrypted
-handoff rather than discarding that work.
+`pageshow`, visible-state resume, and an online transition revalidate the
+server session and refetch both the Agent and Direct Chat capability contracts.
+Foreground duplicates share one bounded probe and an online edge may bypass
+the short throttle after an outage. Every result is fenced to the exact
+session plus Agent/Chat client pair that requested it. An upgrade becomes
+usable without a reload; a downgrade or probe outage fails closed while staged
+images, drafts, recovery ownership, thread/run state, and live operations stay
+untouched. Agent mutations defer the whole refresh until their ownership fence
+is released. A revoked session returns to sign-in while keeping unsent composer
+work in page memory; an exact newer release uses a version-addressed navigation
+and the encrypted handoff rather than discarding that work.
 
 Before caching, the service worker requires the exact same-origin URL, status,
 MIME type, declared shell security headers, byte length, and SHA-256 for every

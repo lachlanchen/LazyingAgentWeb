@@ -5995,6 +5995,64 @@ test("pageshow and visible PWA resume revalidate the retained browser session wi
   assert.equal(harness.restoreCalls, 3, "foreground resume revalidates exactly once");
 });
 
+test("a capability-resume release fence locks dispatch and carries the exact draft to its versioned successor", async () => {
+  const clients = idleAuthenticatedPwaClients();
+  const store = memoryUpdateHandoffStore();
+  const originalAgentCapability = clients.agent.capabilities.bind(clients.agent);
+  const originalChatCapability = clients.chat.capabilities.bind(clients.chat);
+  const delayedChatCapability = Promise.withResolvers();
+  let mismatch = false;
+  let agentReads = 0;
+  let chatReads = 0;
+  clients.agent.capabilities = async () => {
+    agentReads += 1;
+    if (mismatch) {
+      throw new DirectChatTransportError("new release required", {
+        code: "client_release_mismatch",
+        status: 409,
+        retryable: false,
+        serverRelease: NEXT_RELEASE,
+      });
+    }
+    return await originalAgentCapability();
+  };
+  clients.chat.capabilities = async () => {
+    chatReads += 1;
+    if (mismatch) return await delayedChatCapability.promise;
+    return await originalChatCapability();
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    now: () => 20_000,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent: clients.agent,
+    chat: clients.chat,
+    updateHandoffStore: store,
+  });
+  await harness.app.initialize();
+  const input = harness.document.getElementById("message-input");
+  input.value = "carry this exact foreground capability draft";
+
+  mismatch = true;
+  harness.window.dispatch("pageshow", { persisted: true });
+  await store.saved;
+  await settlePwaActions(4);
+
+  assert.equal(agentReads, 2);
+  assert.equal(chatReads, 2, "the release fence still completes both bounded capability reads");
+  assert.equal(store.calls.save, 1);
+  assert.equal(harness.replacements.length, 1);
+  assert.match(harness.replacements[0], new RegExp(`\\?v=${NEXT_RELEASE}#lazying-update-handoff=`, "u"));
+  assert.equal(input.value, "carry this exact foreground capability draft");
+  assert.equal(harness.document.getElementById("send-message").disabled, true);
+  assert.deepEqual(clients.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+  delayedChatCapability.resolve(await originalChatCapability());
+});
+
 test("a PWA resume with a revoked session preserves the unsent draft and returns to sign-in", async () => {
   const clients = idleAuthenticatedPwaClients();
   let valid = true;

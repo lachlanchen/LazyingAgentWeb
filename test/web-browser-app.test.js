@@ -806,6 +806,68 @@ test("Agent multi-image input preserves an iPhone draft after rejection then acc
   assert.equal(userMessage.children[0].children.length, 2);
 });
 
+test("Agent empty Resume snapshots the retained-image marker and idempotency for a just-accepted image run", async () => {
+  const failed = await verifiedEvent({ seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH });
+  const completed = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID,
+  });
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const resumeCalls = [];
+  const agent = {
+    ...baseAgent(agentImageCapabilities()),
+    async createThread() { return { thread: agentThread() }; },
+    async startRun() { return { run: run("running") }; },
+    async resumeRun(runId, text, options) {
+      resumeCalls.push({ runId, text, options });
+      if (resumeCalls.length === 1) {
+        throw Object.assign(new Error("retained-image ACK was lost"), { retryable: true });
+      }
+      return { run: run("running", { id: SECOND_RUN_ID, previousRunId: RUN_ID }) };
+    },
+    async *streamRunEvents({ runId }) {
+      const event = runId === RUN_ID ? failed : completed;
+      yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_resume_000000001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 640,
+        height: 480,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:agent-image-resume"; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "resume.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  browser.document.getElementById("message-input").value = "Inspect this image";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+
+  await browser.app.resume();
+  await browser.app.resume();
+  assert.equal(resumeCalls.length, 2);
+  assert.equal(resumeCalls.every(({ runId, text }) => runId === RUN_ID && text === undefined), true);
+  assert.equal(resumeCalls.every(({ options }) => options.reuseAttachments === true), true);
+  assert.equal(new Set(resumeCalls.map(({ options }) => options.idempotency)).size, 1,
+    "an ambiguous retained-image retry keeps one exact mutation ticket");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
 test("Agent history replays retained image descriptors without browser bytes or a Chat attachment read", async () => {
   const history = await verifiedEvents([
     ["output.delta", { text: "Stored description" }],

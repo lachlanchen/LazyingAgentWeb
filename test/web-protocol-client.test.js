@@ -296,6 +296,20 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
     afterHash: ZERO_HASH,
     lastEventHash: ZERO_HASH,
   }), /unsupported field/u);
+  assert.deepEqual(validateAgentRequest(AGINTI_RPC_PATHS.runsResume, {
+    runId: RUN_ID,
+    reuseAttachments: true,
+  }), { runId: RUN_ID, reuseAttachments: true });
+  for (const invalidResume of [
+    { runId: RUN_ID, reuseAttachments: false },
+    { runId: RUN_ID, reuseAttachments: "true" },
+    { runId: RUN_ID, reuseAttachments: true, input: { text: "Corrected prompt" } },
+  ]) {
+    assert.throws(
+      () => validateAgentRequest(AGINTI_RPC_PATHS.runsResume, invalidResume),
+      /reuseAttachments/u,
+    );
+  }
   for (const request of [{ runId: RUN_ID }, { threadId: THREAD_ID }]) {
     const normalized = validateAgentRequest(AGINTI_RPC_PATHS.artifactsList, request);
     assert.deepEqual(normalized, request);
@@ -979,6 +993,24 @@ test("Agent image mutations outlive the ordinary deadline while preserving abort
   assert.equal((await image).run.id, RUN_ID, "a slow acknowledged image mutation completes once");
   assert.equal(calls[1].options.headers.get("idempotency-key"), "image_agent_slow_upload_001");
 
+  const retainedImageRetry = client.resumeRun(RUN_ID, undefined, {
+    idempotency: "image_agent_retained_retry_01",
+    reuseAttachments: true,
+  });
+  let retainedRetrySettled = false;
+  retainedImageRetry.then(() => { retainedRetrySettled = true; }, () => { retainedRetrySettled = true; });
+  t.mock.timers.tick(15_000);
+  await Promise.resolve();
+  assert.equal(retainedRetrySettled, false, "a retained-image retry does not use the ordinary deadline");
+  t.mock.timers.tick(5_000);
+  assert.equal((await retainedImageRetry).run.id, SECOND_RUN_ID);
+  assert.deepEqual(JSON.parse(calls[2].options.body), { runId: RUN_ID, reuseAttachments: true });
+  assert.equal(calls[2].options.headers.get("idempotency-key"), "image_agent_retained_retry_01");
+  assert.throws(
+    () => client.resumeRun(RUN_ID, "Corrected prompt", { reuseAttachments: true }),
+    /reuseAttachments/u,
+  );
+
   responseDelayMs = 600_000;
   const caller = new AbortController();
   const aborted = client.resumeRun(RUN_ID, "Abort this image follow-up", {
@@ -989,7 +1021,7 @@ test("Agent image mutations outlive the ordinary deadline while preserving abort
   caller.abort(new DOMException("cancelled by caller", "AbortError"));
   await assert.rejects(aborted, (error) => error instanceof AgintiTransportError
     && error.code === "AGINTI_ABORTED" && error.retryable === false);
-  assert.equal(calls[2].options.headers.get("idempotency-key"), "image_agent_caller_abort_01");
+  assert.equal(calls[3].options.headers.get("idempotency-key"), "image_agent_caller_abort_01");
 
   const timedOut = client.resumeRun(RUN_ID, "Bound the image follow-up", {
     idempotency: "image_agent_exact_timeout_1",
@@ -1004,7 +1036,7 @@ test("Agent image mutations outlive the ordinary deadline while preserving abort
     && error.code === "AGINTI_TIMEOUT" && error.retryable === true);
   t.mock.timers.tick(1);
   await timeoutRejected;
-  assert.equal(calls[3].options.headers.get("idempotency-key"), "image_agent_exact_timeout_1");
+  assert.equal(calls[4].options.headers.get("idempotency-key"), "image_agent_exact_timeout_1");
 });
 
 test("pinned Agent transport exposes an exact newer release without retrying", async () => {

@@ -1258,6 +1258,7 @@ export function createBrowserApp({
     presentation: null,
     assistantNode: null,
     agentRunMessages: new Map(),
+    agentImageRunIds: new Set(),
     agentHistoryRestoring: false,
     agentReplayValidating: false,
     agentReplayFailed: false,
@@ -2205,6 +2206,7 @@ export function createBrowserApp({
     state.presentation = null;
     state.assistantNode = null;
     state.agentRunMessages.clear();
+    state.agentImageRunIds.clear();
     state.agentHistoryRestoring = false;
     state.agentReplayValidating = false;
     state.agentReplayOfferResume = true;
@@ -2364,6 +2366,10 @@ export function createBrowserApp({
       && state.mode === "chat" && typeof threadId === "string";
     const retainedAgentImages = localImages.length === 0 && storedImages.length > 0
       && state.mode === "agent" && typeof runId === "string";
+    if (role === "user" && state.mode === "agent" && typeof runId === "string"
+        && displayImages.length > 0 && (localImages.length > 0 || retainedAgentImages)) {
+      state.agentImageRunIds.add(runId);
+    }
     if (role === "user" && displayImages.length > 0
         && (localImages.length > 0 || storedChatImages || retainedAgentImages)) {
       const gallery = displayImages.length > 1 ? document.createElement("div") : null;
@@ -6042,6 +6048,7 @@ export function createBrowserApp({
             draft,
             text,
             search,
+            reuseAttachments: text === undefined && state.agentImageRunIds.has(requestedRunId),
             idempotency: createBrowserOpaqueId("agent_resume"),
           });
           state.agentPendingResume = resumeTicket;
@@ -6070,6 +6077,7 @@ export function createBrowserApp({
           {
             idempotency: resumeTicket.idempotency,
             ...(resumeTicket.search === undefined ? {} : { search: resumeTicket.search }),
+            ...(resumeTicket.reuseAttachments ? { reuseAttachments: true } : {}),
           },
         );
         if (!ownsAgentResume() || state.agentPendingResume !== resumeTicket) return;

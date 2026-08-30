@@ -507,11 +507,16 @@ export function validateAgentRequest(pathname, value = {}) {
       });
     }
     case AGINTI_RPC_PATHS.runsResume: {
-      const object = exact(value, ["runId", "input"], "request", ["runId"]);
+      const object = exact(value, ["runId", "input", "reuseAttachments"], "request", ["runId"]);
       const nextInput = input(object.input, { optional: true });
+      if (object.reuseAttachments !== undefined
+          && (object.reuseAttachments !== true || nextInput !== undefined)) {
+        invalid("reuseAttachments must be true on an input-less image Resume request");
+      }
       return Object.freeze({
         runId: validateRunId(object.runId),
         ...(nextInput === undefined ? {} : { input: nextInput }),
+        ...(object.reuseAttachments === true ? { reuseAttachments: true } : {}),
       });
     }
     case AGINTI_RPC_PATHS.artifactsList: {

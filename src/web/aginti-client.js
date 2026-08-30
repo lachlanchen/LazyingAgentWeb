@@ -433,7 +433,7 @@ export class AgintiBrowserClient {
     const endpoint = this.endpoint(pathname);
     const imageMutation = (pathname === AGINTI_RPC_PATHS.runsStart
       || pathname === AGINTI_RPC_PATHS.runsResume)
-      && Array.isArray(request.input?.attachments);
+      && (Array.isArray(request.input?.attachments) || request.reuseAttachments === true);
     const deadline = deadlineSignal(
       signal,
       imageMutation ? AGINTI_IMAGE_ATTACHMENT_REQUEST_TIMEOUT_MS : this.timeoutMs,
@@ -498,13 +498,20 @@ export class AgintiBrowserClient {
   }
   runStatus(runId, options) { return this.call(AGINTI_RPC_PATHS.runsStatus, { runId }, options); }
   cancelRun(runId, options) { return this.call(AGINTI_RPC_PATHS.runsCancel, { runId }, options); }
-  resumeRun(runId, text, { search, attachments, ...options } = {}) {
+  resumeRun(runId, text, { search, attachments, reuseAttachments, ...options } = {}) {
     if (text === undefined && (search !== undefined || attachments !== undefined)) {
       throw new TypeError("search and attachments require a corrected resume prompt");
     }
+    if (reuseAttachments !== undefined
+        && (reuseAttachments !== true || text !== undefined)) {
+      throw new TypeError("reuseAttachments must be true on an input-less image Resume request");
+    }
     return this.call(
       AGINTI_RPC_PATHS.runsResume,
-      text === undefined ? { runId } : {
+      text === undefined ? {
+        runId,
+        ...(reuseAttachments === true ? { reuseAttachments: true } : {}),
+      } : {
         runId,
         input: {
           text,

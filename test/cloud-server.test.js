@@ -1266,6 +1266,14 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
   assert.equal(forgedImage.status, 409);
   assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/start'), false, 'disabled image input never reaches AgInTi');
 
+  const forgedRetainedImageRetry = await post(baseUrl, '/api/transport/agent/v1/runs/resume', {
+    runId: 'run_00000000-0000-4000-8000-000000000000',
+    reuseAttachments: true
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000003' });
+  assert.equal(forgedRetainedImageRetry.status, 409);
+  assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/resume'), false,
+    'disabled retained image input never reaches AgInTi');
+
   const unavailableState = testState(t);
   const unavailable = await unavailableState.start();
   const unavailableAuth = await login(unavailable.baseUrl);
@@ -1286,6 +1294,7 @@ test('preflights negotiated Agent Search and image input and forwards one exact 
   const calls = [];
   const threadId = 'thr_12345678-1234-4123-8123-123456789abc';
   const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
+  const resumedRunId = 'run_12345678-abcd-4abc-8def-abcdefabcdef';
   const capability = {
     schemaVersion: '1',
     enabled: true,
@@ -1316,9 +1325,9 @@ test('preflights negotiated Agent Search and image input and forwards one exact 
       return {
         schemaVersion: '1',
         run: {
-          id: runId,
+          id: path === '/agent/v1/runs/resume' ? resumedRunId : runId,
           threadId,
-          previousRunId: null,
+          previousRunId: path === '/agent/v1/runs/resume' ? runId : null,
           status: 'starting',
           createdAt: '2026-08-20T08:00:00.000Z',
           startedAt: null,
@@ -1352,11 +1361,24 @@ test('preflights negotiated Agent Search and image input and forwards one exact 
   assert.deepEqual(Object.keys(calls[0].context).sort(), ['browserSession', 'principalId', 'signal']);
   assert.equal(calls[1].context.idempotencyKey, IDEMPOTENCY);
 
+  const retainedRetry = await post(baseUrl, '/api/transport/agent/v1/runs/resume', {
+    runId,
+    reuseAttachments: true
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000002' });
+  assert.equal(retainedRetry.status, 200);
+  assert.equal((await retainedRetry.json()).run.id, resumedRunId);
+  assert.deepEqual(calls.slice(2).map(({ path }) => path), [
+    '/agent/v1/capabilities',
+    '/agent/v1/runs/resume'
+  ]);
+  assert.deepEqual(calls[3].body, { runId, reuseAttachments: true });
+  assert.equal(calls[3].context.idempotencyKey, 'browser-action-00000002');
+
   const beforeInvalid = calls.length;
   const invalid = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
     threadId,
     input: { text: 'Too many', search: { mode: 'web', limit: 21 } }
-  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000002' });
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000004' });
   assert.equal(invalid.status, 400);
   assert.equal(calls.length, beforeInvalid);
 

@@ -2025,7 +2025,7 @@ export function createCloudRequestHandler({
   async function handleAgent(req, res, route, body, session, requestSignal) {
     const nativePath = route.nativeAgentPath;
     const input = validateTransportAgentRequest(nativePath, body);
-    const requestTimeoutMs = Array.isArray(input.input?.attachments)
+    const requestTimeoutMs = Array.isArray(input.input?.attachments) || input.reuseAttachments === true
       ? limits.visionBodyTimeoutMs
       : limits.dependencyTimeoutMs;
     const mutation = routeRequiresIdempotency(route.pathname, nativePath);
@@ -2040,7 +2040,8 @@ export function createCloudRequestHandler({
     primeAgentAuthority(session);
     const requestedSearch = input.input?.search;
     const requestedAttachments = input.input?.attachments;
-    if (requestedSearch !== undefined || requestedAttachments !== undefined) {
+    const reusingAttachments = input.reuseAttachments === true;
+    if (requestedSearch !== undefined || requestedAttachments !== undefined || reusingAttachments) {
       const proof = await withTimeout(
         async (signal) => {
           const authority = await resolveAgentRequestScope(nativePath, input, signal);
@@ -2059,7 +2060,7 @@ export function createCloudRequestHandler({
           || requestedSearch.limit > capability.search.maximumSources)) {
         throw new CloudHttpError(409, 'agent_search_unavailable', 'AgInTi Search is not enabled for this session.');
       }
-      if (requestedAttachments !== undefined
+      if ((requestedAttachments !== undefined || reusingAttachments)
           && (capability.enabled !== true || capability.attachments?.enabled !== true)) {
         throw new CloudHttpError(409, 'agent_attachments_unavailable', 'AgInTi image input is not enabled for this session.');
       }

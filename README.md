@@ -4,7 +4,7 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.56 production):** `llm.lazying.art`
+> **Deployment status (v0.1.57 production):** `llm.lazying.art`
 > currently serves
 > `release-4bd06beda0b15b6655f772ff39ee38dd75e42380c9d19ae055cf1ddb249199a6`.
 > Production is promoted
@@ -30,11 +30,16 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > image questions can continue after reload without leaking context to another
 > conversation. Production Agent images remain disabled until the matching
 > retained-image backend and its durable-state floor are separately accepted.
-> The v0.1.57 candidate also keeps the attachment capability as a browser
+> The accepted v0.1.57 release also keeps the attachment capability as a browser
 > creation gate instead of a receipt-transport gate. An exact idempotent image
 > request can therefore reach the attachment-aware backend after vision is
 > disabled and resolve a response-loss ambiguity, while the backend rejects a
 > genuinely new key before mutation.
+> The v0.1.58 candidate refetches both Agent and Direct Chat capabilities after
+> PWA foreground and online transitions. It applies results only to the exact
+> owning session and client pair, fails closed on a downgrade or outage, and
+> preserves the user's draft plus up to four staged images until capability
+> returns or the user explicitly removes them.
 > Direct Chat remembers the user's non-private workspace-mode preference across
 > a full reload, while
 > confirmed sign-out fences stale history reads. The accepted v0.1.23 release also

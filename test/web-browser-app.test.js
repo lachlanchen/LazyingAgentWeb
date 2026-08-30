@@ -9,6 +9,7 @@ import { canonicalJson, verifyAgentEvent } from "../src/web/aginti-protocol.js";
 import { DirectChatTransportError } from "../src/web/direct-chat-client.js";
 
 const THREAD_ID = "thr_12345678-1234-4123-8123-123456789abc";
+const OTHER_THREAD_ID = "thr_cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const RUN_ID = "run_12345678-1234-4123-8123-123456789abc";
 const SECOND_RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const THIRD_RUN_ID = "run_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -579,13 +580,15 @@ test("failed login clears the password and releases the single-flight guard", as
   assert.equal(browser.document.getElementById("password").value, "");
 });
 
-async function verifiedEvent({ seq, type, payload, previousHash, runId = RUN_ID }) {
+async function verifiedEvent({
+  seq, type, payload, previousHash, runId = RUN_ID, threadId = THREAD_ID,
+}) {
   const envelope = {
     schemaVersion: "1",
     id: `${runId}.${seq}`,
     seq,
     type,
-    threadId: THREAD_ID,
+    threadId,
     runId,
     createdAt: NOW,
     payload,
@@ -594,7 +597,7 @@ async function verifiedEvent({ seq, type, payload, previousHash, runId = RUN_ID 
   const value = { ...envelope, hash: digest(canonicalJson(envelope)) };
   return await verifyAgentEvent(value, {
     expectedRunId: runId,
-    expectedThreadId: THREAD_ID,
+    expectedThreadId: threadId,
     afterSeq: seq - 1,
     previousHash,
     digest: async (input) => digest(input),
@@ -866,6 +869,303 @@ test("Agent empty Resume snapshots the retained-image marker and idempotency for
   assert.equal(new Set(resumeCalls.map(({ options }) => options.idempotency)).size, 1,
     "an ambiguous retained-image retry keeps one exact mutation ticket");
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("Agent text follow-up inherits image context for its own empty retry", async () => {
+  const events = new Map([
+    [RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: RUN_ID,
+    })],
+    [SECOND_RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH, runId: SECOND_RUN_ID,
+    })],
+    [THIRD_RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: THIRD_RUN_ID,
+    })],
+  ]);
+  const resumeCalls = [];
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const browser = harness({
+    agent: {
+      ...baseAgent(agentImageCapabilities()),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun() { return { run: run("running") }; },
+      async resumeRun(runId, text, options) {
+        resumeCalls.push({ runId, text, options });
+        return { run: run("running", {
+          id: runId === RUN_ID ? SECOND_RUN_ID : THIRD_RUN_ID,
+          previousRunId: runId,
+        }) };
+      },
+      async *streamRunEvents({ runId }) {
+        const event = events.get(runId);
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_inherited_0000001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 640,
+        height: 480,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:agent-image-inherited"; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "context.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  const input = browser.document.getElementById("message-input");
+  input.value = "Inspect this image";
+  await browser.app.submitMessage({ preventDefault() {} });
+  input.value = "Now compare the important regions";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+
+  await browser.app.resume();
+  assert.equal(resumeCalls.length, 2);
+  assert.deepEqual(
+    resumeCalls.map(({ runId, text }) => ({ runId, text })),
+    [
+      { runId: RUN_ID, text: "Now compare the important regions" },
+      { runId: SECOND_RUN_ID, text: undefined },
+    ],
+  );
+  assert.equal(Object.hasOwn(resumeCalls[0].options, "reuseAttachments"), false,
+    "a normal text follow-up inherits server context without restaging or reuse transport");
+  assert.equal(resumeCalls[1].options.reuseAttachments, true,
+    "only the failed inherited run's input-less retry requests attachment reuse");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("corrected Agent Resume carries image context to a successor without reusing bytes", async () => {
+  const events = new Map([
+    [RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH, runId: RUN_ID,
+    })],
+    [SECOND_RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH, runId: SECOND_RUN_ID,
+    })],
+    [THIRD_RUN_ID, await verifiedEvent({
+      seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: THIRD_RUN_ID,
+    })],
+  ]);
+  const resumeCalls = [];
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const browser = harness({
+    agent: {
+      ...baseAgent(agentImageCapabilities()),
+      async createThread() { return { thread: agentThread() }; },
+      async startRun() { return { run: run("running") }; },
+      async resumeRun(runId, text, options) {
+        resumeCalls.push({ runId, text, options });
+        return { run: run("running", {
+          id: runId === RUN_ID ? SECOND_RUN_ID : THIRD_RUN_ID,
+          previousRunId: runId,
+        }) };
+      },
+      async *streamRunEvents({ runId }) {
+        const event = events.get(runId);
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+    async canonicalizeImage() {
+      return Object.freeze({
+        attachmentId: "image_corrected_0000001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 640,
+        height: 480,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl() { return "blob:agent-image-corrected"; },
+    revokeObjectUrl() {},
+  });
+  await browser.app.initialize();
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "correct.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  const input = browser.document.getElementById("message-input");
+  input.value = "Inspect this image";
+  await browser.app.submitMessage({ preventDefault() {} });
+  input.value = "Use the upper-left region instead";
+  await browser.app.resume();
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+  await browser.app.resume();
+
+  assert.deepEqual(
+    resumeCalls.map(({ runId, text }) => ({ runId, text })),
+    [
+      { runId: RUN_ID, text: "Use the upper-left region instead" },
+      { runId: SECOND_RUN_ID, text: undefined },
+    ],
+  );
+  assert.equal(Object.hasOwn(resumeCalls[0].options, "reuseAttachments"), false);
+  assert.equal(resumeCalls[1].options.reuseAttachments, true);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("hydrated active image context survives pruned descriptors only for the proven head", async () => {
+  const failed = await verifiedEvent({
+    seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH, runId: SECOND_RUN_ID,
+  });
+  const completed = await verifiedEvent({
+    seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: THIRD_RUN_ID,
+  });
+  const thread = agentThread({
+    lastRunId: SECOND_RUN_ID,
+    activeImageContext: true,
+    replay: { prunedMessageCount: 2, anchorDigest: "c".repeat(64) },
+    messages: [
+      { id: "msg_pruned_image_context", role: "user", content: "Continue from the retained image", runId: SECOND_RUN_ID },
+    ],
+  });
+  let resumeOptions;
+  const browser = harness({
+    agent: {
+      ...baseAgent(agentImageCapabilities()),
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { thread }; },
+      async runStatus() {
+        return { run: terminalRun("failed", [failed], {
+          id: SECOND_RUN_ID,
+          previousRunId: RUN_ID,
+        }) };
+      },
+      async resumeRun(runId, text, options) {
+        resumeOptions = options;
+        assert.equal(runId, SECOND_RUN_ID);
+        assert.equal(text, undefined);
+        return { run: run("running", { id: THIRD_RUN_ID, previousRunId: SECOND_RUN_ID }) };
+      },
+      async *streamRunEvents({ runId }) {
+        const event = runId === SECOND_RUN_ID ? failed : completed;
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+  });
+  await browser.app.initialize();
+  assert.equal(thread.messages.some((message) => message.attachments !== undefined), false,
+    "the retained image descriptors are outside this replay suffix");
+  await browser.app.resume();
+  assert.equal(resumeOptions.reuseAttachments, true);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("absent or false Agent image-context proof never enables empty Resume reuse", async () => {
+  for (const activeImageContext of [undefined, false]) {
+    const failed = await verifiedEvent({
+      seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH, runId: RUN_ID,
+    });
+    const completed = await verifiedEvent({
+      seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: SECOND_RUN_ID,
+    });
+    const thread = agentThread({
+      lastRunId: RUN_ID,
+      ...(activeImageContext === undefined ? {} : { activeImageContext }),
+      messages: [
+        { id: "msg_inactive_context_head", role: "user", content: "A plain failed task", runId: RUN_ID },
+      ],
+    });
+    let resumeOptions;
+    const browser = harness({
+      agent: {
+        ...baseAgent(agentImageCapabilities()),
+        async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+        async getThread() { return { thread }; },
+        async runStatus() { return { run: terminalRun("failed", [failed]) }; },
+        async resumeRun(runId, text, options) {
+          resumeOptions = options;
+          return { run: run("running", { id: SECOND_RUN_ID, previousRunId: runId }) };
+        },
+        async *streamRunEvents({ runId }) {
+          const event = runId === RUN_ID ? failed : completed;
+          yield { event, cursor: { seq: event.seq, hash: event.hash } };
+        },
+      },
+    });
+    await browser.app.initialize();
+    await browser.app.resume();
+    assert.equal(Object.hasOwn(resumeOptions, "reuseAttachments"), false,
+      `${activeImageContext === undefined ? "absent" : "false"} proof remains fail closed`);
+  }
+});
+
+test("Agent image context does not leak when another thread becomes the view owner", async () => {
+  const firstCompleted = await verifiedEvent({
+    seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH, runId: RUN_ID,
+  });
+  const secondFailed = await verifiedEvent({
+    seq: 1, type: "run.failed", payload: {}, previousHash: ZERO_HASH,
+    runId: SECOND_RUN_ID, threadId: OTHER_THREAD_ID,
+  });
+  const resumedCompleted = await verifiedEvent({
+    seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH,
+    runId: THIRD_RUN_ID, threadId: OTHER_THREAD_ID,
+  });
+  const imageThread = agentThread({
+    activeImageContext: true,
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_image_owner_thread", role: "user", content: "Image context owner", runId: RUN_ID },
+    ],
+  });
+  const plainThread = agentThread({
+    id: OTHER_THREAD_ID,
+    title: "Plain thread",
+    lastRunId: SECOND_RUN_ID,
+    messages: [
+      { id: "msg_plain_other_thread", role: "user", content: "Plain failed task", runId: SECOND_RUN_ID },
+    ],
+  });
+  let resumeOptions;
+  const browser = harness({
+    agent: {
+      ...baseAgent(agentImageCapabilities()),
+      async listThreads() {
+        return { schemaVersion: "1", threads: [imageThread, plainThread], nextBefore: null };
+      },
+      async getThread(threadId) {
+        return { thread: threadId === THREAD_ID ? imageThread : plainThread };
+      },
+      async runStatus(runId) {
+        return runId === RUN_ID
+          ? { run: terminalRun("completed", [firstCompleted]) }
+          : { run: terminalRun("failed", [secondFailed], {
+              id: SECOND_RUN_ID,
+              threadId: OTHER_THREAD_ID,
+              previousRunId: null,
+            }) };
+      },
+      async resumeRun(runId, text, options) {
+        resumeOptions = options;
+        return { run: run("running", {
+          id: THIRD_RUN_ID,
+          threadId: OTHER_THREAD_ID,
+          previousRunId: runId,
+        }) };
+      },
+      async *streamRunEvents({ runId }) {
+        const event = runId === RUN_ID
+          ? firstCompleted
+          : (runId === SECOND_RUN_ID ? secondFailed : resumedCompleted);
+        yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+  });
+  await browser.app.initialize();
+  await browser.app.openThread(OTHER_THREAD_ID);
+  await browser.app.resume();
+  assert.equal(Object.hasOwn(resumeOptions, "reuseAttachments"), false);
 });
 
 test("Agent history replays retained image descriptors without browser bytes or a Chat attachment read", async () => {

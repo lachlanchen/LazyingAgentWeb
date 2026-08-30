@@ -709,6 +709,36 @@ test("persisted Agent messages cannot make a pristine thread replay or restart",
   }), /only Agent user messages/u);
 });
 
+test("Agent thread image-context proof is optional, boolean, and requires an exact head run", () => {
+  const absent = validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({ lastRunId: RUN_ID }),
+  }).thread;
+  const inactive = validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({ lastRunId: RUN_ID, activeImageContext: false }),
+  }).thread;
+  const active = validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({ lastRunId: RUN_ID, activeImageContext: true }),
+  }).thread;
+
+  assert.equal(absent.activeImageContext, false, "an older backend response normalizes fail closed");
+  assert.equal(inactive.activeImageContext, false);
+  assert.equal(active.activeImageContext, true);
+  for (const thread of [
+    publicThread({ activeImageContext: true }),
+    publicThread({ lastRunId: RUN_ID, activeImageContext: "true" }),
+    publicThread({ lastRunId: RUN_ID, activeImageContext: 1 }),
+    publicThread({ lastRunId: RUN_ID, activeImageContext: null }),
+  ]) {
+    assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+      schemaVersion: "1",
+      thread,
+    }), /active image context/u);
+  }
+});
+
 test("thread replay ancestry accepts one exact chain and one proven omitted prefix", () => {
   const message = (runId, index) => ({
     id: `msg_lineage_${String(index).padStart(16, "0")}`,

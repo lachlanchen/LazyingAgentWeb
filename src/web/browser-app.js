@@ -1258,7 +1258,8 @@ export function createBrowserApp({
     presentation: null,
     assistantNode: null,
     agentRunMessages: new Map(),
-    agentImageRunIds: new Set(),
+    agentImageContextThreadId: null,
+    agentImageContextRunId: null,
     agentHistoryRestoring: false,
     agentReplayValidating: false,
     agentReplayFailed: false,
@@ -1895,6 +1896,26 @@ export function createBrowserApp({
     return state.mode === "agent" ? state.agentThreadId : state.chatThreadId;
   }
 
+  function resetAgentImageContext() {
+    state.agentImageContextThreadId = null;
+    state.agentImageContextRunId = null;
+  }
+
+  function bindAgentImageContext(threadId, runId, active = false) {
+    resetAgentImageContext();
+    if (active !== true || state.mode !== "agent" || state.agentThreadId !== threadId
+        || typeof threadId !== "string" || typeof runId !== "string") return;
+    state.agentImageContextThreadId = threadId;
+    state.agentImageContextRunId = runId;
+  }
+
+  function agentRunHasImageContext(threadId, runId) {
+    return state.mode === "agent" && state.agentThreadId === threadId
+      && typeof threadId === "string" && typeof runId === "string"
+      && state.agentImageContextThreadId === threadId
+      && state.agentImageContextRunId === runId;
+  }
+
   function agentRecoveryThreadRetryAllowed(threadId) {
     if (state.mode !== "agent" || !state.agentSearchRecoveryChoicePending
         || !state.agentReplayFailed) return false;
@@ -1954,6 +1975,7 @@ export function createBrowserApp({
     }
     if (changed) {
       clearAgentReconnect();
+      resetAgentImageContext();
       state.viewEpoch += 1;
       state.streamAbort?.abort();
       state.agentSearchSelected = false;
@@ -2206,7 +2228,7 @@ export function createBrowserApp({
     state.presentation = null;
     state.assistantNode = null;
     state.agentRunMessages.clear();
-    state.agentImageRunIds.clear();
+    resetAgentImageContext();
     state.agentHistoryRestoring = false;
     state.agentReplayValidating = false;
     state.agentReplayOfferResume = true;
@@ -2366,10 +2388,6 @@ export function createBrowserApp({
       && state.mode === "chat" && typeof threadId === "string";
     const retainedAgentImages = localImages.length === 0 && storedImages.length > 0
       && state.mode === "agent" && typeof runId === "string";
-    if (role === "user" && state.mode === "agent" && typeof runId === "string"
-        && displayImages.length > 0 && (localImages.length > 0 || retainedAgentImages)) {
-      state.agentImageRunIds.add(runId);
-    }
     if (role === "user" && displayImages.length > 0
         && (localImages.length > 0 || storedChatImages || retainedAgentImages)) {
       const gallery = displayImages.length > 1 ? document.createElement("div") : null;
@@ -2909,6 +2927,7 @@ export function createBrowserApp({
       state.agentThreadId = thread.id;
       state.runId = null;
       state.agentRunStatus = null;
+      bindAgentImageContext(thread.id, thread.lastRunId, thread.activeImageContext);
       elements.conversation_title.textContent = thread.title;
       const persistedAssistantRuns = new Set(
         thread.messages.filter((message) => message.role === "assistant").map((message) => message.runId),
@@ -2972,6 +2991,7 @@ export function createBrowserApp({
       state.agentReplayValidating = false;
       state.agentReplayFailed = true;
       state.agentReplayOfferResume = false;
+      resetAgentImageContext();
       elements.resume_run.hidden = true;
       showToast("Verified Agent history could not be restored safely. Reopen this conversation to retry; no run was resumed.");
       return false;
@@ -4489,6 +4509,8 @@ export function createBrowserApp({
         code: "AGENT_RUN_ACTIVE",
       });
     }
+    const inheritsImageContext = attachments.length > 0
+      || agentRunHasImageContext(threadId, previousRunId);
     const idempotency = createBrowserOpaqueId(previousRunId === null ? "agent_start" : "agent_followup");
     const options = {
       idempotency,
@@ -4503,6 +4525,7 @@ export function createBrowserApp({
     const accepted = previousRunId === null
       ? correlatedAgentRun(run, { runId: run?.id, threadId })
       : correlatedResumedAgentRun(run, { previousRunId, threadId });
+    bindAgentImageContext(threadId, accepted.id, inheritsImageContext);
     if (search !== undefined) {
       state.agentSearchSelected = false;
       updateSearchControl();
@@ -6039,6 +6062,7 @@ export function createBrowserApp({
               return;
             }
           }
+          const inheritsImageContext = agentRunHasImageContext(requestedThreadId, requestedRunId);
           resumeTicket = Object.freeze({
             session: requestedSession,
             agent: requestedAgent,
@@ -6048,7 +6072,8 @@ export function createBrowserApp({
             draft,
             text,
             search,
-            reuseAttachments: text === undefined && state.agentImageRunIds.has(requestedRunId),
+            inheritsImageContext,
+            reuseAttachments: text === undefined && inheritsImageContext,
             idempotency: createBrowserOpaqueId("agent_resume"),
           });
           state.agentPendingResume = resumeTicket;
@@ -6086,6 +6111,11 @@ export function createBrowserApp({
           previousRunId: requestedRunId,
           threadId: requestedThreadId,
         });
+        bindAgentImageContext(
+          requestedThreadId,
+          resumedRun.id,
+          resumeTicket.inheritsImageContext,
+        );
         agentResumeAmbiguities.delete(resumeTicket);
         if (state.agentPendingResume === resumeTicket) state.agentPendingResume = null;
         if (resumeTicket.text !== undefined) {

@@ -1133,7 +1133,7 @@ function publicMessage(value, index) {
 export function validateThread(value) {
   const thread = exact(
     value,
-    ["id", "title", "status", "revision", "createdAt", "updatedAt", "lastRunId", "authority", "replay", "messages"],
+    ["id", "title", "status", "revision", "createdAt", "updatedAt", "lastRunId", "activeImageContext", "authority", "replay", "messages"],
     "thread",
     ["id", "title", "status", "revision", "createdAt", "updatedAt", "lastRunId", "authority", "replay"],
   );
@@ -1185,6 +1185,12 @@ export function validateThread(value) {
   if (lastRunId === null && prunedMessageCount !== 0) {
     invalid("a pristine thread cannot declare a pruned replay prefix");
   }
+  const activeImageContext = thread.activeImageContext === undefined
+    ? false
+    : thread.activeImageContext;
+  if (typeof activeImageContext !== "boolean" || (activeImageContext && lastRunId === null)) {
+    invalid("thread active image context is invalid");
+  }
   return Object.freeze({
     id: validateThreadId(thread.id),
     title: title(thread.title),
@@ -1193,6 +1199,7 @@ export function validateThread(value) {
     createdAt: timestamp(thread.createdAt, "thread createdAt"),
     updatedAt: timestamp(thread.updatedAt, "thread updatedAt"),
     lastRunId,
+    activeImageContext,
     authority: Object.freeze({
       kind: "aginti",
       mapped: authority.mapped,

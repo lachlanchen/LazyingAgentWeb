@@ -1211,11 +1211,18 @@ test('keys login rate admission by the Caddy-asserted client address instead of 
   assert.equal(independent.response.status, 200);
 });
 
-test('keeps Agent mode disabled and passes only server-derived adapter context', async (t) => {
+test('keeps Agent mode disabled, forwards ambiguous image retries, and passes only server-derived adapter context', async (t) => {
   const contexts = [];
   const adapter = {
     async rpc(path, body, context) {
       contexts.push({ path, body, context });
+      if (path === '/agent/v1/runs/start' || path === '/agent/v1/runs/resume') {
+        throw new AgintiAdapterError('new image mutation rejected while the gate is off', {
+          code: 'AGINTI_UPSTREAM_REJECTED',
+          statusCode: 409,
+          retryable: false
+        });
+      }
       return {
         schemaVersion: '1',
         enabled: false,
@@ -1264,15 +1271,20 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
     }
   }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000002' });
   assert.equal(forgedImage.status, 409);
-  assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/start'), false, 'disabled image input never reaches AgInTi');
+  assert.equal(contexts.filter(({ path }) => path === '/agent/v1/runs/start').length, 1,
+    'an idempotent image request reaches AgInTi so an existing receipt can be replayed');
+  assert.equal(contexts.find(({ path }) => path === '/agent/v1/runs/start').context.idempotencyKey,
+    'browser-action-00000002');
 
   const forgedRetainedImageRetry = await post(baseUrl, '/api/transport/agent/v1/runs/resume', {
     runId: 'run_00000000-0000-4000-8000-000000000000',
     reuseAttachments: true
   }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000003' });
   assert.equal(forgedRetainedImageRetry.status, 409);
-  assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/resume'), false,
-    'disabled retained image input never reaches AgInTi');
+  assert.equal(contexts.filter(({ path }) => path === '/agent/v1/runs/resume').length, 1,
+    'an idempotent retained-image retry reaches AgInTi so an existing receipt can be replayed');
+  assert.equal(contexts.find(({ path }) => path === '/agent/v1/runs/resume').context.idempotencyKey,
+    'browser-action-00000003');
 
   const unavailableState = testState(t);
   const unavailable = await unavailableState.start();
@@ -1389,6 +1401,115 @@ test('preflights negotiated Agent Search and image input and forwards one exact 
     assert.equal(direct.status, 404);
   }
   assert.equal(calls.length, beforeInvalid);
+});
+
+test('forwards an exact Agent image receipt replay after the attachment gate closes and rejects a new key upstream', async (t) => {
+  const threadId = 'thr_87654321-4321-4321-8321-cba987654321';
+  const runId = 'run_87654321-4321-4321-8321-cba987654321';
+  const receipts = new Map();
+  const calls = [];
+  let attachmentGate = true;
+  let mutations = 0;
+  const capability = () => ({
+    schemaVersion: '1',
+    enabled: true,
+    agent: { kind: 'aginti', label: 'AgInTi Agent' },
+    model: { label: 'LocalLLM' },
+    actions: { cancel: true, resume: true, retry: false },
+    attachments: attachmentGate ? {
+      enabled: true,
+      transport: 'inline-base64',
+      acceptedMediaTypes: ['image/png', 'image/jpeg'],
+      maximumCount: 4,
+      maximumBytesEach: 4 * 1024 * 1024,
+      maximumBytesTotal: 16 * 1024 * 1024,
+      requestTimeoutMs: 515_000,
+      model: 'localllm-vision',
+      persistence: 'retained-reference-v1'
+    } : { enabled: false },
+    artifacts: { kinds: ['plot', 'table', 'markdown', 'file'], schemaVersion: '1' }
+  });
+  const accepted = {
+    schemaVersion: '1',
+    run: {
+      id: runId,
+      threadId,
+      previousRunId: null,
+      status: 'starting',
+      createdAt: '2026-08-30T02:00:00.000Z',
+      startedAt: null,
+      completedAt: null,
+      cancelRequestedAt: null,
+      output: '',
+      error: null,
+      authority: { kind: 'aginti', snapshotHash: null, runtimeRevision: null, contextDigest: null },
+      eventCursor: { firstSeq: 1, lastSeq: 0, lastHash: '0'.repeat(64), prunedThroughSeq: 0 }
+    }
+  };
+  const adapter = {
+    async capabilities(context) {
+      calls.push({ path: '/agent/v1/capabilities', context });
+      return capability();
+    },
+    async rpc(path, body, context) {
+      calls.push({ path, body, context });
+      assert.equal(path, '/agent/v1/runs/start');
+      const receipt = receipts.get(context.idempotencyKey);
+      if (receipt !== undefined) return receipt;
+      if (!attachmentGate) {
+        throw new AgintiAdapterError('new image mutation rejected while the gate is off', {
+          code: 'AGINTI_UPSTREAM_REJECTED',
+          statusCode: 409,
+          retryable: false
+        });
+      }
+      mutations += 1;
+      receipts.set(context.idempotencyKey, accepted);
+      return accepted;
+    }
+  };
+  const state = testState(t, { adapter });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const body = {
+    threadId,
+    input: {
+      text: 'Inspect this image once',
+      attachments: [{
+        attachmentId: 'image_0000000000000001',
+        mediaType: 'image/png',
+        data: 'iVBORw0KGgoAAAANSUhEUg=='
+      }]
+    }
+  };
+  const receiptKey = 'browser-action-image-receipt-0001';
+  const first = await post(baseUrl, '/api/transport/agent/v1/runs/start', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: receiptKey
+  });
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  attachmentGate = false;
+
+  const replay = await post(baseUrl, '/api/transport/agent/v1/runs/start', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: receiptKey
+  });
+  assert.equal(replay.status, 200);
+  assert.deepEqual(await replay.json(), firstBody);
+  assert.equal(mutations, 1, 'the gate-off replay resolves the stored receipt without a second mutation');
+
+  const rejected = await post(baseUrl, '/api/transport/agent/v1/runs/start', body, {
+    cookie: auth.cookie,
+    csrf: auth.csrf,
+    idempotency: 'browser-action-image-receipt-0002'
+  });
+  assert.equal(rejected.status, 409);
+  assert.equal(mutations, 1, 'a new gate-off key is rejected by AgInTi before mutation');
+  assert.deepEqual(calls.filter(({ path }) => path === '/agent/v1/runs/start')
+    .map(({ context }) => context.idempotencyKey), [receiptKey, receiptKey, 'browser-action-image-receipt-0002']);
 });
 
 test('primes a legacy Agent scope once and preserves list, get, continue, idempotency, and artifacts across logins', async (t) => {

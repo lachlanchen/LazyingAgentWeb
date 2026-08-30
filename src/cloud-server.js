@@ -2060,10 +2060,12 @@ export function createCloudRequestHandler({
           || requestedSearch.limit > capability.search.maximumSources)) {
         throw new CloudHttpError(409, 'agent_search_unavailable', 'AgInTi Search is not enabled for this session.');
       }
-      if ((requestedAttachments !== undefined || reusingAttachments)
-          && (capability.enabled !== true || capability.attachments?.enabled !== true)) {
-        throw new CloudHttpError(409, 'agent_attachments_unavailable', 'AgInTi image input is not enabled for this session.');
-      }
+      // The advertised attachment gate controls creation in the browser and
+      // in AgInTi, but it must not become a transport gate here. A response
+      // can be lost after AgInTi durably accepts an idempotent image mutation;
+      // the same request then has to reach AgInTi even after vision is turned
+      // off so its stored receipt can resolve the ambiguity. AgInTi remains
+      // responsible for rejecting a genuinely new key before any state write.
     }
     if (nativePath === AGINTI_RPC_PATHS.runsEvents) {
       const streamDeadline = deadlineSignal(requestSignal, limits.sseLifetimeMs, 'Agent event stream reached its reconnect boundary');

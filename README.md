@@ -30,6 +30,11 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > image questions can continue after reload without leaking context to another
 > conversation. Production Agent images remain disabled until the matching
 > retained-image backend and its durable-state floor are separately accepted.
+> The v0.1.57 candidate also keeps the attachment capability as a browser
+> creation gate instead of a receipt-transport gate. An exact idempotent image
+> request can therefore reach the attachment-aware backend after vision is
+> disabled and resolve a response-loss ambiguity, while the backend rejects a
+> genuinely new key before mutation.
 > Direct Chat remembers the user's non-private workspace-mode preference across
 > a full reload, while
 > confirmed sign-out fences stale history reads. The accepted v0.1.23 release also

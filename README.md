@@ -4,9 +4,9 @@
 `llm.lazying.art`. It provides a usable browser chat surface while keeping
 AgInTi, LocalLLM, and LazyEdge independently replaceable.
 
-> **Deployment status (v0.1.56 candidate; v0.1.55 production):** `llm.lazying.art`
+> **Deployment status (v0.1.56 production):** `llm.lazying.art`
 > currently serves
-> `release-f8a4813ae91fa2bd77fcdd6acd9825b0bf7d124f14b9897a68d9157d92cd8b17`.
+> `release-4bd06beda0b15b6655f772ff39ee38dd75e42380c9d19ae055cf1ddb249199a6`.
 > Production is promoted
 > independently from repository commits, with immutable acceptance receipts and
 > a verified rollback release. The current deployment enables AgInTi Agent only
@@ -19,12 +19,12 @@ AgInTi, LocalLLM, and LazyEdge independently replaceable.
 > completed Agent conversations truly multi-turn: later prompts resume the exact
 > terminal predecessor, retry an uncertain mutation once with the same idempotency
 > key, and keep any rejected prompt editable without an optimistic duplicate.
-> The accepted v0.1.55 release keeps the verified Agent thread immediately usable after
+> The accepted v0.1.56 release keeps the verified Agent thread immediately usable after
 > a definitive pre-run rejection, while ambiguous transport failures remain
 > fenced for reconciliation. It also removes redundant full-image validation
 > passes immediately before an iPhone upload without weakening validation of
 > caller-supplied or cloned requests.
-> The v0.1.56 candidate adds capability-gated Agent input for one to four ordered
+> v0.1.56 adds capability-gated Agent input for one to four ordered
 > PNG/JPEG images, a slow-upload deadline that does not slow ordinary messages,
 > exact same-idempotency image retry, and current-thread image-context proof so
 > image questions can continue after reload without leaking context to another

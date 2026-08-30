@@ -828,14 +828,25 @@ async function currentV3AgentDraftHandoff({
   };
 }
 
-function enabledAgentPwaCapability() {
+function enabledAgentPwaCapability({ imageInput = false } = {}) {
   return Object.freeze({
     schemaVersion: "1",
     enabled: true,
     agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
     model: Object.freeze({ label: "LocalLLM" }),
     actions: Object.freeze({ cancel: true, resume: true, retry: false }),
-    attachments: Object.freeze({ enabled: false }),
+    attachments: imageInput
+      ? Object.freeze({
+          enabled: true,
+          transport: "inline-base64",
+          acceptedMediaTypes: Object.freeze(["image/png", "image/jpeg"]),
+          maximumCount: 4,
+          maximumBytesEach: 4 * 1024 * 1024,
+          maximumBytesTotal: 16 * 1024 * 1024,
+          model: "localllm-vision",
+          persistence: "retained-reference-v1",
+        })
+      : Object.freeze({ enabled: false }),
     search: Object.freeze({
       enabled: true,
       modes: Object.freeze(["web", "papers", "both"]),
@@ -1107,6 +1118,28 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) auto;[^}]*padding:[^;}]*max\(\.6rem, env\(safe-area-inset-bottom\)\);/u,
   );
   assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
+});
+
+test("the iPhone multi-image composer and retained Agent gallery cannot overlap their controls", () => {
+  const previewRule = /\.image-preview \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const labelRule = /\.image-preview span \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const removeRule = /\.image-preview button \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  const retainedRule = /\.message-attachment-retained \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
+  assert.ok(previewRule && labelRule && removeRule && retainedRule);
+  assert.match(previewRule[1], /min-width:\s*0;/u);
+  assert.match(labelRule[1], /min-width:\s*0;/u);
+  assert.match(labelRule[1], /flex:\s*1 1 auto;/u);
+  assert.match(labelRule[1], /text-overflow:\s*ellipsis;/u);
+  assert.match(removeRule[1], /min-height:\s*44px;/u);
+  assert.match(removeRule[1], /flex:\s*0 0 auto;/u);
+  assert.match(retainedRule[1], /overflow-wrap:\s*anywhere;/u);
+
+  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
+  const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
+  assert.match(mobileCss, /\.composer > \.image-button, \.composer > \.image-preview, \.composer > \.search-controls \{ grid-column: 1 \/ -1; \}/u);
+  assert.match(mobileCss, /\.image-preview \{ max-width: 100%; \}/u);
+  assert.match(mobileCss, /\.message-attachments \{ grid-template-columns: minmax\(0, 1fr\); \}/u);
 });
 
 test("mobile sidebar and send controls expose comfortable touch targets", () => {
@@ -5695,6 +5728,85 @@ test("an explicit release mismatch hard-refreshes by exact version and restores 
   assert.match(restored.document.getElementById("image-preview-label").textContent, /2 images/u);
   assert.equal(store.records.size, 0);
   assert.deepEqual(restoredClients.mutationCalls, { prepareThread: 0, createThread: 0, startRun: 0 });
+});
+
+test("a versioned iPhone update encrypts and restores an unsent Agent multi-image draft without mutation", async () => {
+  const capability = enabledAgentPwaCapability({ imageInput: true });
+  const agentMutations = { createThread: 0, startRun: 0 };
+  const makeAgent = () => ({
+    async capabilities() { return capability; },
+    async listThreads() { return { schemaVersion: "1", threads: [], nextBefore: null }; },
+    async createThread() { agentMutations.createThread += 1; throw new Error("update recovery must not create"); },
+    async startRun() { agentMutations.startRun += 1; throw new Error("update recovery must not send"); },
+    async *streamRunEvents() {},
+  });
+  const store = memoryUpdateHandoffStore();
+  const environment = updateEnvironment();
+  const bytes = canonicalPngHeader();
+  let imageSerial = 0;
+  const source = updateControllerHarness({
+    environment,
+    now: () => 31_000,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: makeAgent(),
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+    async canonicalizeImage() {
+      imageSerial += 1;
+      return Object.freeze({
+        attachmentId: `image_agent_update_000000${imageSerial}`,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 64,
+        height: 64,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: () => `blob:agent-source-${imageSerial}`,
+    revokeObjectUrl() {},
+  });
+  await source.app.initialize();
+  assert.equal(source.document.getElementById("workspace").dataset.mode, "agent");
+  const imageInput = source.document.getElementById("image-input");
+  imageInput.files = [{ name: "IMG_1001.HEIC" }, { name: "IMG_1002.HEIC" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  source.document.getElementById("message-input").value = "Compare these two unsent Agent images";
+  source.document.getElementById("apply-update").dispatch("click");
+  await store.saved;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(environment.workerMessages, [{ type: "SKIP_WAITING" }]);
+  assert.equal(store.records.size, 1);
+  assert.doesNotMatch(JSON.stringify([...store.records.values()][0]), /Compare these two|image_agent_update/u);
+
+  environment.registration.waiting = null;
+  environment.transitionController(NEXT_RELEASE);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(source.replacements.length, 1);
+
+  let restoredUrls = 0;
+  const restored = updateControllerHarness({
+    waiting: false,
+    environment: updateEnvironment({ waiting: false, activeReleaseId: NEXT_RELEASE }),
+    releaseId: NEXT_RELEASE,
+    locationHref: source.replacements[0],
+    now: () => 31_001,
+    restore: async () => ({ authenticated: true, username: "account-user", csrfToken: "csrf-token-value-long-enough" }),
+    agent: makeAgent(),
+    chat: idleAuthenticatedPwaClients().chat,
+    updateHandoffStore: store,
+    createObjectUrl: () => { restoredUrls += 1; return `blob:agent-restored-${restoredUrls}`; },
+    revokeObjectUrl() {},
+  });
+  await restored.app.initialize();
+  assert.equal(restored.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(restored.document.getElementById("message-input").value, "Compare these two unsent Agent images");
+  assert.match(restored.document.getElementById("image-preview-label").textContent, /2 images/u);
+  assert.equal(restored.document.getElementById("image-preview-thumbnail").src, "blob:agent-restored-1");
+  assert.equal(restored.document.getElementById("add-image").hidden, false);
+  assert.deepEqual(agentMutations, { createThread: 0, startRun: 0 });
+  assert.equal(store.records.size, 0);
 });
 
 test("corrupt, oversized, foreign-release, and foreign-account update handoffs are deleted and rejected", async (t) => {

@@ -2,6 +2,7 @@ import { AgintiBrowserClient, AgintiTransportError, selectDefaultMode } from "./
 import {
   AgintiProtocolError,
   FAIL_CLOSED_AGENT_CAPABILITIES,
+  prepareAgentImageAttachments,
   validateAgentCapabilities,
   validateAgentSearch,
   validateThreadRunAncestry,
@@ -449,7 +450,6 @@ async function validateUpdateHandoff(value, {
   if (!draft && images.length === 0 && !(current && record.threadId !== null)) {
     throw new TypeError("update handoff is empty");
   }
-  if (mode === "agent" && images.length !== 0) throw new TypeError("Agent update handoff cannot contain images");
   const search = current && record.search !== null ? validateAgentSearch(record.search) : null;
   if (search !== null && mode !== "agent") throw new TypeError("update handoff search mode is invalid");
   const accountDigest = await updateHandoffDigest(updateHandoffEncoder.encode(
@@ -1450,6 +1450,30 @@ export function createBrowserApp({
     elements.login_error.hidden = true;
   }
 
+  function agentImageInputAvailable(capability = state.capabilities) {
+    return capability?.enabled === true
+      && capability.attachments?.enabled === true;
+  }
+
+  function imageInputAvailable(mode = state.mode, {
+    agentCapability = state.capabilities,
+    chatCapability = state.chatCapabilities,
+  } = {}) {
+    if (mode === "agent") return agentImageInputAvailable(agentCapability);
+    return mode === "chat" && chatCapability?.visionInput === true;
+  }
+
+  function imagesSupportedInMode(images, mode = state.mode, capabilities = {}) {
+    if (!Array.isArray(images)) return false;
+    if (!imageInputAvailable(mode, capabilities)) return images.length === 0;
+    const agentCapability = capabilities.agentCapability ?? state.capabilities;
+    const chatCapability = capabilities.chatCapability ?? state.chatCapabilities;
+    const accepted = mode === "agent"
+      ? agentCapability.attachments.acceptedMediaTypes
+      : chatCapability.visionMediaTypes;
+    return images.every((image) => accepted.includes(image?.mediaType));
+  }
+
   function captureChatReadRecovery({
     threadId = state.chatThreadId ?? state.chatGeneration?.threadId ?? null,
     generationId = state.chatGeneration?.generationId ?? null,
@@ -1478,6 +1502,7 @@ export function createBrowserApp({
       return Object.freeze({
         threadId: retained.threadId,
         draft: retained.draft,
+        images: state.selectedImages,
         search: retained.search,
         searchInvalid: false,
       });
@@ -1491,6 +1516,7 @@ export function createBrowserApp({
     return Object.freeze({
       threadId: typeof state.agentThreadId === "string" ? state.agentThreadId : null,
       draft: String(elements.message_input.value ?? ""),
+      images: state.selectedImages,
       search,
       searchInvalid,
     });
@@ -1521,6 +1547,7 @@ export function createBrowserApp({
           threadId: legacyDestinationThreadId,
           draft: state.retainedUpdateRecoveryRecord?.draft
             ?? String(elements.message_input.value ?? ""),
+          images: state.selectedImages,
           search: legacySearch,
           searchInvalid: legacySearchInvalid,
         })
@@ -1698,7 +1725,7 @@ export function createBrowserApp({
 
   function restoreDetachedImage(detached) {
     if (!detached || state.selectedImages.length !== 0 || !state.session.authenticated
-        || state.mode !== "chat" || state.chatCapabilities.visionInput !== true) {
+        || !imagesSupportedInMode(detached.selected)) {
       disposeDetachedImage(detached);
       return false;
     }
@@ -1744,20 +1771,23 @@ export function createBrowserApp({
     if (state.mode === "agent" && state.capabilities.enabled === true) {
       const fileCreation = state.capabilities.artifacts.kinds.includes("file");
       const search = state.capabilities.search?.enabled === true;
+      const imageInput = agentImageInputAvailable();
       const additions = [
+        ...(imageInput ? ["up to four images"] : []),
         ...(fileCreation ? ["TeX/PDF files"] : []),
         ...(search ? ["optional web/paper Search"] : []),
       ];
       const unavailable = [
-        "image input",
+        ...(!imageInput ? ["image input"] : []),
         ...(!fileCreation ? ["file creation"] : []),
         ...(!search ? ["web search"] : []),
       ];
-      elements.capability_note.textContent = [
+      const parts = [
         "Agent · bounded Python 3.12 standard library · plots/tables/Markdown",
         ...additions,
-        `no ${unavailable.join(", ")}`,
-      ].join(" · ") + ".";
+        ...(unavailable.length === 0 ? [] : [`no ${unavailable.join(", ")}`]),
+      ];
+      elements.capability_note.textContent = parts.join(" · ") + ".";
       return;
     }
     const input = state.chatCapabilities.visionInput === true ? "text + up to four images" : "text only";
@@ -1793,8 +1823,7 @@ export function createBrowserApp({
   }
 
   function updateImageControl() {
-    const available = state.session.authenticated && state.mode === "chat"
-      && state.chatCapabilities.visionInput === true;
+    const available = state.session.authenticated && imageInputAvailable();
     const pendingChatSend = state.mode === "chat" && state.chatPendingSend !== null;
     const pendingChatDeletion = state.mode === "chat" && state.chatPendingDeletion !== null;
     const pendingAgentDeletion = state.mode === "agent" && state.agentPendingDeletion !== null;
@@ -1815,9 +1844,10 @@ export function createBrowserApp({
       state.imagePreparing ? "Preparing images…" : "Add images",
     );
     elements.add_image.disabled = !available || locked || state.imagePreparing || pendingChatSend || pendingChatDeletion
+      || pendingAgentDeletion || agentDispatchFenced
       || state.selectedImages.length >= COMPOSER_IMAGE_COUNT_LIMIT;
     elements.remove_image.disabled = (!available && !preservingAuthenticationDraft) || locked || pendingChatSend
-      || pendingChatDeletion
+      || pendingChatDeletion || pendingAgentDeletion
       || (state.selectedImages.length === 0 && !state.imagePreparing);
     elements.message_input.disabled = !state.session.authenticated || (locked && !pendingAgentResume)
       || state.imagePreparing || pendingChatSend
@@ -1833,10 +1863,11 @@ export function createBrowserApp({
     elements.new_thread.disabled = !state.session.authenticated || locked || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft;
+    const imageModeLocked = state.imagePreparing || state.selectedImages.length > 0;
     elements.agent_mode.disabled = !state.session.authenticated || !state.capabilities.enabled || locked
-      || pendingChatDeletion || pendingAgentDeletion || preservingAuthenticationDraft;
+      || pendingChatDeletion || pendingAgentDeletion || preservingAuthenticationDraft || imageModeLocked;
     elements.chat_mode.disabled = !state.session.authenticated || locked || pendingChatDeletion
-      || pendingAgentDeletion
+      || pendingAgentDeletion || imageModeLocked
       || preservingAuthenticationDraft;
     elements.composer.setAttribute("aria-busy", locked || state.imagePreparing || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
@@ -1882,6 +1913,14 @@ export function createBrowserApp({
     const nextMode = mode === "agent" && (agentAvailable || allowUnavailableAgentRecovery) ? "agent" : "chat";
     const changed = nextMode !== state.mode;
     if (changed && interactionLocked()) return;
+    if (changed && state.imagePreparing) cancelImagePreparation();
+    if (changed && state.selectedImages.length > 0
+        && !allowUnavailableAgentRecovery && !allowRetainedUpdateRecovery
+        && !allowAgentAuthenticationRecovery) {
+      showToast("Remove the selected images before changing conversation modes; they remain unsent.");
+      updateImageControl();
+      return;
+    }
     if (changed && state.agentSearchRecoveryChoicePending
         && !allowRetainedUpdateRecovery && !allowAgentAuthenticationRecovery) {
       showToast("Confirm Search or No Search for the recovered Agent prompt before changing modes.");
@@ -2321,8 +2360,12 @@ export function createBrowserApp({
     const localImages = localAttachments ?? (localAttachment === undefined ? [] : [localAttachment]);
     const storedImages = attachments ?? (attachment === undefined ? [] : [attachment]);
     const displayImages = localImages.length > 0 ? localImages : storedImages;
+    const storedChatImages = localImages.length === 0 && storedImages.length > 0
+      && state.mode === "chat" && typeof threadId === "string";
+    const retainedAgentImages = localImages.length === 0 && storedImages.length > 0
+      && state.mode === "agent" && typeof runId === "string";
     if (role === "user" && displayImages.length > 0
-        && (localImages.length > 0 || (threadId && state.chat))) {
+        && (localImages.length > 0 || storedChatImages || retainedAgentImages)) {
       const gallery = displayImages.length > 1 ? document.createElement("div") : null;
       if (gallery !== null) {
         gallery.className = "message-attachments";
@@ -2333,6 +2376,15 @@ export function createBrowserApp({
         if (gallery !== null) {
           imageParent.className = "message-attachment-item";
           gallery.appendChild(imageParent);
+        }
+        if (retainedAgentImages) {
+          const retained = document.createElement("div");
+          retained.className = "message-attachment-retained";
+          const kind = displayedAttachment.mediaType === "image/png" ? "PNG" : "JPEG";
+          retained.textContent = `${displayImages.length === 1 ? "Image" : `Image ${index + 1}`} retained by Agent · ${kind} · ${displayedAttachment.width}×${displayedAttachment.height}`;
+          imageParent.appendChild(retained);
+          article.dataset.attachmentState = "retained";
+          continue;
         }
         const image = document.createElement("img");
         image.className = "message-attachment";
@@ -2864,7 +2916,10 @@ export function createBrowserApp({
         runs.filter((requested) => !requested.persisted).map((requested) => requested.runId)
       );
       thread.messages.forEach((message, index) => {
-        messageNode(message.role, message.content, { runId: message.runId });
+        messageNode(message.role, message.content, {
+          runId: message.runId,
+          attachments: message.attachments,
+        });
         const next = thread.messages[index + 1];
         if (missingAssistantRuns.has(message.runId) && next?.runId !== message.runId) {
           // Failed, cancelled, and live runs do not necessarily have a
@@ -4335,7 +4390,9 @@ export function createBrowserApp({
     }
   }
 
-  async function sendAgent(text, search) {
+  async function sendAgent(text, search, attachments = Object.freeze([]), {
+    localPreviews = Object.freeze([]), onAccepted = null,
+  } = {}) {
     const session = state.session;
     const agent = state.agent;
     const current = () => state.session === session && state.agent === agent && state.session.authenticated;
@@ -4430,6 +4487,7 @@ export function createBrowserApp({
     const options = {
       idempotency,
       ...(search === undefined ? {} : { search }),
+      ...(attachments.length === 0 ? {} : { attachments }),
     };
     const dispatch = previousRunId === null
       ? () => agent.startRun(threadId, text, options)
@@ -4443,10 +4501,18 @@ export function createBrowserApp({
       state.agentSearchSelected = false;
       updateSearchControl();
     }
+    onAccepted?.();
+    onAccepted = null;
+    attachments = Object.freeze([]);
+    delete options.attachments;
     // Bind the accepted turn before the event stream starts. This keeps the
     // visible prompt, the assistant placeholder, and every follow-up on the
     // same server-owned run even if the first SSE read pauses or reconnects.
-    messageNode("user", text, { runId: accepted.id });
+    messageNode("user", text, {
+      runId: accepted.id,
+      ...(localPreviews.length === 0 ? {} : { localAttachments: localPreviews }),
+    });
+    localPreviews = Object.freeze([]);
     await streamAgentRun(accepted, { expectedThreadId: threadId });
   }
 
@@ -4762,9 +4828,10 @@ export function createBrowserApp({
   }
 
   async function selectImage() {
-    if (interactionLocked() || !state.session.authenticated || state.mode !== "chat"
-        || state.chatCapabilities.visionInput !== true || state.chatPendingSend !== null
-        || state.chatPendingDeletion !== null || state.logoutPending) return;
+    if (interactionLocked() || !state.session.authenticated || !imageInputAvailable()
+        || state.chatPendingSend !== null || state.chatPendingDeletion !== null
+        || state.agentPendingDeletion !== null || state.agentReplayFailed || state.logoutPending) return;
+    const selectionMode = state.mode;
     const files = elements.image_input.files;
     if (!files || files.length < 1) {
       elements.image_input.value = "";
@@ -4798,12 +4865,13 @@ export function createBrowserApp({
         }));
       }
       if (selectionEpoch !== state.imageSelectionEpoch || !state.imagePreparing
-          || !state.session.authenticated || state.mode !== "chat"
-          || state.chatCapabilities.visionInput !== true || state.logoutPending) return;
+          || !state.session.authenticated || state.mode !== selectionMode
+          || !imageInputAvailable(selectionMode) || state.logoutPending) return;
       const combined = [...state.selectedImages, ...prepared];
       const totalBytes = combined.reduce((total, image) => total + image.byteLength, 0);
       if (totalBytes > COMPOSER_IMAGE_BYTES_LIMIT
-          || new Set(combined.map((image) => image.attachmentId)).size !== combined.length) {
+          || new Set(combined.map((image) => image.attachmentId)).size !== combined.length
+          || !imagesSupportedInMode(combined, selectionMode)) {
         throw new TypeError("selected images exceed the aggregate limit");
       }
       for (const selected of prepared) previewUrls.push(createObjectUrl(selected.previewBlob));
@@ -4914,8 +4982,13 @@ export function createBrowserApp({
         return;
       }
     }
+    if (state.selectedImages.length > 0
+        && !imagesSupportedInMode(state.selectedImages, submissionMode)) {
+      showToast("Image input is not available for this conversation mode. Your prompt and images remain unsent.");
+      return;
+    }
     if (state.mode === "chat") fenceAttachmentRestorationsForSend();
-    let detachedImage = state.mode === "chat" ? detachSelectedImage() : null;
+    let detachedImage = state.selectedImages.length > 0 ? detachSelectedImage() : null;
     let selected = detachedImage?.selected ?? Object.freeze([]);
     let attachments = Object.freeze(selected.map((image) => Object.freeze({
       attachmentId: image.attachmentId,
@@ -4931,6 +5004,15 @@ export function createBrowserApp({
         : new Blob([image.bytes], { type: image.mediaType });
       return Object.freeze({ mediaType: previewBlob.type || image.mediaType, previewBlob });
     }));
+    let agentAttachments = Object.freeze([]);
+    if (submissionMode === "agent" && attachments.length > 0) {
+      try { agentAttachments = prepareAgentImageAttachments(attachments); }
+      catch {
+        if (restoreDetachedImage(detachedImage)) detachedImage = null;
+        showToast("Those images could not be prepared for Agent safely. Your prompt and images remain unsent.");
+        return;
+      }
+    }
     let releaseRefreshTarget = null;
     elements.message_input.value = "";
     state.busy = true;
@@ -4938,7 +5020,17 @@ export function createBrowserApp({
     if (submissionMode === "agent") beginAgentSubmissionActivity();
     updateImageControl();
     try {
-      if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text, agentSearch);
+      if (state.mode === "agent" && state.capabilities.enabled) await sendAgent(text, agentSearch, agentAttachments, {
+        localPreviews,
+        onAccepted() {
+          disposeDetachedImage(detachedImage);
+          detachedImage = null;
+          selected = Object.freeze([]);
+          attachments = Object.freeze([]);
+          agentAttachments = Object.freeze([]);
+          localPreviews = Object.freeze([]);
+        },
+      });
       else await sendChat(text, attachments, {
         localPreviews,
         onAccepted() {
@@ -4958,10 +5050,8 @@ export function createBrowserApp({
       releaseRefreshTarget = clientReleaseMismatch(error);
       if (releaseRefreshTarget !== null) {
         elements.message_input.value = draft;
-        if (state.mode === "chat") {
-          const imageRestored = restoreDetachedImage(detachedImage);
-          if (imageRestored) detachedImage = null;
-        }
+        const imageRestored = restoreDetachedImage(detachedImage);
+        if (imageRestored) detachedImage = null;
         connection("Refreshing browser app", false);
         showToast("A newer app release is ready. Your unsent prompt and images are being protected before refresh.");
         return;
@@ -4984,6 +5074,8 @@ export function createBrowserApp({
         } else {
           state.agentPendingThreadCreate = null;
           restoreAgentActivityAfterRollout();
+          const imageRestored = restoreDetachedImage(detachedImage);
+          if (imageRestored) detachedImage = null;
         }
         elements.resume_run.hidden = true;
         connection("App update finishing", false);
@@ -5040,6 +5132,8 @@ export function createBrowserApp({
       } else {
         if (state.mode === "agent") {
           if (elements.message_input.value === "") elements.message_input.value = draft;
+          const imageRestored = restoreDetachedImage(detachedImage);
+          if (imageRestored) detachedImage = null;
           const definitivelyNotAccepted = isAuthoritativeAgentRejection(error);
           if (definitivelyNotAccepted) {
             // A bounded non-retryable 4xx proves the exact mutation did not
@@ -5047,9 +5141,11 @@ export function createBrowserApp({
             // corrected prompt can be sent immediately in this same session.
             restoreAgentActivityAfterRollout();
             connection("Agent request not sent", false);
-            showToast(state.agentThreadId === null
-              ? "AgInTi rejected the new conversation before it ran. Your prompt is still ready; edit it or retry."
-              : "AgInTi rejected this request before it ran. Your prompt is still ready; edit it or retry in this conversation.");
+            showToast(imageRestored
+              ? `This Agent image message was not sent. Your prompt and ${selected.length === 1 ? "image is" : "images are"} still ready; edit or retry ${state.agentThreadId === null ? "it" : "in this conversation"}.`
+              : state.agentThreadId === null
+                ? "AgInTi rejected the new conversation before it ran. Your prompt is still ready; edit it or retry."
+                : "AgInTi rejected this request before it ran. Your prompt is still ready; edit it or retry in this conversation.");
           } else {
             elements.run_state.textContent = "Interrupted";
             elements.workspace.dataset.status = "failed";
@@ -5083,6 +5179,7 @@ export function createBrowserApp({
       }
     } finally {
       disposeDetachedImage(detachedImage);
+      agentAttachments = Object.freeze([]);
       state.busy = false;
       updateImageControl();
       renderThreads();
@@ -5317,8 +5414,11 @@ export function createBrowserApp({
         || (capability.search?.enabled === true
           && capability.search.modes.includes(updateHandoff.search.mode)
           && updateHandoff.search.limit <= capability.search.maximumSources);
+      const updateImagesAvailable = updateHandoff?.images.length > 0
+        ? imagesSupportedInMode(updateHandoff.images, updateHandoff.mode, { agentCapability: capability })
+        : true;
       const unavailableRecoveredAgent = updateHandoff?.mode === "agent"
-        && capability.enabled !== true;
+        && (capability.enabled !== true || !updateImagesAvailable);
       const updateSearchChoiceRequired = updateHandoff?.mode === "agent"
         && capability.enabled === true && !updateSearchAvailable;
       const updateRequiresVerification = updateHandoff !== null
@@ -5338,8 +5438,11 @@ export function createBrowserApp({
       const authenticationAgentSearchAvailable = sameAccountRecoveryAgent?.searchInvalid !== true
         && (sameAccountRecoveryAgent?.search == null
           || (capability.search?.enabled === true
-          && capability.search.modes.includes(sameAccountRecoveryAgent.search.mode)
-          && sameAccountRecoveryAgent.search.limit <= capability.search.maximumSources));
+            && capability.search.modes.includes(sameAccountRecoveryAgent.search.mode)
+            && sameAccountRecoveryAgent.search.limit <= capability.search.maximumSources));
+      const authenticationAgentImagesAvailable = sameAccountRecoveryAgent?.images.length > 0
+        ? imagesSupportedInMode(sameAccountRecoveryAgent.images, "agent", { agentCapability: capability })
+        : true;
       const authenticationSearchChoiceRequired = sameAccountRecoveryAgent !== null
         && capability.enabled === true && !authenticationAgentSearchAvailable;
       state.agentSearchRecoveryChoicePending = updateSearchChoiceRequired
@@ -5353,7 +5456,7 @@ export function createBrowserApp({
         if (!preserveUninstalledRetainedComposer) {
           elements.message_input.value = sameAccountRecoveryAgent.draft;
         }
-        if (capability.enabled !== true) {
+        if (capability.enabled !== true || !authenticationAgentImagesAvailable) {
           state.unavailableAgentUpdateRecovery = true;
         }
       }
@@ -5380,7 +5483,7 @@ export function createBrowserApp({
         elements.search_limit.value = String(sameAccountRecoveryAgent.search.limit);
       }
       const recoveryImageNeedsUserAction = recoveringAuthenticationDraft && !discardedCrossAccountDraft
-        && state.selectedImages.length > 0 && chatCapability.visionInput !== true
+        && state.selectedImages.length > 0 && !imagesSupportedInMode(state.selectedImages, state.mode)
         && sameAccountRecoveryWorkflow === null;
       const agentAuthenticationNeedsVerification = sameAccountRecoveryAgent !== null
         && state.agentAuthenticationRecoveryPending;
@@ -5809,12 +5912,15 @@ export function createBrowserApp({
         if (!installRetainedUpdateRecovery(protectedRecord, "Press Resume")) return;
         connection("Retrying protected draft restoration", false);
         if (protectedRecord.mode === "agent") {
-          if (state.capabilities.enabled !== true) {
+          if (state.capabilities.enabled !== true
+              || (protectedRecord.images.length > 0
+                && !imagesSupportedInMode(protectedRecord.images, "agent"))) {
             state.authRecoveryPending = true;
             state.authRecoveryUsername = normalizedSessionUsername(state.session.username);
             state.authRecoveryAgent = Object.freeze({
               threadId: protectedRecord.threadId,
               draft: protectedRecord.draft,
+              images: state.selectedImages,
               search: protectedRecord.search,
               searchInvalid: state.agentSearchRecoveryChoicePending,
             });
@@ -6074,7 +6180,7 @@ export function createBrowserApp({
       ? state.retainedUpdateRecoveryRecord
       : null;
     const protectedImagesUnavailable = protectedRecord?.images?.length > 0
-      && (state.mode !== "chat" || state.chatCapabilities.visionInput !== true);
+      && !imagesSupportedInMode(protectedRecord.images, protectedRecord.mode ?? state.mode);
     if (protectedImagesUnavailable) {
       elements.resume_run.hidden = false;
       showToast("This protected prompt includes images that are not restored yet. Use Resume or reload; New conversation will not discard them.");
@@ -6219,11 +6325,11 @@ export function createBrowserApp({
     try { updateHandoffSearch(); }
     catch { return false; }
     return !updateHasUnsafeActivity() && state.session.authenticated
-      && (state.mode === "chat" || (state.mode === "agent" && work.images.length === 0))
+      && ["chat", "agent"].includes(state.mode)
       && !state.authRecoveryPending && validAgentRelease(currentRelease) && validAgentRelease(targetRelease)
       && work.images.length <= UPDATE_HANDOFF_IMAGE_COUNT_LIMIT
       && (work.draft.length > 0 || work.images.length > 0)
-      && (work.images.length === 0 || state.chatCapabilities.visionInput === true)
+      && (work.images.length === 0 || imagesSupportedInMode(work.images, state.mode))
       && (updateHandoffThreadId() === null || UPDATE_HANDOFF_IDENTIFIER.test(updateHandoffThreadId()));
   }
 
@@ -6335,8 +6441,11 @@ export function createBrowserApp({
       const searchAvailable = record.search === null || (agentCapabilities?.search?.enabled === true
         && agentCapabilities.search.modes.includes(record.search.mode)
         && record.search.limit <= agentCapabilities.search.maximumSources);
+      const attachmentAvailable = record.images.length === 0
+        || (record.mode === "agent" && agentCapabilities?.attachments?.enabled === true
+          && record.images.every((image) => agentCapabilities.attachments.acceptedMediaTypes.includes(image.mediaType)));
       const unavailableAgentRecovery = record.mode === "agent"
-        && (agentCapabilities?.enabled !== true || !searchAvailable);
+        && (agentCapabilities?.enabled !== true || !searchAvailable || !attachmentAvailable);
       const requiresVerification = unavailableAgentRecovery || record.legacyModeAmbiguous
         || record.threadId !== null;
       const retainUntilVerified = retainUntilInitialized || requiresVerification;
@@ -6386,7 +6495,7 @@ export function createBrowserApp({
         }
       }
       if (record.images.length > 0) {
-        if (state.chatCapabilities.visionInput !== true) return false;
+        if (!imagesSupportedInMode(record.images)) return false;
         const selected = Object.freeze(record.images.map((image) => {
           const previewBlob = new Blob([image.bytes], { type: image.mediaType });
           return Object.freeze({ ...image, previewBlob });
@@ -6473,7 +6582,8 @@ export function createBrowserApp({
     const selectedImages = state.selectedImages;
     const recoveryAgent = state.authRecoveryAgent;
     if (recoveryAgent !== null) {
-      if (recoveryAgent.searchInvalid === true || selectedImages.length !== 0
+      if (recoveryAgent.searchInvalid === true || selectedImages !== recoveryAgent.images
+          || (selectedImages.length > 0 && !imagesSupportedInMode(selectedImages, "agent"))
           || String(elements.message_input.value ?? "") !== recoveryAgent.draft) return null;
       return Object.freeze({
         session,
@@ -6538,7 +6648,8 @@ export function createBrowserApp({
       if (!descriptor.current() || !["chat", "agent"].includes(mode)
           || (threadId !== null && (typeof threadId !== "string"
             || !UPDATE_HANDOFF_IDENTIFIER.test(threadId)))
-          || (mode === "agent" && descriptor.images.length !== 0)) return false;
+          || (descriptor.images.length > 0
+            && !imagesSupportedInMode(descriptor.images, mode))) return false;
       const draft = updateHandoffDraft(descriptor.draft);
       const images = updateHandoffImages(descriptor.images.map((selectedImage) => ({
         attachmentId: selectedImage.attachmentId,

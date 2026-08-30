@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT,
+  AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
+  AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES,
+  AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT,
   AGINTI_RPC_PATHS,
   AGINTI_SEARCH_MODES,
   AgintiProtocolError,
@@ -10,7 +14,9 @@ import {
   canonicalJson,
   failClosedCapabilities,
   initialEventCursor,
+  prepareAgentImageAttachments,
   validateAgentCapabilities,
+  validateAgentImageAttachments,
   validateAgentRequest,
   validateAgentSearch,
   validateAgentResponse,
@@ -50,6 +56,28 @@ function capabilities(overrides = {}) {
     attachments: { enabled: false },
     artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" },
     ...overrides,
+  };
+}
+
+function agentAttachment(overrides = {}) {
+  return {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUg==",
+    ...overrides,
+  };
+}
+
+function attachmentCapabilities() {
+  return {
+    enabled: true,
+    transport: "inline-base64",
+    acceptedMediaTypes: ["image/png", "image/jpeg"],
+    maximumCount: 4,
+    maximumBytesEach: 4 * 1024 * 1024,
+    maximumBytesTotal: 16 * 1024 * 1024,
+    model: "localllm-vision",
+    persistence: "retained-reference-v1",
   };
 }
 
@@ -186,6 +214,30 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
     threadId: THREAD_ID,
     input: { text: "Find evidence", search: { mode: "both", limit: 12 } },
   }), { threadId: THREAD_ID, input: { text: "Find evidence", search: { mode: "both", limit: 12 } } });
+  const orderedAttachments = [
+    agentAttachment(),
+    agentAttachment({ attachmentId: "image_0000000000000002", data: "AQIDBAUGBwgJCgsMDQ4PEA==" }),
+  ];
+  assert.deepEqual(validateAgentRequest(AGINTI_RPC_PATHS.runsStart, {
+    threadId: THREAD_ID,
+    input: { text: "Compare the images", attachments: orderedAttachments },
+  }), {
+    threadId: THREAD_ID,
+    input: { text: "Compare the images", attachments: orderedAttachments },
+  });
+  assert.deepEqual(validateAgentImageAttachments(orderedAttachments), orderedAttachments);
+  for (const attachments of [
+    [],
+    Array.from({ length: 5 }, (_, index) => agentAttachment({ attachmentId: `image_000000000000000${index}` })),
+    [agentAttachment(), agentAttachment()],
+    [agentAttachment({ mediaType: "image/gif" })],
+    [agentAttachment({ data: "aGVsbG8*" })],
+    [agentAttachment({ data: "AB==" })],
+    [agentAttachment({ data: "AAB=" })],
+    [agentAttachment({ attachmentId: "short" })],
+  ]) {
+    assert.throws(() => validateAgentImageAttachments(attachments));
+  }
   assert.deepEqual(validateAgentSearch({ mode: "papers", limit: 1 }), { mode: "papers", limit: 1 });
   for (const search of [
     { mode: "auto", limit: 5 },
@@ -258,6 +310,52 @@ test("AgInTi protocol keeps every native path exact and rejects browser agent co
   }), /exactly one/u);
 });
 
+test("maximum-size Agent PNG preparation keeps mobile intermediates bounded and skips trusted retry rescans", () => {
+  const bytes = new Uint8Array(4 * 1024 * 1024);
+  Object.defineProperty(bytes, "toBase64", { value: undefined });
+  for (let index = 0; index < bytes.byteLength; index += 1) bytes[index] = index & 0xff;
+  const originalBtoa = globalThis.btoa;
+  let maximumInput = 0;
+  try {
+    globalThis.btoa = (value) => {
+      maximumInput = Math.max(maximumInput, value.length);
+      return originalBtoa(value);
+    };
+    const prepared = prepareAgentImageAttachments([{
+      attachmentId: "image_0000000000000001",
+      mediaType: "image/png",
+      byteLength: bytes.byteLength,
+      width: 4_096,
+      height: 4_096,
+      bytes,
+    }]);
+    assert.ok(maximumInput <= 12 * 1024, `largest btoa input was ${maximumInput} bytes`);
+    assert.equal(prepared[0].data.length, Math.ceil(bytes.byteLength / 3) * 4);
+    assert.deepEqual(Buffer.from(prepared[0].data, "base64"), Buffer.from(bytes));
+
+    const originalCharCodeAt = String.prototype.charCodeAt;
+    let largeBase64Rescans = 0;
+    try {
+      String.prototype.charCodeAt = function observedCharCodeAt(index) {
+        if (this.length > 1024 * 1024) largeBase64Rescans += 1;
+        return originalCharCodeAt.call(this, index);
+      };
+      assert.deepEqual(validateAgentImageAttachments(prepared), prepared);
+      assert.deepEqual(validateAgentImageAttachments(prepared), prepared,
+        "an exact retry reuses the same immutable prepared attachments");
+    } finally {
+      String.prototype.charCodeAt = originalCharCodeAt;
+    }
+    assert.equal(largeBase64Rescans, 0);
+    assert.throws(() => validateAgentImageAttachments([{
+      ...prepared[0],
+      data: `${prepared[0].data.slice(0, -1)}*`,
+    }]), /base64/u, "a clone still takes the full fail-closed validation path");
+  } finally {
+    globalThis.btoa = originalBtoa;
+  }
+});
+
 test("capabilities default to Chat and enable Agent only for exact AgInTi + LocalLLM proof", () => {
   assert.equal(selectDefaultMode(undefined), "chat");
   assert.equal(selectDefaultMode(capabilities()), "chat");
@@ -284,6 +382,17 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     artifacts: { kinds: ["plot", "table", "markdown", "file"], schemaVersion: "1" },
   };
   assert.deepEqual(validateAgentCapabilities(fileEnabled).artifacts.kinds, ["plot", "table", "markdown", "file"]);
+  const attachmentEnabled = {
+    ...enabled,
+    attachments: attachmentCapabilities(),
+  };
+  assert.deepEqual(validateAgentCapabilities(attachmentEnabled).attachments, attachmentCapabilities());
+  assert.equal(validateAgentCapabilities(attachmentEnabled).attachments.acceptedMediaTypes,
+    AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES);
+  assert.deepEqual(AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES, ["image/png", "image/jpeg"]);
+  assert.equal(AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT, 4);
+  assert.equal(AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT, 4 * 1024 * 1024);
+  assert.equal(AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT, 16 * 1024 * 1024);
   const searchEnabled = capabilities({
     enabled: true,
     actions: { cancel: true, resume: true, retry: false },
@@ -327,6 +436,10 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     { ...enabled, model: { label: "DeepSeek" } },
     { ...enabled, workspace: "/home/private" },
     { ...enabled, attachments: { enabled: true } },
+    { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), acceptedMediaTypes: ["image/jpeg", "image/png"] } },
+    { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), maximumCount: 5 } },
+    { ...attachmentEnabled, attachments: { ...attachmentCapabilities(), persistence: "browser-cache" } },
+    { ...capabilities(), attachments: attachmentCapabilities() },
   ]) {
     assert.equal(failClosedCapabilities(invalid), FAIL_CLOSED_AGENT_CAPABILITIES);
     assert.equal(selectDefaultMode(invalid), "chat");
@@ -536,6 +649,46 @@ test("persisted Agent messages cannot make a pristine thread replay or restart",
     { role: "user", runId: RUN_ID },
     { role: "assistant", runId: RUN_ID },
   ]);
+
+  const descriptor = {
+    attachmentId: "image_0000000000000001",
+    mediaType: "image/jpeg",
+    byteLength: 4_096,
+    width: 4_032,
+    height: 3_024,
+    sha256: "c".repeat(64),
+  };
+  const withImages = validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({
+      lastRunId: RUN_ID,
+      messages: [{ ...message("user"), attachments: [descriptor] }, message("assistant")],
+    }),
+  }).thread;
+  assert.deepEqual(withImages.messages[0].attachments, [descriptor]);
+  assert.equal(Object.isFrozen(withImages.messages[0].attachments), true);
+  for (const invalidAttachments of [
+    [],
+    [{ ...descriptor, mediaType: "image/heic" }],
+    [{ ...descriptor, data: "private-bytes" }],
+    [{ ...descriptor, width: 8_192, height: 8_192 }],
+    [descriptor, descriptor],
+  ]) {
+    assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+      schemaVersion: "1",
+      thread: publicThread({
+        lastRunId: RUN_ID,
+        messages: [{ ...message("user"), attachments: invalidAttachments }],
+      }),
+    }));
+  }
+  assert.throws(() => validateAgentResponse(AGINTI_RPC_PATHS.threadsGet, {
+    schemaVersion: "1",
+    thread: publicThread({
+      lastRunId: RUN_ID,
+      messages: [{ ...message("assistant"), attachments: [descriptor] }],
+    }),
+  }), /only Agent user messages/u);
 });
 
 test("thread replay ancestry accepts one exact chain and one proven omitted prefix", () => {
@@ -730,6 +883,7 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   await client.startRun(THREAD_ID, "Find grounded evidence", { search: { mode: "web", limit: 5 } });
   await client.resumeRun(RUN_ID, "Compare with the prior answer", {
     idempotency: "agent_followup_exact_1234567890",
+    attachments: [agentAttachment()],
   });
   assert.equal(calls[0].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsList}`);
   assert.equal(calls[1].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.threadsCreate}`);
@@ -748,7 +902,7 @@ test("browser client injects only same-origin transport, CSRF, and mutation idem
   assert.equal(calls[3].url, `https://llm.lazying.art/api/edge${AGINTI_RPC_PATHS.runsResume}`);
   assert.deepEqual(JSON.parse(calls[3].options.body), {
     runId: RUN_ID,
-    input: { text: "Compare with the prior answer" },
+    input: { text: "Compare with the prior answer", attachments: [agentAttachment()] },
   });
   assert.equal(calls[3].options.headers.get("idempotency-key"), "agent_followup_exact_1234567890");
   for (const name of [

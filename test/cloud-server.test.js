@@ -12,7 +12,12 @@ import { DirectChatStore } from '../src/chat-store.js';
 import { DirectChatContextCoordinator } from '../src/chat-context.js';
 import { AgintiAdapterError, createAgintiAgentAdapter } from '../src/aginti-adapter.js';
 import { createCloudServer, resolveTrustedClientAddress } from '../src/cloud-server.js';
-import { CLIENT_RELEASE_HEADER_NAME, CLOUD_HTTP_LIMITS, SESSION_COOKIE_NAME } from '../src/http-contract.js';
+import {
+  CLIENT_RELEASE_HEADER_NAME,
+  CLOUD_HTTP_LIMITS,
+  SESSION_COOKIE_NAME,
+  bodyLimitForRoute
+} from '../src/http-contract.js';
 import { RolloutAdmissionLatch } from '../src/rollout-admission.js';
 import { CloudIndexStore } from '../src/store.js';
 import { canonicalJson } from '../src/web/aginti-protocol.js';
@@ -696,6 +701,9 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   assert.equal(CLOUD_HTTP_LIMITS.jobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.visionJobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.directChatJobs, 1);
+  assert.equal(bodyLimitForRoute('/api/transport/agent/v1/runs/start'), CLOUD_HTTP_LIMITS.agentVisionBodyBytes);
+  assert.equal(bodyLimitForRoute('/api/transport/agent/v1/runs/resume'), CLOUD_HTTP_LIMITS.agentVisionBodyBytes);
+  assert.equal(bodyLimitForRoute('/api/transport/agent/v1/capabilities'), CLOUD_HTTP_LIMITS.agentBodyBytes);
 });
 
 test('outer request deadline covers the longest bounded body reader without relaxing connection limits', async (t) => {
@@ -1244,6 +1252,20 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
   assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/start'), false, 'disabled Search never reaches AgInTi');
   assert.deepEqual(Object.keys(contexts.at(-1).context).sort(), ['browserSession', 'principalId', 'signal']);
 
+  const forgedImage = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
+    threadId: 'thr_00000000-0000-4000-8000-000000000000',
+    input: {
+      text: 'inspect despite disabled image input',
+      attachments: [{
+        attachmentId: 'image_0000000000000001',
+        mediaType: 'image/png',
+        data: 'iVBORw0KGgoAAAANSUhEUg=='
+      }]
+    }
+  }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: 'browser-action-00000002' });
+  assert.equal(forgedImage.status, 409);
+  assert.equal(contexts.some(({ path }) => path === '/agent/v1/runs/start'), false, 'disabled image input never reaches AgInTi');
+
   const unavailableState = testState(t);
   const unavailable = await unavailableState.start();
   const unavailableAuth = await login(unavailable.baseUrl);
@@ -1260,7 +1282,7 @@ test('keeps Agent mode disabled and passes only server-derived adapter context',
   assert.equal(bypass.status, 503);
 });
 
-test('preflights negotiated Agent Search and forwards one exact run without a LocalLLM browser route', async (t) => {
+test('preflights negotiated Agent Search and image input and forwards one exact run without a LocalLLM browser route', async (t) => {
   const calls = [];
   const threadId = 'thr_12345678-1234-4123-8123-123456789abc';
   const runId = 'run_abcdefab-cdef-4abc-8def-abcdefabcdef';
@@ -1270,7 +1292,16 @@ test('preflights negotiated Agent Search and forwards one exact run without a Lo
     agent: { kind: 'aginti', label: 'AgInTi Agent' },
     model: { label: 'LocalLLM' },
     actions: { cancel: true, resume: true, retry: false },
-    attachments: { enabled: false },
+    attachments: {
+      enabled: true,
+      transport: 'inline-base64',
+      acceptedMediaTypes: ['image/png', 'image/jpeg'],
+      maximumCount: 4,
+      maximumBytesEach: 4 * 1024 * 1024,
+      maximumBytesTotal: 16 * 1024 * 1024,
+      model: 'localllm-vision',
+      persistence: 'retained-reference-v1'
+    },
     search: { enabled: true, modes: ['web', 'papers', 'both'], maximumSources: 12 },
     artifacts: { kinds: ['plot', 'table', 'markdown', 'sources'], schemaVersion: '1' }
   };
@@ -1304,14 +1335,19 @@ test('preflights negotiated Agent Search and forwards one exact run without a Lo
   const { baseUrl } = await state.start();
   const auth = await login(baseUrl);
   const search = { mode: 'both', limit: 7 };
+  const attachments = [{
+    attachmentId: 'image_0000000000000001',
+    mediaType: 'image/png',
+    data: 'iVBORw0KGgoAAAANSUhEUg=='
+  }];
   const response = await post(baseUrl, '/api/transport/agent/v1/runs/start', {
     threadId,
-    input: { text: 'Compare current evidence', search }
+    input: { text: 'Compare current evidence', search, attachments }
   }, { cookie: auth.cookie, csrf: auth.csrf, idempotency: IDEMPOTENCY });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).run.id, runId);
   assert.deepEqual(calls.map(({ path }) => path), ['/agent/v1/capabilities', '/agent/v1/runs/start']);
-  assert.deepEqual(calls[1].body, { threadId, input: { text: 'Compare current evidence', search } });
+  assert.deepEqual(calls[1].body, { threadId, input: { text: 'Compare current evidence', search, attachments } });
   assert.deepEqual(Object.keys(calls[0].context).sort(), ['browserSession', 'principalId', 'signal']);
   assert.equal(calls[1].context.idempotencyKey, IDEMPOTENCY);
 

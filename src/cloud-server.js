@@ -2025,6 +2025,9 @@ export function createCloudRequestHandler({
   async function handleAgent(req, res, route, body, session, requestSignal) {
     const nativePath = route.nativeAgentPath;
     const input = validateTransportAgentRequest(nativePath, body);
+    const requestTimeoutMs = Array.isArray(input.input?.attachments)
+      ? limits.visionBodyTimeoutMs
+      : limits.dependencyTimeoutMs;
     const mutation = routeRequiresIdempotency(route.pathname, nativePath);
     const idempotencyKey = mutation ? requestIdempotency(req, true) : undefined;
     if (!agintiAdapter) {
@@ -2036,7 +2039,8 @@ export function createCloudRequestHandler({
     }
     primeAgentAuthority(session);
     const requestedSearch = input.input?.search;
-    if (requestedSearch !== undefined) {
+    const requestedAttachments = input.input?.attachments;
+    if (requestedSearch !== undefined || requestedAttachments !== undefined) {
       const proof = await withTimeout(
         async (signal) => {
           const authority = await resolveAgentRequestScope(nativePath, input, signal);
@@ -2049,10 +2053,15 @@ export function createCloudRequestHandler({
       catch (error) {
         throw new CloudHttpError(502, 'invalid_agent_response', 'AgInTi returned an invalid capability response.', { cause: error });
       }
-      if (capability.enabled !== true || capability.search?.enabled !== true
+      if (requestedSearch !== undefined && (capability.enabled !== true
+          || capability.search?.enabled !== true
           || !capability.search.modes.includes(requestedSearch.mode)
-          || requestedSearch.limit > capability.search.maximumSources) {
+          || requestedSearch.limit > capability.search.maximumSources)) {
         throw new CloudHttpError(409, 'agent_search_unavailable', 'AgInTi Search is not enabled for this session.');
+      }
+      if (requestedAttachments !== undefined
+          && (capability.enabled !== true || capability.attachments?.enabled !== true)) {
+        throw new CloudHttpError(409, 'agent_attachments_unavailable', 'AgInTi image input is not enabled for this session.');
       }
     }
     if (nativePath === AGINTI_RPC_PATHS.runsEvents) {
@@ -2116,7 +2125,7 @@ export function createCloudRequestHandler({
           rememberAgentResponse(nativePath, validated, authority.scopeDigest);
           return validated;
         },
-        { signal: requestSignal, milliseconds: limits.dependencyTimeoutMs, timeoutMessage: 'AgInTi request timed out' }
+        { signal: requestSignal, milliseconds: requestTimeoutMs, timeoutMessage: 'AgInTi request timed out' }
       );
       let validated;
       try { validated = validateAgentResponse(nativePath, response); }
@@ -2337,6 +2346,8 @@ export function createCloudRequestHandler({
         req,
         bodyLimitForRoute(route.pathname),
         route.pathname === CLOUD_ROUTES.chatRunsStart
+            || (route.kind === 'agent'
+              && [AGINTI_RPC_PATHS.runsStart, AGINTI_RPC_PATHS.runsResume].includes(route.nativeAgentPath))
           ? limits.visionBodyTimeoutMs
           : limits.bodyTimeoutMs
       );

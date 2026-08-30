@@ -742,11 +742,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-file-download { background: var(--accent); color: white; }
 .artifact-file-privacy { margin: .55rem 0 0; color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
 .image-button { min-height: 48px; }
-.image-preview { display: flex; max-width: 190px; align-items: center; gap: .45rem; padding: .35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+.image-preview { min-width: 0; display: flex; max-width: 190px; align-items: center; gap: .45rem; padding: .35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .image-preview img { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; }
-.image-preview span { overflow: hidden; color: var(--muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
-.image-preview button { padding: .35rem .5rem; }
+.image-preview span { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
+.image-preview button { min-height: 44px; flex: 0 0 auto; padding: .35rem .5rem; }
 .message-attachments { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: min(100%, 620px); gap: .5rem; margin-bottom: .65rem; }
+.message-attachment-retained { min-width: 0; padding: .65rem .75rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
 .message-attachment-item { min-width: 0; }
 .message-attachment { display: block; width: 100%; max-height: 520px; border-radius: 12px; object-fit: contain; }
 .message > .message-attachment { max-width: min(100%, 620px); margin-bottom: .65rem; }

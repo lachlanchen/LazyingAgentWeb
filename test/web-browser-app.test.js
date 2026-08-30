@@ -176,6 +176,24 @@ function capabilities(overrides = {}) {
   };
 }
 
+function agentImageCapabilities(overrides = {}) {
+  return capabilities({
+    enabled: true,
+    actions: { cancel: true, resume: true, retry: false },
+    attachments: {
+      enabled: true,
+      transport: "inline-base64",
+      acceptedMediaTypes: ["image/png", "image/jpeg"],
+      maximumCount: 4,
+      maximumBytesEach: 4 * 1024 * 1024,
+      maximumBytesTotal: 16 * 1024 * 1024,
+      model: "localllm-vision",
+      persistence: "retained-reference-v1",
+    },
+    ...overrides,
+  });
+}
+
 function baseAgent(capability = capabilities()) {
   return {
     async capabilities() { return capability; },
@@ -669,6 +687,8 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(enabled.document.getElementById("mode-switch").hidden, false);
   assert.equal(enabled.document.getElementById("agent-mode").getAttribute("aria-pressed"), "true");
   assert.equal(enabled.document.getElementById("search-controls").hidden, true, "legacy Agent capability keeps Search absent");
+  assert.equal(enabled.document.getElementById("add-image").hidden, true,
+    "Agent image input stays hidden until the exact attachment capability is enabled");
   assert.match(enabled.document.getElementById("capability-note").textContent,
     /bounded Python 3\.12[\s\S]*no image input, file creation, web search/iu);
 
@@ -678,6 +698,157 @@ test("browser UI defaults to Agent only after an exact enabled AgInTi capability
   assert.equal(malformed.document.getElementById("mode-switch").hidden, true);
   assert.equal(malformed.document.getElementById("connection-state").textContent, "Connected · Chat only");
   assert.match(malformed.document.getElementById("capability-note").textContent, /Agent unavailable/iu);
+});
+
+test("Agent multi-image input preserves an iPhone draft after rejection then accepts the same conversation", async () => {
+  const history = await verifiedEvents([
+    ["output.delta", { text: "Compared both images" }],
+    ["run.completed", {}],
+  ]);
+  const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 8, 0, 0, 0, 0, 0xff, 0xd9, 0, 0, 0, 0]);
+  const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const canonicalizations = [];
+  const starts = [];
+  const revoked = [];
+  let objectUrlSerial = 0;
+  let threadCreates = 0;
+  const agent = {
+    ...baseAgent(agentImageCapabilities()),
+    async createThread() {
+      threadCreates += 1;
+      return { thread: agentThread() };
+    },
+    async startRun(threadId, text, options) {
+      starts.push({
+        threadId,
+        text,
+        options: {
+          ...options,
+          attachments: options.attachments?.map((attachment) => ({ ...attachment })),
+        },
+      });
+      if (starts.length === 1) {
+        throw Object.assign(new Error("image request rejected"), { status: 409, retryable: false });
+      }
+      return { run: run("running") };
+    },
+    async *streamRunEvents() {
+      for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    async canonicalizeImage(file, options) {
+      canonicalizations.push({ file, options });
+      const jpeg = file.name.endsWith(".HEIC");
+      const bytes = jpeg ? jpegBytes : pngBytes;
+      const mediaType = jpeg ? "image/jpeg" : "image/png";
+      return Object.freeze({
+        attachmentId: jpeg ? "image_iphone_0000000001" : "image_diagram_000000001",
+        mediaType,
+        byteLength: bytes.byteLength,
+        width: jpeg ? 4032 : 640,
+        height: jpeg ? 3024 : 480,
+        bytes,
+        previewBlob: new Blob([bytes], { type: mediaType }),
+      });
+    },
+    createObjectUrl() { objectUrlSerial += 1; return `blob:agent-image-${objectUrlSerial}`; },
+    revokeObjectUrl(url) { revoked.push(url); },
+  });
+  await browser.app.initialize();
+  assert.equal(browser.document.getElementById("workspace").dataset.mode, "agent");
+  assert.equal(browser.document.getElementById("add-image").hidden, false);
+  assert.match(browser.document.getElementById("capability-note").textContent, /up to four images/u);
+
+  const imageInput = browser.document.getElementById("image-input");
+  imageInput.files = [{ name: "IMG_1234.HEIC" }, { name: "diagram.png" }];
+  imageInput.dispatch("change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(canonicalizations.map(({ file }) => file.name), ["IMG_1234.HEIC", "diagram.png"]);
+  assert.ok(canonicalizations.every(({ options }) => options.signal && options.timeoutMs === 15_000));
+  assert.match(browser.document.getElementById("image-preview-label").textContent, /2 images/u);
+  assert.equal(browser.document.getElementById("agent-mode").disabled, true,
+    "a staged image draft cannot silently cross modes");
+
+  const input = browser.document.getElementById("message-input");
+  input.value = "Compare these two images";
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(threadCreates, 1);
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].options.attachments.map(({ attachmentId, mediaType, data }) => ({
+    attachmentId, mediaType, bytes: [...Buffer.from(data, "base64")],
+  })), [
+    { attachmentId: "image_iphone_0000000001", mediaType: "image/jpeg", bytes: [...jpegBytes] },
+    { attachmentId: "image_diagram_000000001", mediaType: "image/png", bytes: [...pngBytes] },
+  ]);
+  assert.equal(input.value, "Compare these two images");
+  assert.equal(browser.document.getElementById("image-preview").hidden, false);
+  assert.match(browser.document.getElementById("toast").textContent, /image message was not sent[\s\S]*images are still ready/iu);
+  assert.equal(browser.document.getElementById("send-message").disabled, false);
+  assert.deepEqual(revoked, [], "a definitive rejection retains the exact composer previews");
+
+  await browser.app.submitMessage({ preventDefault() {} });
+  assert.equal(threadCreates, 1, "the safe retry continues the already-created Agent conversation");
+  assert.equal(starts.length, 2);
+  assert.notEqual(starts[0].options.idempotency, starts[1].options.idempotency);
+  assert.deepEqual(
+    starts[1].options.attachments.map(({ attachmentId, mediaType, data }) => ({ attachmentId, mediaType, data })),
+    starts[0].options.attachments.map(({ attachmentId, mediaType, data }) => ({ attachmentId, mediaType, data })),
+  );
+  assert.equal(input.value, "");
+  assert.equal(browser.document.getElementById("image-preview").hidden, true);
+  assert.deepEqual(revoked, ["blob:agent-image-1", "blob:agent-image-2"]);
+  assert.match(browser.document.getElementById("messages").textContent, /Compared both images/u);
+  const userMessage = browser.document.getElementById("messages").children[0];
+  assert.equal(userMessage.children[0].className, "message-attachments");
+  assert.equal(userMessage.children[0].children.length, 2);
+});
+
+test("Agent history replays retained image descriptors without browser bytes or a Chat attachment read", async () => {
+  const history = await verifiedEvents([
+    ["output.delta", { text: "Stored description" }],
+    ["run.completed", {}],
+  ]);
+  const descriptor = {
+    attachmentId: "image_retained_00000001",
+    mediaType: "image/jpeg",
+    byteLength: 12_345,
+    width: 1_920,
+    height: 1_080,
+    sha256: "c".repeat(64),
+  };
+  const thread = agentThread({
+    lastRunId: RUN_ID,
+    messages: [
+      { id: "msg_agent_image_user_01", role: "user", content: "Describe this image", runId: RUN_ID, attachments: [descriptor] },
+      { id: "msg_agent_image_answer1", role: "assistant", content: "Stored description", runId: RUN_ID },
+    ],
+  });
+  let chatAttachmentReads = 0;
+  const browser = harness({
+    agent: {
+      ...baseAgent(agentImageCapabilities()),
+      async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+      async getThread() { return { thread }; },
+      async runStatus() { return { run: terminalRun("completed", history) }; },
+      async *streamRunEvents() {
+        for (const event of history) yield { event, cursor: { seq: event.seq, hash: event.hash } };
+      },
+    },
+    chat: baseChat({
+      async getAttachment() { chatAttachmentReads += 1; throw new Error("Agent replay must not use Chat storage"); },
+    }),
+    createObjectUrl() { throw new Error("retained Agent descriptors do not expose browser image bytes"); },
+  });
+  await browser.app.initialize();
+
+  assert.equal(chatAttachmentReads, 0);
+  assert.match(browser.document.getElementById("messages").textContent,
+    /Image retained by Agent · JPEG · 1920×1080[\s\S]*Stored description/u);
+  const userMessage = browser.document.getElementById("messages").children[0];
+  assert.equal(userMessage.dataset.attachmentState, "retained");
+  assert.equal(userMessage.children[0].className, "message-attachment-retained");
 });
 
 test("Chat and Agent thread hydration both open at the newest message", async () => {

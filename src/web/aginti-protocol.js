@@ -9,6 +9,10 @@
 
 export const AGINTI_SCHEMA_VERSION = "1";
 export const AGINTI_MAX_FILE_ARTIFACT_BYTES = 16 * 1024 * 1024;
+export const AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES = Object.freeze(["image/png", "image/jpeg"]);
+export const AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT = 4;
+export const AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT = 4 * 1024 * 1024;
+export const AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT = 16 * 1024 * 1024;
 
 export const AGINTI_RPC_PATHS = Object.freeze({
   capabilities: "/agent/v1/capabilities",
@@ -79,6 +83,7 @@ const MUTATIONS = new Set([
 const THREAD_ID = /^thr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const RUN_ID = /^run_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const ARTIFACT_ID = /^art_[A-Za-z0-9_-]{32,86}$/u;
+const ATTACHMENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const FILE_ARTIFACT_MIMES = new Set(["application/pdf", "application/x-tex", "text/x-tex"]);
 const PRIVATE_PATH = /(?:^|[\s("'`])\/(?:workspace|home|users|root|etc|usr|var|opt|srv|run|tmp|proc|sys|dev|mnt|media|aginti-(?:home|cache|env))(?:\/|\b)|(?:^|[\s("'`])[A-Za-z]:\\/iu;
@@ -90,6 +95,7 @@ const SEARCH_MODES = new Set(AGINTI_SEARCH_MODES);
 const CREDENTIAL_QUERY_NAME = /(?:(?:^|[_-])(?:access[_-]?token|api[_-]?key|auth(?:orization)?|credential|key|password|secret|signature|token)(?:$|[_-])|^(?:(?:aws|google)?accesskeyid|googleaccessid|sig)$)/iu;
 const utf8 = new TextEncoder();
 const verifiedEvents = new WeakSet();
+const preparedImageAttachmentBytes = new WeakMap();
 
 export class AgintiProtocolError extends Error {
   constructor(message, { code = "AGINTI_PROTOCOL_ERROR" } = {}) {
@@ -274,15 +280,176 @@ export function validateAgentSearch(value) {
   });
 }
 
+function decodedBase64Length(value) {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+function bytesToBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  if (typeof globalThis.btoa !== "function") invalid("image base64 encoding is unavailable");
+  const parts = [];
+  const encodingChunkBytes = 9 * 1024;
+  const spreadChunkBytes = 3 * 1024;
+  for (let offset = 0; offset < bytes.byteLength; offset += encodingChunkBytes) {
+    const end = Math.min(offset + encodingChunkBytes, bytes.byteLength);
+    let binary = "";
+    for (let cursor = offset; cursor < end; cursor += spreadChunkBytes) {
+      binary += String.fromCharCode(...bytes.subarray(cursor, Math.min(cursor + spreadChunkBytes, end)));
+    }
+    parts.push(globalThis.btoa(binary));
+  }
+  return parts.join("");
+}
+
+function boundedCanonicalBase64(value, label) {
+  const maximumCharacters = Math.ceil(AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT / 3) * 4;
+  if (typeof value !== "string" || value.length < 4 || value.length > maximumCharacters || value.length % 4 !== 0) {
+    invalid(`${label} is not bounded canonical base64`);
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  const contentLength = value.length - padding;
+  if ((padding === 0 && contentLength % 4 !== 0)
+      || (padding === 1 && contentLength % 4 !== 3)
+      || (padding === 2 && contentLength % 4 !== 2)) {
+    invalid(`${label} is not bounded canonical base64`);
+  }
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = value.charCodeAt(index);
+    if (!((code >= 0x41 && code <= 0x5a)
+        || (code >= 0x61 && code <= 0x7a)
+        || (code >= 0x30 && code <= 0x39)
+        || code === 0x2b || code === 0x2f)) {
+      invalid(`${label} is not bounded canonical base64`);
+    }
+  }
+  for (let index = contentLength; index < value.length; index += 1) {
+    if (value.charCodeAt(index) !== 0x3d) invalid(`${label} is not bounded canonical base64`);
+  }
+  const finalCode = value.charCodeAt(contentLength - 1);
+  const finalSextet = finalCode >= 0x41 && finalCode <= 0x5a ? finalCode - 0x41
+    : finalCode >= 0x61 && finalCode <= 0x7a ? finalCode - 0x61 + 26
+    : finalCode >= 0x30 && finalCode <= 0x39 ? finalCode - 0x30 + 52
+    : finalCode === 0x2b ? 62 : 63;
+  if ((padding === 2 && (finalSextet & 0x0f) !== 0)
+      || (padding === 1 && (finalSextet & 0x03) !== 0)) {
+    invalid(`${label} is not canonical base64`);
+  }
+  const bytes = decodedBase64Length(value);
+  if (!Number.isSafeInteger(bytes) || bytes < 16 || bytes > AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT) {
+    invalid(`${label} exceeds the decoded byte limit`);
+  }
+  return bytes;
+}
+
+function imageAttachment(value, index) {
+  const trustedBytes = value && typeof value === "object"
+    ? preparedImageAttachmentBytes.get(value)
+    : undefined;
+  if (trustedBytes !== undefined) {
+    return Object.freeze({
+      attachmentId: value.attachmentId,
+      mediaType: value.mediaType,
+      data: value.data,
+      byteLength: trustedBytes,
+    });
+  }
+  const attachment = exact(
+    value,
+    ["attachmentId", "mediaType", "data"],
+    `input.attachments[${index}]`,
+  );
+  if (typeof attachment.attachmentId !== "string" || !ATTACHMENT_ID.test(attachment.attachmentId)) {
+    invalid(`input.attachments[${index}].attachmentId is invalid`);
+  }
+  if (!AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES.includes(attachment.mediaType)) {
+    invalid(`input.attachments[${index}].mediaType is unsupported`);
+  }
+  const byteLength = boundedCanonicalBase64(attachment.data, `input.attachments[${index}].data`);
+  return Object.freeze({
+    attachmentId: attachment.attachmentId,
+    mediaType: attachment.mediaType,
+    data: attachment.data,
+    byteLength,
+  });
+}
+
+export function prepareAgentImageAttachments(value) {
+  denseDataArray(value, "canonical image attachments", {
+    minimum: 1,
+    maximum: AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
+  });
+  const attachments = [];
+  const identifiers = new Set();
+  let totalBytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const image = exact(
+      value[index],
+      ["attachmentId", "mediaType", "byteLength", "width", "height", "bytes"],
+      `canonical image attachments[${index}]`,
+    );
+    if (typeof image.attachmentId !== "string" || !ATTACHMENT_ID.test(image.attachmentId)
+        || !AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES.includes(image.mediaType)
+        || !(image.bytes instanceof Uint8Array)
+        || !Number.isSafeInteger(image.byteLength) || image.byteLength !== image.bytes.byteLength
+        || image.byteLength < 16 || image.byteLength > AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT
+        || !Number.isSafeInteger(image.width) || image.width < 1 || image.width > 4_096
+        || !Number.isSafeInteger(image.height) || image.height < 1 || image.height > 4_096
+        || image.width * image.height > 16 * 1024 * 1024) {
+      invalid(`canonical image attachments[${index}] is invalid`);
+    }
+    if (identifiers.has(image.attachmentId)) invalid("canonical image attachment identifiers must be unique");
+    identifiers.add(image.attachmentId);
+    totalBytes += image.byteLength;
+    if (totalBytes > AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT) {
+      invalid("canonical image attachments exceed the aggregate decoded byte limit");
+    }
+    const attachment = Object.freeze({
+      attachmentId: image.attachmentId,
+      mediaType: image.mediaType,
+      data: bytesToBase64(image.bytes),
+    });
+    preparedImageAttachmentBytes.set(attachment, image.byteLength);
+    attachments.push(attachment);
+  }
+  return Object.freeze(attachments);
+}
+
+export function validateAgentImageAttachments(value) {
+  denseDataArray(value, "input.attachments", {
+    minimum: 1,
+    maximum: AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
+  });
+  const attachments = [];
+  const identifiers = new Set();
+  let totalBytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const attachment = imageAttachment(value[index], index);
+    if (identifiers.has(attachment.attachmentId)) invalid("input attachment identifiers must be unique");
+    identifiers.add(attachment.attachmentId);
+    totalBytes += attachment.byteLength;
+    if (totalBytes > AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT) {
+      invalid("input attachments exceed the aggregate decoded byte limit");
+    }
+    attachments.push(Object.freeze({
+      attachmentId: attachment.attachmentId,
+      mediaType: attachment.mediaType,
+      data: attachment.data,
+    }));
+  }
+  return Object.freeze(attachments);
+}
+
 function input(value, { optional = false } = {}) {
   if (optional && value === undefined) return undefined;
-  const object = exact(value, ["text", "search"], "input", ["text"]);
+  const object = exact(value, ["text", "search", "attachments"], "input", ["text"]);
   const text = boundedText(object.text, "input.text", 32_000, { minimum: 1 }).trim();
   if (!text) invalid("input.text must contain non-whitespace text");
   if (utf8.encode(text).byteLength > 32 * 1024) invalid("input.text exceeds the UTF-8 byte limit");
   return Object.freeze({
     text,
     ...(object.search === undefined ? {} : { search: validateAgentSearch(object.search) }),
+    ...(object.attachments === undefined ? {} : { attachments: validateAgentImageAttachments(object.attachments) }),
   });
 }
 
@@ -790,7 +957,16 @@ export function validateAgentCapabilities(value) {
   const agent = exact(response.agent, ["kind", "label"], "agent capabilities agent");
   const model = exact(response.model, ["label"], "agent capabilities model");
   const actions = exact(response.actions, ["cancel", "resume", "retry"], "agent capabilities actions");
-  const attachments = exact(response.attachments, ["enabled"], "agent capabilities attachments");
+  const attachmentFields = [
+    "enabled", "transport", "acceptedMediaTypes", "maximumCount", "maximumBytesEach",
+    "maximumBytesTotal", "model", "persistence",
+  ];
+  const attachments = exact(
+    response.attachments,
+    attachmentFields,
+    "agent capabilities attachments",
+    ["enabled"],
+  );
   const search = response.search === undefined
     ? { enabled: false, modes: [], maximumSources: 0 }
     : exact(response.search, ["enabled", "modes", "maximumSources"], "agent capabilities search");
@@ -800,7 +976,37 @@ export function validateAgentCapabilities(value) {
   if (![actions.cancel, actions.resume, actions.retry, attachments.enabled, search.enabled].every((flag) => typeof flag === "boolean")) {
     invalid("agent capability flags must be booleans");
   }
-  if (actions.retry || attachments.enabled) invalid("retry and attachments are not enabled in protocol v1");
+  if (actions.retry) invalid("retry is not enabled in protocol v1");
+  let attachmentCapability = Object.freeze({ enabled: false });
+  if (attachments.enabled) {
+    exact(attachments, attachmentFields, "agent capabilities attachments");
+    denseDataArray(attachments.acceptedMediaTypes, "agent capabilities attachment media types", {
+      minimum: AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES.length,
+      maximum: AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES.length,
+    });
+    if (!response.enabled
+        || attachments.transport !== "inline-base64"
+        || canonicalJson(attachments.acceptedMediaTypes) !== canonicalJson(AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES)
+        || attachments.maximumCount !== AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT
+        || attachments.maximumBytesEach !== AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT
+        || attachments.maximumBytesTotal !== AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT
+        || attachments.model !== "localllm-vision"
+        || attachments.persistence !== "retained-reference-v1") {
+      invalid("agent attachment capabilities are invalid");
+    }
+    attachmentCapability = Object.freeze({
+      enabled: true,
+      transport: "inline-base64",
+      acceptedMediaTypes: AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES,
+      maximumCount: AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
+      maximumBytesEach: AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT,
+      maximumBytesTotal: AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT,
+      model: "localllm-vision",
+      persistence: "retained-reference-v1",
+    });
+  } else {
+    exact(attachments, ["enabled"], "agent capabilities attachments");
+  }
   const searchModes = search.enabled ? AGINTI_SEARCH_MODES : [];
   const maximumSources = search.enabled
     ? boundedInteger(search.maximumSources, "agent capabilities search maximumSources", { minimum: 1, maximum: 20 })
@@ -833,7 +1039,7 @@ export function validateAgentCapabilities(value) {
     agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
     model: Object.freeze({ label: "LocalLLM" }),
     actions: Object.freeze({ cancel: actions.cancel, resume: actions.resume, retry: false }),
-    attachments: Object.freeze({ enabled: false }),
+    attachments: attachmentCapability,
     ...(search.enabled ? {
       search: Object.freeze({ enabled: search.enabled, modes: Object.freeze(searchModes), maximumSources }),
     } : {}),
@@ -842,10 +1048,69 @@ export function validateAgentCapabilities(value) {
 }
 
 function publicMessage(value, index) {
-  const message = exact(value, ["id", "role", "content", "runId", "createdAt", "digest"], `thread message[${index}]`);
+  const message = exact(
+    value,
+    ["id", "role", "content", "runId", "createdAt", "digest", "attachments"],
+    `thread message[${index}]`,
+    ["id", "role", "content", "runId", "createdAt", "digest"],
+  );
   if (typeof message.id !== "string" || !/^msg_[A-Za-z0-9_-]{16,96}$/u.test(message.id)) invalid("thread message id is invalid");
   if (!["user", "assistant"].includes(message.role)) invalid("thread message role is invalid");
   if (!DIGEST.test(message.digest)) invalid("thread message digest is invalid");
+  let attachments;
+  if (message.attachments !== undefined) {
+    if (message.role !== "user") invalid("only Agent user messages may contain attachments");
+    denseDataArray(message.attachments, `thread message[${index}].attachments`, {
+      minimum: 1,
+      maximum: AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
+    });
+    const identifiers = new Set();
+    let totalBytes = 0;
+    attachments = message.attachments.map((value, attachmentIndex) => {
+      const attachment = exact(
+        value,
+        ["attachmentId", "mediaType", "byteLength", "width", "height", "sha256"],
+        `thread message[${index}].attachments[${attachmentIndex}]`,
+      );
+      if (typeof attachment.attachmentId !== "string" || !ATTACHMENT_ID.test(attachment.attachmentId)
+          || identifiers.has(attachment.attachmentId)
+          || !AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES.includes(attachment.mediaType)
+          || !DIGEST.test(attachment.sha256)) {
+        invalid(`thread message[${index}].attachments[${attachmentIndex}] is invalid`);
+      }
+      identifiers.add(attachment.attachmentId);
+      const byteLength = boundedInteger(
+        attachment.byteLength,
+        `thread message[${index}].attachments[${attachmentIndex}].byteLength`,
+        { minimum: 16, maximum: AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT },
+      );
+      const width = boundedInteger(
+        attachment.width,
+        `thread message[${index}].attachments[${attachmentIndex}].width`,
+        { minimum: 1, maximum: 8_192 },
+      );
+      const height = boundedInteger(
+        attachment.height,
+        `thread message[${index}].attachments[${attachmentIndex}].height`,
+        { minimum: 1, maximum: 8_192 },
+      );
+      if (width * height > 20_000_000) {
+        invalid(`thread message[${index}].attachments[${attachmentIndex}] exceeds the decoded pixel limit`);
+      }
+      totalBytes += byteLength;
+      if (totalBytes > AGINTI_IMAGE_ATTACHMENT_TOTAL_BYTES_LIMIT) {
+        invalid(`thread message[${index}].attachments exceed the aggregate byte limit`);
+      }
+      return Object.freeze({
+        attachmentId: attachment.attachmentId,
+        mediaType: attachment.mediaType,
+        byteLength,
+        width,
+        height,
+        sha256: attachment.sha256,
+      });
+    });
+  }
   return Object.freeze({
     id: message.id,
     role: message.role,
@@ -853,6 +1118,7 @@ function publicMessage(value, index) {
     runId: validateRunId(message.runId),
     createdAt: timestamp(message.createdAt, `thread message[${index}].createdAt`),
     digest: message.digest,
+    ...(attachments === undefined ? {} : { attachments: Object.freeze(attachments) }),
   });
 }
 

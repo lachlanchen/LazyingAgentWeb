@@ -36,6 +36,7 @@ export const CLOUD_HTTP_LIMITS = Object.freeze({
   chatBodyBytes: 72 * 1024,
   visionChatBodyBytes: 24 * 1024 * 1024,
   agentBodyBytes: 64 * 1024,
+  agentVisionBodyBytes: 24 * 1024 * 1024,
   responseJsonBytes: 512 * 1024,
   connectorDeltaBytes: 16 * 1024,
   connectorOutputBytes: 64 * 1024,
@@ -424,6 +425,10 @@ export function bodyLimitForRoute(pathname) {
   if (pathname === CLOUD_ROUTES.session || pathname === CLOUD_ROUTES.logout) return CLOUD_HTTP_LIMITS.sessionBodyBytes;
   if (pathname === CLOUD_ROUTES.chatRunsStart) return CLOUD_HTTP_LIMITS.visionChatBodyBytes;
   if (pathname.startsWith('/api/chat/')) return CLOUD_HTTP_LIMITS.chatBodyBytes;
+  if (pathname === `${AGENT_TRANSPORT_PREFIX}${AGINTI_RPC_PATHS.runsStart}`
+      || pathname === `${AGENT_TRANSPORT_PREFIX}${AGINTI_RPC_PATHS.runsResume}`) {
+    return CLOUD_HTTP_LIMITS.agentVisionBodyBytes;
+  }
   if (pathname.startsWith(`${AGENT_TRANSPORT_PREFIX}/agent/v1/`)) return CLOUD_HTTP_LIMITS.agentBodyBytes;
   throw new TypeError('route has no body limit');
 }

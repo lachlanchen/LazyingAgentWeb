@@ -94,6 +94,7 @@ function stripPngMetadata(bytes, requireServerCompatiblePng) {
     }
     if (PNG_METADATA_CHUNKS.has(type)) stripped = true;
     else {
+      let retain = true;
       if (requireServerCompatiblePng && (type.charCodeAt(0) & 0x20) !== 0) {
         const expectedLength = PNG_SERVER_RENDERING_CHUNKS.get(type);
         const dataOffset = offset + 8;
@@ -107,10 +108,18 @@ function stripPngMetadata(bytes, requireServerCompatiblePng) {
             || view.getUint32(dataOffset + 4) === 0 || bytes[dataOffset + 8] > 1));
         if (incompatible) throw new UnsupportedCanvasPngEncodingError();
         renderingChunks.add(type);
+        // The retained Agent vision profile admits only critical PNG chunks.
+        // These bounded canvas rendering hints have already been applied by
+        // the browser decoder, so omit them from the canonical upload rather
+        // than letting an otherwise safe iPhone canvas output fail upstream.
+        stripped = true;
+        retain = false;
       }
-      const part = bytes.subarray(offset, end);
-      parts.push(part);
-      byteLength += part.byteLength;
+      if (retain) {
+        const part = bytes.subarray(offset, end);
+        parts.push(part);
+        byteLength += part.byteLength;
+      }
     }
     offset = end;
     if (type === "IDAT") sawImageData = true;

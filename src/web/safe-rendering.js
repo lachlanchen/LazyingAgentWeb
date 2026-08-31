@@ -178,11 +178,15 @@ function inlineDataImage(value) {
   if (altEnd < 2 || altEnd > 502 || value.slice(2, altEnd).includes("\n")) return null;
   const destinationStart = altEnd + 2;
   if (!/^data:image\/[a-z0-9.+-]+(?:;[a-z0-9.+-]+=[a-z0-9.+-]+)*(?:;base64)?,/iu.test(value.slice(destinationStart))) return null;
-  const destinationEnd = value.indexOf(")", destinationStart);
-  if (destinationEnd < destinationStart || value.slice(destinationStart, destinationEnd).includes("\n")) return null;
+  const lineEnd = value.indexOf("\n", destinationStart);
+  const closing = value.indexOf(")", destinationStart);
+  const destinationEnd = closing >= destinationStart && (lineEnd === -1 || closing < lineEnd)
+    ? closing
+    : lineEnd === -1 ? value.length : lineEnd;
+  if (destinationEnd <= destinationStart) return null;
   return Object.freeze({
     alt: value.slice(2, altEnd).trim(),
-    length: destinationEnd + 1,
+    length: destinationEnd + (destinationEnd === closing ? 1 : 0),
   });
 }
 

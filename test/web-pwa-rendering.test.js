@@ -1112,7 +1112,8 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
     assert.match(BRIGHT_APP_CSS, new RegExp(`${escaped} \\{[^}]*grid-area: ${area};`, "u"));
   }
-  assert.match(BRIGHT_APP_CSS, /\.chat-scroll \{[^}]*min-height: 0;[^}]*overflow-y: auto;/u);
+  assert.match(BRIGHT_APP_CSS, /\.chat-scroll \{[^}]*min-height: 0;[^}]*overflow-x: hidden;[^}]*overflow-y: auto;/u);
+  assert.match(BRIGHT_APP_CSS, /\.message-content \{[^}]*min-width: 0;[^}]*max-width: 100%;[^}]*overflow-wrap: anywhere;[^}]*word-break: break-word;/u);
   assert.match(BRIGHT_APP_CSS, /\.composer \{[^}]*padding:[^;}]*max\(\.8rem, env\(safe-area-inset-bottom\)\);/u);
   assert.match(
     BRIGHT_APP_CSS,
@@ -6679,6 +6680,21 @@ test("Markdown preserves adjacent assistant lines while retaining hard-break ren
     breaks: 1,
     lines: ["First  ", "Second"],
   });
+});
+
+test("Markdown compacts generated data images instead of exposing their payload as layout-breaking text", () => {
+  const document = new DomDocument();
+  const renderer = createSafeRenderer({ document });
+  const target = document.createElement("section");
+  const payload = "A".repeat(20_000);
+  renderer.renderMarkdown(target, `Result\n\n![Comparison plot](data:image/svg+xml;base64,${payload})\n\nDone`);
+
+  const omitted = target.walk().filter((node) => node.className === "inline-image-omitted");
+  assert.equal(omitted.length, 1);
+  assert.equal(omitted[0].textContent, "Embedded image “Comparison plot” omitted from message.");
+  assert.doesNotMatch(target.textContent, /data:image|AAAAAA/u);
+  assert.match(target.textContent, /Result/u);
+  assert.match(target.textContent, /Done/u);
 });
 
 test("plot, table, Markdown, and source artifacts render declaratively while active content fails closed", () => {

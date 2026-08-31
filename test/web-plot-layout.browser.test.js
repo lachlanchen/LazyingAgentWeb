@@ -187,7 +187,7 @@ const BROWSER_FIXTURE = `<!doctype html>
   <section id="workspace" class="workspace">
     <header class="topbar"><button id="open-sidebar" class="icon-button" type="button" aria-label="Open conversations">☰</button><div class="conversation-meta"><strong id="conversation-title">An intentionally very long adversarial Agent conversation title that must stay on one row</strong><span class="connection-state" role="status">Connected · Agent available</span></div><div class="mode-switch" role="group" aria-label="Conversation mode"><button type="button" aria-pressed="true">Agent</button><button type="button" aria-pressed="false">Chat</button></div><label class="theme-label">Theme<select><option>Bright</option></select></label><details id="topbar-info" class="topbar-info"><summary aria-label="Show app and capability information">Info</summary><p id="capability-note" class="capability-note">Agent capabilities and local storage information.</p></details></header><div hidden></div><div hidden></div>
     <div class="chat-scroll"><section class="messages"><article class="message" data-role="assistant">
-      <p>Completed bounded analysis.</p><section class="message-artifacts">
+      <div id="assistant-message-content" class="message-content"></div><section class="message-artifacts">
         <article class="artifact"><h3>Long categorical labels</h3><div id="categorical"></div></article>
         <article class="artifact"><h3>Large scientific ticks</h3><div id="large-scientific"></div></article>
         <article class="artifact"><h3>Small scientific ticks</h3><div id="small-scientific"></div></article>
@@ -201,6 +201,8 @@ const BROWSER_FIXTURE = `<!doctype html>
 <script type="module">
 import { createSafeRenderer } from "/safe-rendering.js";
 const renderer = createSafeRenderer({ document });
+renderer.renderMarkdown(document.querySelector("#assistant-message-content"),
+  "Completed bounded analysis.\\n\\n![Generated comparison](data:image/svg+xml;base64," + "A".repeat(20_000) + ")");
 const labels = Array.from({ length: 128 }, (unused, index) => (index % 2 ? "WWWWWWWWWWWWWWWW" : "界界界界界界界界界界界界界界界界"));
 const maximum = Number.MAX_SAFE_INTEGER;
 renderer.renderArtifact(document.querySelector("#categorical"), {
@@ -288,6 +290,7 @@ const GEOMETRY_EXPRESSION = `(() => {
   const topbarWithInfo = rectangle(topbarNode);
   topbarInfo.open = false;
   const chatScroll = rectangle(document.querySelector('.chat-scroll'));
+  const assistantContent = document.querySelector('#assistant-message-content');
   const composer = rectangle(document.querySelector('#composer'));
   const messageInput = rectangle(document.querySelector('#message-input'));
   const runAgent = rectangle(document.querySelector('#run-agent'));
@@ -338,6 +341,9 @@ const GEOMETRY_EXPRESSION = `(() => {
     },
     shell: {
       chatScroll,
+      chatHasHorizontalOverflow: document.querySelector('.chat-scroll').scrollWidth > document.querySelector('.chat-scroll').clientWidth,
+      inlineImageCompacted: assistantContent.querySelectorAll('.inline-image-omitted').length === 1
+        && !assistantContent.textContent.includes('data:image'),
       composer,
       messageInput,
       runAgent,
@@ -485,6 +491,8 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     const shellFailures = [];
     for (const [label, result] of [["desktop", desktop], ["iphone", iphone]]) {
       assert.equal(result.pageOverflow, false);
+      assert.equal(result.shell.chatHasHorizontalOverflow, false);
+      assert.equal(result.shell.inlineImageCompacted, true);
       assert.equal(result.maskPreserved, true);
       assert.equal(result.file.actionsCount, 2);
       assert.equal(result.file.controlsInsideTarget, true);

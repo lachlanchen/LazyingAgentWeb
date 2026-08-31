@@ -671,7 +671,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 #offline-banner { grid-area: offline; }
 .context-indicator { grid-area: context; }
 .update-notice { position: fixed; z-index: 10; top: max(.4rem, env(safe-area-inset-top)); left: 50%; width: min(calc(100% - 1rem), 620px); margin: 0; transform: translateX(-50%); box-shadow: var(--shadow); }
-.chat-scroll { grid-area: chat; min-height: 0; overflow-y: auto; scroll-padding-block-end: 4rem; padding: clamp(1rem, 4vw, 3rem) max(1rem, calc((100% - 850px) / 2)); }
+.chat-scroll { grid-area: chat; min-height: 0; overflow-x: hidden; overflow-y: auto; scroll-padding-block-end: 4rem; padding: clamp(1rem, 4vw, 3rem) max(1rem, calc((100% - 850px) / 2)); }
 .chat-bottom { width: 100%; height: 3.75rem; }
 .go-to-bottom { grid-area: chat; z-index: 3; align-self: end; justify-self: end; width: 46px; min-width: 46px; height: 46px; min-height: 46px; margin: .75rem max(1rem, env(safe-area-inset-right)); padding: 0; border-radius: 999px; background: var(--surface); color: var(--accent-strong); box-shadow: var(--shadow); touch-action: manipulation; }
 .welcome { margin: 11vh auto 2rem; max-width: 680px; text-align: center; }
@@ -680,6 +680,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message { min-width: 0; max-width: min(86%, 760px); padding: .85rem 1rem; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
 .message[data-role="user"] { justify-self: end; background: var(--accent-soft); }
 .message[data-role="assistant"] { width: min(100%, 760px); max-width: min(100%, 760px); justify-self: start; }
+.message-content { min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+.inline-image-omitted { color: var(--muted); font-size: .88rem; }
 .agent-run-failure { margin: 0; color: var(--danger); overflow-wrap: anywhere; }
 .message pre { overflow-x: auto; padding: .8rem; border-radius: 10px; background: var(--surface-soft); }
 .message-artifacts { min-width: 0; display: grid; gap: .75rem; margin-top: .85rem; padding-top: .85rem; border-top: 1px solid var(--line); overflow-wrap: anywhere; }

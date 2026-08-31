@@ -172,6 +172,20 @@ function safeHref(value, locationHref) {
   return parsed.href;
 }
 
+function inlineDataImage(value) {
+  if (!value.startsWith("![")) return null;
+  const altEnd = value.indexOf("](", 2);
+  if (altEnd < 2 || altEnd > 502 || value.slice(2, altEnd).includes("\n")) return null;
+  const destinationStart = altEnd + 2;
+  if (!/^data:image\/[a-z0-9.+-]+(?:;[a-z0-9.+-]+=[a-z0-9.+-]+)*(?:;base64)?,/iu.test(value.slice(destinationStart))) return null;
+  const destinationEnd = value.indexOf(")", destinationStart);
+  if (destinationEnd < destinationStart || value.slice(destinationStart, destinationEnd).includes("\n")) return null;
+  return Object.freeze({
+    alt: value.slice(2, altEnd).trim(),
+    length: destinationEnd + 1,
+  });
+}
+
 function mathNode({ document, katex }, source, displayMode, budget) {
   const container = createNode(document, displayMode ? "div" : "span", displayMode ? "math-display" : "math-inline");
   const bounded = source.slice(0, MAX_TEX_EXPRESSION);
@@ -212,6 +226,16 @@ function appendInline(runtime, parent, source, budget, depth = 0) {
   let cursor = 0;
   while (cursor < source.length) {
     const remaining = source.slice(cursor);
+    const embeddedImage = inlineDataImage(remaining);
+    if (embeddedImage) {
+      const omitted = createNode(document, "span", "inline-image-omitted");
+      omitted.textContent = embeddedImage.alt
+        ? `Embedded image “${embeddedImage.alt}” omitted from message.`
+        : "Embedded image omitted from message.";
+      parent.appendChild(omitted);
+      cursor += embeddedImage.length;
+      continue;
+    }
     if (remaining.startsWith("\\(") && !escapedAt(source, cursor)) {
       const end = closingDelimiter(source, "\\)", cursor + 2);
       if (end > cursor + 2) {

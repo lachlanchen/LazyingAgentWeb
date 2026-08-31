@@ -83,6 +83,35 @@ function attachmentCapabilities() {
   };
 }
 
+function roleCapabilities(overrides = {}) {
+  const observedAt = "2026-08-31T16:11:38.009Z";
+  const ready = (role) => ({
+    schemaVersion: "aginti-analysis-role-state-v1",
+    role,
+    configured: true,
+    status: "ready",
+    ready: true,
+    observedAt,
+    reason: null,
+    actionable: null,
+  });
+  return {
+    executionWorker: ready("executionWorker"),
+    documentWorker: {
+      schemaVersion: "aginti-analysis-role-state-v1",
+      role: "documentWorker",
+      configured: true,
+      status: "degraded",
+      ready: false,
+      observedAt,
+      reason: "credential_unavailable",
+      actionable: "repair the private route or credential, then reactivate",
+    },
+    groundedSearch: ready("groundedSearch"),
+    ...overrides,
+  };
+}
+
 function publicThread(overrides = {}) {
   return {
     id: THREAD_ID,
@@ -428,6 +457,19 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
   assert.deepEqual(validateAgentCapabilities(searchAndFiles).artifacts.kinds, [
     "plot", "table", "markdown", "sources", "file",
   ]);
+  const roleAware = { ...searchEnabled, roles: roleCapabilities() };
+  assert.deepEqual(validateAgentCapabilities(roleAware), roleAware,
+    "strict role health is retained without disabling an otherwise ready Agent");
+  assert.equal(validateAgentCapabilities(roleAware).roles.executionWorker.ready, true);
+  assert.equal(validateAgentCapabilities(roleAware).roles.documentWorker.status, "degraded");
+  for (const roles of [
+    { ...roleCapabilities(), executionWorker: { ...roleCapabilities().executionWorker, role: "documentWorker" } },
+    { ...roleCapabilities(), groundedSearch: { ...roleCapabilities().groundedSearch, status: "degraded", ready: true } },
+    { ...roleCapabilities(), documentWorker: { ...roleCapabilities().documentWorker, actionable: "/home/private" } },
+    { ...roleCapabilities(), unknownWorker: roleCapabilities().executionWorker },
+  ]) {
+    assert.equal(failClosedCapabilities({ ...searchEnabled, roles }), FAIL_CLOSED_AGENT_CAPABILITIES);
+  }
   for (const invalid of [
     { ...searchEnabled, search: { enabled: true, modes: ["web", "both", "papers"], maximumSources: 20 } },
     { ...searchEnabled, search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 21 } },

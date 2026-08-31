@@ -93,6 +93,8 @@ const CONTROL = /\u0000|[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ZERO_HASH = "0".repeat(64);
 const MAX_PLOT_MAGNITUDE = Number.MAX_SAFE_INTEGER;
 const SEARCH_MODES = new Set(AGINTI_SEARCH_MODES);
+const AGINTI_ROLE_NAMES = Object.freeze(["executionWorker", "documentWorker", "groundedSearch"]);
+const AGINTI_ROLE_STATUSES = new Set(["disabled", "configured", "degraded", "ready"]);
 const CREDENTIAL_QUERY_NAME = /(?:(?:^|[_-])(?:access[_-]?token|api[_-]?key|auth(?:orization)?|credential|key|password|secret|signature|token)(?:$|[_-])|^(?:(?:aws|google)?accesskeyid|googleaccessid|sig)$)/iu;
 const utf8 = new TextEncoder();
 const verifiedEvents = new WeakSet();
@@ -950,10 +952,56 @@ export function assertVerifiedAgentEvent(value) {
   return value;
 }
 
+function validateAgentRoles(value) {
+  const envelope = exact(value, AGINTI_ROLE_NAMES, "agent capabilities roles");
+  const snapshots = {};
+  for (const roleName of AGINTI_ROLE_NAMES) {
+    const role = exact(
+      envelope[roleName],
+      ["schemaVersion", "role", "configured", "status", "ready", "observedAt", "reason", "actionable"],
+      `agent capabilities ${roleName} role`,
+    );
+    const ready = role.status === "ready";
+    if (role.schemaVersion !== "aginti-analysis-role-state-v1"
+        || role.role !== roleName
+        || typeof role.configured !== "boolean"
+        || !AGINTI_ROLE_STATUSES.has(role.status)
+        || role.ready !== ready) {
+      invalid("agent role capabilities are invalid");
+    }
+    const observedAt = timestamp(role.observedAt, `agent capabilities ${roleName} observedAt`);
+    if (ready) {
+      if (role.configured !== true || role.reason !== null || role.actionable !== null) {
+        invalid("agent ready role capability is invalid");
+      }
+    } else {
+      boundedText(role.reason, `agent capabilities ${roleName} reason`, 96, {
+        minimum: 3,
+        presentation: true,
+      });
+      boundedText(role.actionable, `agent capabilities ${roleName} actionable`, 240, {
+        minimum: 3,
+        presentation: true,
+      });
+    }
+    snapshots[roleName] = Object.freeze({
+      schemaVersion: "aginti-analysis-role-state-v1",
+      role: roleName,
+      configured: role.configured,
+      status: role.status,
+      ready,
+      observedAt,
+      reason: role.reason,
+      actionable: role.actionable,
+    });
+  }
+  return Object.freeze(snapshots);
+}
+
 export function validateAgentCapabilities(value) {
   const response = exact(
     value,
-    ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "search", "artifacts"],
+    ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "search", "roles", "artifacts"],
     "agent capabilities",
     ["schemaVersion", "enabled", "agent", "model", "actions", "attachments", "artifacts"],
   );
@@ -976,6 +1024,7 @@ export function validateAgentCapabilities(value) {
   const search = response.search === undefined
     ? { enabled: false, modes: [], maximumSources: 0 }
     : exact(response.search, ["enabled", "modes", "maximumSources"], "agent capabilities search");
+  const roles = response.roles === undefined ? undefined : validateAgentRoles(response.roles);
   const artifacts = exact(response.artifacts, ["kinds", "schemaVersion"], "agent capabilities artifacts");
   if (agent.kind !== "aginti" || agent.label !== "AgInTi Agent") invalid("agent authority must be AgInTi");
   if (model.label !== "LocalLLM") invalid("agent inference label must be LocalLLM");
@@ -1051,6 +1100,7 @@ export function validateAgentCapabilities(value) {
     ...(search.enabled ? {
       search: Object.freeze({ enabled: search.enabled, modes: Object.freeze(searchModes), maximumSources }),
     } : {}),
+    ...(roles === undefined ? {} : { roles }),
     artifacts: Object.freeze({ kinds: Object.freeze(artifactKinds), schemaVersion: AGINTI_SCHEMA_VERSION }),
   });
 }

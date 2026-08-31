@@ -226,14 +226,17 @@ function appendInline(runtime, parent, source, budget, depth = 0) {
   let cursor = 0;
   while (cursor < source.length) {
     const remaining = source.slice(cursor);
-    const embeddedImage = inlineDataImage(remaining);
+    const escapedEmbeddedImage = remaining.startsWith("\\![")
+      ? inlineDataImage(remaining.slice(1))
+      : null;
+    const embeddedImage = escapedEmbeddedImage ?? inlineDataImage(remaining);
     if (embeddedImage) {
       const omitted = createNode(document, "span", "inline-image-omitted");
       omitted.textContent = embeddedImage.alt
         ? `Embedded image “${embeddedImage.alt}” omitted from message.`
         : "Embedded image omitted from message.";
       parent.appendChild(omitted);
-      cursor += embeddedImage.length;
+      cursor += embeddedImage.length + (escapedEmbeddedImage === null ? 0 : 1);
       continue;
     }
     if (remaining.startsWith("\\(") && !escapedAt(source, cursor)) {

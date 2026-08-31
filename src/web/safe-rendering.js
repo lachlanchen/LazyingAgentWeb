@@ -330,7 +330,7 @@ function appendInline(runtime, parent, source, budget, depth = 0) {
       continue;
     }
     let next = cursor + 1;
-    while (next < source.length && !/[\\`*$\[<_~\n]/u.test(source[next])) next += 1;
+    while (next < source.length && !/[!\\`*$\[<_~\n]/u.test(source[next])) next += 1;
     appendText(document, parent, source.slice(cursor, next));
     cursor = next;
   }

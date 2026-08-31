@@ -190,7 +190,7 @@ function capabilities(overrides = {}) {
 function agentImageCapabilities(overrides = {}) {
   return capabilities({
     enabled: true,
-    actions: { cancel: true, resume: true, retry: false },
+    actions: { cancel: true, resume: true, retry: true },
     attachments: {
       enabled: true,
       transport: "inline-base64",
@@ -1263,6 +1263,7 @@ test("Agent empty Resume snapshots the retained-image marker and idempotency for
   browser.document.getElementById("message-input").value = "Inspect this image";
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(browser.document.getElementById("workspace").dataset.status, "failed");
+  assert.equal(browser.document.getElementById("resume-run").textContent, "Retry");
 
   await browser.app.resume();
   await browser.app.resume();
@@ -3364,7 +3365,7 @@ test("Agent resume binds a new run to the exact failed predecessor before openin
   let resumes = 0;
   let resumeArguments = null;
   const agent = {
-    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: true } })),
     async createThread() { return { thread: agentThread() }; },
     async startRun() { return { run: run("running") }; },
     async resumeRun(...args) {

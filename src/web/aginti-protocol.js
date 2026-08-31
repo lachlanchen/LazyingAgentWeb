@@ -1031,7 +1031,6 @@ export function validateAgentCapabilities(value) {
   if (![actions.cancel, actions.resume, actions.retry, attachments.enabled, search.enabled].every((flag) => typeof flag === "boolean")) {
     invalid("agent capability flags must be booleans");
   }
-  if (actions.retry) invalid("retry is not enabled in protocol v1");
   let attachmentCapability = Object.freeze({ enabled: false });
   if (attachments.enabled) {
     exact(attachments, attachmentFields, "agent capabilities attachments");
@@ -1089,13 +1088,15 @@ export function validateAgentCapabilities(value) {
       || canonicalJson(artifacts.kinds) !== canonicalJson(artifactKinds)) {
     invalid("agent artifact capabilities are invalid");
   }
-  if (!response.enabled && (actions.cancel || actions.resume)) invalid("disabled capabilities may not advertise actions");
+  if (!response.enabled && (actions.cancel || actions.resume || actions.retry)) {
+    invalid("disabled capabilities may not advertise actions");
+  }
   return Object.freeze({
     schemaVersion: AGINTI_SCHEMA_VERSION,
     enabled: response.enabled,
     agent: Object.freeze({ kind: "aginti", label: "AgInTi Agent" }),
     model: Object.freeze({ label: "LocalLLM" }),
-    actions: Object.freeze({ cancel: actions.cancel, resume: actions.resume, retry: false }),
+    actions: Object.freeze({ cancel: actions.cancel, resume: actions.resume, retry: actions.retry }),
     attachments: attachmentCapability,
     ...(search.enabled ? {
       search: Object.freeze({ enabled: search.enabled, modes: Object.freeze(searchModes), maximumSources }),

@@ -406,17 +406,18 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
   assert.equal(selectDefaultMode(capabilities()), "chat");
   const enabled = capabilities({
     enabled: true,
-    actions: { cancel: true, resume: true, retry: false },
+    actions: { cancel: true, resume: true, retry: true },
   });
   assert.equal(validateAgentCapabilities(enabled).enabled, true);
   assert.equal(validateAgentCapabilities(enabled).search, undefined, "legacy capability stays byte-shape compatible");
   assert.deepEqual(validateAgentCapabilities(enabled), enabled);
+  assert.equal(validateAgentCapabilities(enabled).actions.retry, true);
   assert.equal(canonicalJson(validateAgentCapabilities(enabled)), canonicalJson(enabled));
   assert.equal(digest(canonicalJson(validateAgentCapabilities(enabled))), digest(canonicalJson(enabled)));
   assert.equal(Object.hasOwn(FAIL_CLOSED_AGENT_CAPABILITIES, "search"), false);
   const explicitlyDisabledSearch = capabilities({
     enabled: true,
-    actions: { cancel: true, resume: true, retry: false },
+    actions: { cancel: true, resume: true, retry: true },
     search: { enabled: false, modes: [], maximumSources: 0 },
   });
   assert.deepEqual(validateAgentCapabilities(explicitlyDisabledSearch), enabled);

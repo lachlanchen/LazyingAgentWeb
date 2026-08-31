@@ -1395,7 +1395,22 @@ export function createBrowserApp({
 
   function clearAgentReconnect() {
     state.agentReconnect = null;
-    elements.resume_run.textContent = "Resume";
+    updateAgentTerminalActionLabel();
+  }
+
+  function updateAgentTerminalActionLabel() {
+    if (state.agentReconnect !== null) {
+      elements.resume_run.textContent = "Reconnect";
+      return;
+    }
+    const terminalFailure = state.mode === "agent"
+      && (state.agentRunStatus === "failed" || state.agentRunStatus === "cancelled");
+    const correctedPrompt = String(elements.message_input.value ?? "").length > 0;
+    elements.resume_run.textContent = terminalFailure
+      && state.capabilities.actions.retry
+      && (!correctedPrompt || !state.capabilities.actions.resume)
+      ? "Retry"
+      : "Resume";
   }
 
   function currentAgentReconnect(descriptor = state.agentReconnect) {
@@ -2841,11 +2856,14 @@ export function createBrowserApp({
     const isTerminal = TERMINAL.has(visibleStatus);
     if (isTerminal) clearAgentReconnect();
     elements.stop_run.hidden = isTerminal || state.agentCancelPending || !state.capabilities.actions.cancel;
+    const terminalActionAvailable = state.capabilities.actions.resume
+      || state.capabilities.actions.retry;
     elements.resume_run.hidden = state.agentReplayValidating
       || state.agentReplayFailed
       || !state.agentReplayOfferResume
-      || !state.capabilities.actions.resume
+      || !terminalActionAvailable
       || (visibleStatus !== "failed" && visibleStatus !== "cancelled");
+    updateAgentTerminalActionLabel();
     if (releaseCancellationFence) {
       updateImageControl();
       flushDeferredSessionRevalidation();
@@ -2862,7 +2880,7 @@ export function createBrowserApp({
       : "";
     const message = document.createElement("p");
     message.className = "agent-run-failure";
-    message.textContent = candidate || "Agent execution failed. Resume this run to try again.";
+    message.textContent = candidate || "Agent execution failed. Retry the exact request or edit the prompt and resume.";
     runMessage.body.replaceChildren(message);
   }
 
@@ -6205,7 +6223,8 @@ export function createBrowserApp({
           expectedRunId: reconnectDescriptor.runId,
           expectedThreadId: reconnectDescriptor.threadId,
         });
-      } else if (state.runId && state.capabilities.enabled && state.capabilities.actions.resume) {
+      } else if (state.runId && state.capabilities.enabled
+          && (state.capabilities.actions.resume || state.capabilities.actions.retry)) {
         const requestedRunId = state.runId;
         const requestedThreadId = state.agentThreadId;
         const requestedSession = state.session;
@@ -6218,6 +6237,10 @@ export function createBrowserApp({
           if (state.agentRunStatus === "failed" || state.agentRunStatus === "cancelled") {
             const candidate = elements.message_input.value;
             if (candidate !== "") {
+              if (!state.capabilities.actions.resume) {
+                showToast("Corrected prompts are unavailable. Clear the composer to retry the exact request.");
+                return;
+              }
               try {
                 draft = candidate;
                 text = boundedMessage(candidate);
@@ -6226,6 +6249,10 @@ export function createBrowserApp({
                 return;
               }
             }
+          }
+          if (text === undefined && !state.capabilities.actions.retry) {
+            showToast("Exact retry is unavailable. Edit the prompt before resuming this run.");
+            return;
           }
           let search;
           if (text !== undefined) {
@@ -7261,6 +7288,7 @@ export function createBrowserApp({
     for (const input of [elements.username, elements.password, elements.message_input]) {
       input.addEventListener("input", () => {
         if (input === elements.message_input) {
+          updateAgentTerminalActionLabel();
           invalidatePreparedUpdateHandoff();
           if (state.retainedUpdateRecoveryPending) {
             invalidateRetainedUpdateRecoveryInstallation();

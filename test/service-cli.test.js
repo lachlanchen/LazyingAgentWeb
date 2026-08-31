@@ -1,8 +1,29 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { runCli } from '../src/cli.js';
+
+test('the packaged bin symlink executes the CLI entrypoint instead of silently returning', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lazying-agent-web-bin-'));
+  const executable = join(directory, 'lazying-agent-web');
+  try {
+    symlinkSync(new URL('../src/cli.js', import.meta.url), executable);
+    const result = spawnSync(process.execPath, [executable, 'unsupported-command'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.trim().split('\n')[0], '{"ok":false,"error":"standalone_service_command_failed"}');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 function outputCollector() {
   let value = '';

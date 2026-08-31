@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 import { rolloutAdmissionSocketPathForRuntimeDirectory } from './rollout-admission.js';
@@ -142,5 +143,10 @@ export async function main() {
   }
 }
 
-const entry = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+let entry = null;
+try {
+  entry = process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : null;
+} catch {
+  entry = null;
+}
 if (entry === import.meta.url) await main();

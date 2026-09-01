@@ -3305,6 +3305,7 @@ export function createBrowserApp({
     elements.resume_run.hidden = true;
     if (replayTerminal) connection("Restoring verified Agent history", false);
     let recoveries = 0;
+    let terminalDrainAttempted = false;
     try {
       while (ownsStream()) {
         let failure = null;
@@ -3365,16 +3366,28 @@ export function createBrowserApp({
           if (!ownsStream()) return;
           if (error instanceof AgintiProtocolError || error?.retryable === false) throw error;
         }
+        const authoritativeTerminal = authoritativeRun !== null
+          && TERMINAL.has(authoritativeRun.status);
         if (recoveries >= maxAutomaticAgentReconnects) {
-          throw failure ?? Object.assign(new Error("Agent stream reached its automatic reconnect boundary"), {
-            retryable: true,
-          });
+          // A status response is useful progress evidence but cannot safely
+          // render a terminal result by itself. Allow exactly one final
+          // read-only ledger drain when AgInTi says the run is terminal. This
+          // closes the common race where the finite reconnect budget expires
+          // just before the hash-chained terminal event becomes readable,
+          // without turning a broken terminal ledger into an infinite loop.
+          if (!authoritativeTerminal || terminalDrainAttempted) {
+            throw failure ?? Object.assign(new Error("Agent stream reached its automatic reconnect boundary"), {
+              retryable: true,
+            });
+          }
+          terminalDrainAttempted = true;
+        } else {
+          recoveries += 1;
         }
-        recoveries += 1;
-        connection(authoritativeRun && TERMINAL.has(authoritativeRun.status)
+        connection(authoritativeTerminal
           ? "Waiting for verified Agent completion"
           : "Reconnecting to AgInTi", false);
-        const backoffStep = Math.min(recoveries - 1, maxStreamBackoffSteps);
+        const backoffStep = Math.min(Math.max(recoveries - 1, 0), maxStreamBackoffSteps);
         await wait(Math.min(4_000, 250 * (2 ** backoffStep)), controller.signal);
       }
     } catch (error) {

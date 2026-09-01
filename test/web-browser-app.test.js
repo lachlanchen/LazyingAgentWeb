@@ -8930,6 +8930,51 @@ test("Agent reconnect exhausts a finite automatic budget then continues the same
   assert.equal(reconnect.textContent, "Resume");
 });
 
+test("a terminal status at the reconnect boundary receives one final verified ledger drain", async () => {
+  const terminal = await verifiedEvent({
+    seq: 1,
+    type: "run.completed",
+    payload: {},
+    previousHash: ZERO_HASH,
+  });
+  const waits = [];
+  let streams = 0;
+  let statuses = 0;
+  let starts = 0;
+  let resumes = 0;
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Terminal drain" } }; },
+    async startRun() { starts += 1; return { run: run() }; },
+    async resumeRun() { resumes += 1; throw new Error("a terminal drain must never resume a run"); },
+    async runStatus() {
+      statuses += 1;
+      return { run: statuses === 2 ? terminalRun("completed", [terminal]) : run() };
+    },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 3) yield { event: terminal, cursor: { seq: terminal.seq, hash: terminal.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    maxAutomaticAgentReconnects: 1,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Finish at the boundary";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(starts, 1);
+  assert.equal(resumes, 0);
+  assert.equal(statuses, 2);
+  assert.equal(streams, 3, "the terminal status permits exactly one additional read-only stream");
+  assert.deepEqual(waits, [250, 250]);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
+});
+
 test("an authentication reset rejects an in-flight stale Agent reconnect descriptor", async () => {
   const first = await verifiedEvent({
     seq: 1,

@@ -1,5 +1,6 @@
 export * from "./aginti-client.js";
 export * from "./aginti-protocol.js";
+export * from "./assistant-speech.js";
 export * from "./asset-map.js";
 export * from "./browser-app.js";
 export * from "./cloud-session-client.js";
@@ -7,4 +8,5 @@ export * from "./direct-chat-client.js";
 export * from "./presentation-state.js";
 export * from "./pwa-assets.js";
 export * from "./safe-rendering.js";
+export * from "./speech-client.js";
 export * from "./web-release.js";

@@ -1,4 +1,5 @@
 import { AgintiBrowserClient, AgintiTransportError, selectDefaultMode } from "./aginti-client.js";
+import { createAssistantSpeechPlayback } from "./assistant-speech.js";
 import {
   AgintiProtocolError,
   FAIL_CLOSED_AGENT_CAPABILITIES,
@@ -29,6 +30,10 @@ import {
   inspectVisionImageBytes,
   VisionImageInputError,
 } from "./vision-image-client.js";
+import {
+  BROWSER_SPEECH_LIMITS,
+  SpeechBrowserClient,
+} from "./speech-client.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const UNSAFE_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
@@ -1067,13 +1072,14 @@ function elementMap(document) {
     "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
     "activity-panel", "activity-disclosure", "run-state", "agent-plan",
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
-    "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
+    "stop-run", "voice-input", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
     "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
   ];
+  const progressiveIds = new Set(["voice-input"]);
   return Object.freeze(Object.fromEntries(ids.map((id) => {
     const value = document.getElementById(id);
-    if (!value) throw new TypeError(`app shell is missing #${id}`);
+    if (!value && !progressiveIds.has(id)) throw new TypeError(`app shell is missing #${id}`);
     return [id.replaceAll("-", "_"), value];
   })));
 }
@@ -1097,6 +1103,8 @@ export function createBrowserApp({
   sessionClient: suppliedSessionClient,
   createAgentClient: suppliedAgentClientFactory,
   createChatClient: suppliedChatClientFactory,
+  createSpeechClient: suppliedSpeechClientFactory,
+  assistantSpeech: suppliedAssistantSpeech,
   renderer,
   cursorStore,
   credentialSaver = offerPasswordManagerSave,
@@ -1113,6 +1121,9 @@ export function createBrowserApp({
   attachmentDecodeTimeoutMs = 15_000,
   attachmentMemoryLimitBytes = DEFAULT_ATTACHMENT_MEMORY_LIMIT_BYTES,
   attachmentDecodedMemoryLimitBytes = DEFAULT_ATTACHMENT_DECODED_MEMORY_LIMIT_BYTES,
+  mediaRecorderConstructor: suppliedMediaRecorderConstructor,
+  getUserMedia: suppliedGetUserMedia,
+  voiceMaximumDurationMs = BROWSER_SPEECH_LIMITS.durationSeconds * 1_000,
   now = Date.now,
   maxStreamBackoffSteps = 5,
   maxAutomaticAgentReconnects = 3,
@@ -1142,11 +1153,32 @@ export function createBrowserApp({
     csrfToken: () => sessionClient.csrfToken?.() ?? session.csrfToken,
     releaseId: currentRelease,
   }));
+  const createSpeechClient = suppliedSpeechClientFactory ?? ((session) => new SpeechBrowserClient({
+    baseUrl: browserBaseUrl,
+    csrfToken: () => sessionClient.csrfToken?.() ?? session.csrfToken,
+    releaseId: currentRelease,
+  }));
+  const MediaRecorderConstructor = suppliedMediaRecorderConstructor
+    ?? window?.MediaRecorder ?? globalThis.MediaRecorder;
+  const getUserMedia = suppliedGetUserMedia
+    ?? (typeof navigator?.mediaDevices?.getUserMedia === "function"
+      ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+      : null);
+  const assistantSpeech = suppliedAssistantSpeech ?? createAssistantSpeechPlayback({
+    speechSynthesis: window?.speechSynthesis,
+    utteranceConstructor: window?.SpeechSynthesisUtterance,
+    language: navigator?.language,
+  });
   requiredMethod(sessionClient, "restore", "sessionClient");
   requiredMethod(sessionClient, "login", "sessionClient");
   requiredMethod(sessionClient, "logout", "sessionClient");
-  if (typeof createAgentClient !== "function" || typeof createChatClient !== "function") {
+  if (typeof createAgentClient !== "function" || typeof createChatClient !== "function"
+      || typeof createSpeechClient !== "function") {
     throw new TypeError("client factories are required");
+  }
+  if (!assistantSpeech || typeof assistantSpeech.available !== "boolean"
+      || typeof assistantSpeech.speak !== "function" || typeof assistantSpeech.cancel !== "function") {
+    throw new TypeError("assistantSpeech must provide available, speak(), and cancel()");
   }
   requiredMethod(renderer, "renderMarkdown", "renderer");
   requiredMethod(renderer, "renderArtifact", "renderer");
@@ -1197,6 +1229,10 @@ export function createBrowserApp({
       || attachmentDecodedMemoryLimitBytes > 64 * 1024 * 1024) {
     throw new TypeError("attachmentDecodedMemoryLimitBytes must be from one byte through 64 MiB");
   }
+  if (!Number.isSafeInteger(voiceMaximumDurationMs) || voiceMaximumDurationMs < 1_000
+      || voiceMaximumDurationMs > BROWSER_SPEECH_LIMITS.durationSeconds * 1_000) {
+    throw new TypeError("voiceMaximumDurationMs must be from one second through two minutes");
+  }
   if (typeof now !== "function") throw new TypeError("now must be a function");
   if (!Number.isSafeInteger(maxStreamBackoffSteps) || maxStreamBackoffSteps < 0 || maxStreamBackoffSteps > 20) {
     throw new TypeError("maxStreamBackoffSteps must be an integer from 0 through 20");
@@ -1218,6 +1254,7 @@ export function createBrowserApp({
     chatCapabilities: FAIL_CLOSED_CHAT_CAPABILITIES,
     agent: null,
     chat: null,
+    speech: null,
     mode: "chat",
     agentThreads: [],
     chatThreads: [],
@@ -1247,6 +1284,12 @@ export function createBrowserApp({
     selectedImageUrls: Object.freeze([]),
     imagePreparing: false,
     imagePreparationAbort: null,
+    voiceStarting: false,
+    voiceCapture: null,
+    voiceTranscribing: false,
+    voiceTranscriptionAbort: null,
+    voiceEpoch: 0,
+    speakingButton: null,
     imageSelectionEpoch: 0,
     imageRenderEpoch: 0,
     messageImageUrls: new Set(),
@@ -1489,6 +1532,262 @@ export function createBrowserApp({
     return mode === "chat" && chatCapability?.visionInput === true;
   }
 
+  function voiceRuntimeAvailable() {
+    const secure = window?.isSecureContext === true || window?.location?.protocol === "https:";
+    return elements.voice_input !== null && secure
+      && typeof MediaRecorderConstructor === "function" && typeof getUserMedia === "function";
+  }
+
+  function voiceOperationActive() {
+    return state.voiceStarting || state.voiceCapture !== null || state.voiceTranscribing;
+  }
+
+  function stopVoiceTracks(stream) {
+    try {
+      for (const track of stream?.getTracks?.() ?? []) track.stop?.();
+    } catch { /* Microphone release is best-effort after the capture is fenced. */ }
+  }
+
+  function stopCaptureTracks(capture) {
+    if (!capture || capture.tracksStopped) return;
+    capture.tracksStopped = true;
+    stopVoiceTracks(capture.stream);
+  }
+
+  function clearVoiceTimer(capture) {
+    if (capture?.timer === null || capture?.timer === undefined) return;
+    const clear = window?.clearTimeout?.bind(window) ?? globalThis.clearTimeout;
+    clear?.(capture.timer);
+    capture.timer = null;
+  }
+
+  function cancelVoiceInput({ abortTranscription = true } = {}) {
+    state.voiceEpoch += 1;
+    state.voiceStarting = false;
+    if (abortTranscription) state.voiceTranscriptionAbort?.abort();
+    state.voiceTranscriptionAbort = null;
+    state.voiceTranscribing = false;
+    const capture = state.voiceCapture;
+    state.voiceCapture = null;
+    if (capture !== null) {
+      capture.discard = true;
+      capture.chunks.length = 0;
+      clearVoiceTimer(capture);
+      try {
+        if (capture.recorder?.state !== "inactive") capture.recorder.stop();
+      } catch { /* The capture is already fenced and discarded. */ }
+      stopCaptureTracks(capture);
+    }
+    updateImageControl();
+  }
+
+  function voiceRecorderFor(stream) {
+    const choices = [
+      "audio/mp4;codecs=mp4a.40.2",
+      "audio/mp4",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+    ];
+    const supported = typeof MediaRecorderConstructor.isTypeSupported === "function"
+      ? choices.filter((mediaType) => MediaRecorderConstructor.isTypeSupported(mediaType))
+      : choices;
+    for (const mediaType of supported) {
+      try {
+        const recorder = new MediaRecorderConstructor(stream, { mimeType: mediaType });
+        return Object.freeze({ recorder, mediaType });
+      } catch { /* Try the next standards-based recording container. */ }
+    }
+    try {
+      const recorder = new MediaRecorderConstructor(stream);
+      const mediaType = String(recorder.mimeType ?? "");
+      if (["audio/mp4", "audio/x-m4a", "audio/webm", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mpeg"]
+        .includes(mediaType.split(";", 1)[0].trim().toLowerCase())) {
+        return Object.freeze({ recorder, mediaType });
+      }
+    } catch { /* Report one generic compatibility error below. */ }
+    throw new TypeError("This browser cannot record a supported voice format.");
+  }
+
+  function insertVoiceTranscript(value) {
+    const transcript = String(value ?? "").trim();
+    if (!transcript) throw new TypeError("Voice transcription was empty.");
+    const current = String(elements.message_input.value ?? "");
+    const start = Number.isSafeInteger(elements.message_input.selectionStart)
+      ? Math.min(current.length, Math.max(0, elements.message_input.selectionStart))
+      : current.length;
+    const end = Number.isSafeInteger(elements.message_input.selectionEnd)
+      ? Math.min(current.length, Math.max(start, elements.message_input.selectionEnd))
+      : start;
+    const before = current.slice(0, start);
+    const after = current.slice(end);
+    const prefix = before && !/\s$/u.test(before) ? " " : "";
+    const suffix = after && !/^\s/u.test(after) ? " " : "";
+    const inserted = `${prefix}${transcript}${suffix}`;
+    const next = `${before}${inserted}${after}`;
+    if (next.length > 32_000 || updateHandoffEncoder.encode(next).byteLength > COMPOSER_MESSAGE_BYTES_LIMIT) {
+      throw new TypeError("The transcript does not fit in the current draft.");
+    }
+    elements.message_input.value = next;
+    const cursor = before.length + inserted.length;
+    try { elements.message_input.setSelectionRange?.(cursor, cursor); }
+    catch { /* Cursor placement is cosmetic; the transcript remains editable. */ }
+    elements.message_input.selectionStart = cursor;
+    elements.message_input.selectionEnd = cursor;
+    composerDraftChanged();
+    elements.message_input.focus?.();
+  }
+
+  async function finishVoiceCapture(capture) {
+    clearVoiceTimer(capture);
+    stopCaptureTracks(capture);
+    if (state.voiceCapture !== capture) {
+      capture.chunks.length = 0;
+      return;
+    }
+    state.voiceCapture = null;
+    if (capture.discard) {
+      capture.chunks.length = 0;
+      updateImageControl();
+      return;
+    }
+    if (capture.overflow) {
+      capture.chunks.length = 0;
+      updateImageControl();
+      showToast("That recording exceeded 8 MiB. Record a shorter voice prompt.");
+      return;
+    }
+    const recording = new Blob(capture.chunks, { type: capture.mediaType });
+    capture.chunks.length = 0;
+    if (recording.size < 1 || recording.size > BROWSER_SPEECH_LIMITS.audioBytes) {
+      updateImageControl();
+      showToast("No usable voice recording was captured. Please try again.");
+      return;
+    }
+    const controller = new AbortController();
+    const owner = Object.freeze({
+      epoch: capture.epoch,
+      session: capture.session,
+      speech: capture.speech,
+      controller,
+    });
+    state.voiceTranscribing = true;
+    state.voiceTranscriptionAbort = controller;
+    updateImageControl();
+    try {
+      const result = await owner.speech.transcribe(recording, {
+        language: "auto",
+        signal: controller.signal,
+      });
+      if (state.voiceEpoch !== owner.epoch || state.session !== owner.session
+          || state.speech !== owner.speech || !state.session.authenticated) return;
+      insertVoiceTranscript(result.text);
+      showToast("Voice transcribed locally. Edit the text, then send when ready.");
+    } catch (error) {
+      if (controller.signal.aborted || state.voiceEpoch !== owner.epoch) return;
+      const targetRelease = clientReleaseMismatch(error);
+      if (targetRelease !== null) await refreshForReleaseMismatch(targetRelease);
+      else if (AUTHENTICATION_FAILURE_CODES.has(error?.code) || error?.code === "csrf_rejected") {
+        requireFreshAuthentication();
+      } else if (error?.code === "speech_busy" || error?.status === 429) {
+        showToast("Voice transcription is busy. Your draft is unchanged; try again shortly.");
+      } else {
+        showToast("Voice was not transcribed. Your draft is unchanged; record again when ready.");
+      }
+    } finally {
+      if (state.voiceTranscriptionAbort === controller) {
+        state.voiceTranscriptionAbort = null;
+        state.voiceTranscribing = false;
+        updateImageControl();
+      }
+    }
+  }
+
+  async function startVoiceInput() {
+    if (!voiceRuntimeAvailable() || !state.session.authenticated || state.speech === null
+        || voiceOperationActive() || interactionLocked()) return;
+    const epoch = state.voiceEpoch + 1;
+    state.voiceEpoch = epoch;
+    state.voiceStarting = true;
+    updateImageControl();
+    let stream = null;
+    try {
+      stream = await getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      if (state.voiceEpoch !== epoch || !state.session.authenticated || state.speech === null) {
+        stopVoiceTracks(stream);
+        return;
+      }
+      const { recorder, mediaType } = voiceRecorderFor(stream);
+      const capture = {
+        epoch,
+        session: state.session,
+        speech: state.speech,
+        recorder,
+        mediaType,
+        stream,
+        chunks: [],
+        bytes: 0,
+        overflow: false,
+        discard: false,
+        timer: null,
+        tracksStopped: false,
+      };
+      recorder.addEventListener("dataavailable", (event) => {
+        if (state.voiceCapture !== capture || capture.discard || !(event?.data instanceof Blob)
+            || event.data.size < 1) return;
+        capture.bytes += event.data.size;
+        if (capture.bytes > BROWSER_SPEECH_LIMITS.audioBytes) {
+          capture.overflow = true;
+          capture.chunks.length = 0;
+          try { if (recorder.state !== "inactive") recorder.stop(); } catch { /* onstop owns cleanup */ }
+          return;
+        }
+        capture.chunks.push(event.data);
+      });
+      recorder.addEventListener("stop", () => { void finishVoiceCapture(capture); }, { once: true });
+      recorder.addEventListener("error", () => {
+        if (state.voiceCapture !== capture) return;
+        capture.discard = true;
+        state.voiceCapture = null;
+        stopCaptureTracks(capture);
+        state.voiceStarting = false;
+        updateImageControl();
+        showToast("Microphone recording stopped unexpectedly. Your draft is unchanged.");
+      }, { once: true });
+      state.voiceCapture = capture;
+      state.voiceStarting = false;
+      recorder.start(1_000);
+      const schedule = window?.setTimeout?.bind(window) ?? globalThis.setTimeout;
+      capture.timer = schedule?.(() => {
+        if (state.voiceCapture !== capture) return;
+        try { if (recorder.state !== "inactive") recorder.stop(); } catch { /* onstop owns cleanup */ }
+      }, voiceMaximumDurationMs) ?? null;
+      updateImageControl();
+    } catch {
+      stopVoiceTracks(stream);
+      if (state.voiceEpoch === epoch) {
+        state.voiceStarting = false;
+        state.voiceCapture = null;
+        updateImageControl();
+        showToast("Microphone access failed. Allow microphone access in Safari or PWA settings and retry.");
+      }
+    }
+  }
+
+  function toggleVoiceInput() {
+    const capture = state.voiceCapture;
+    if (capture !== null) {
+      clearVoiceTimer(capture);
+      try { if (capture.recorder.state !== "inactive") capture.recorder.stop(); } catch { /* onstop owns cleanup */ }
+      return;
+    }
+    void startVoiceInput();
+  }
+
   function imagesSupportedInMode(images, mode = state.mode, capabilities = {}) {
     if (!Array.isArray(images)) return false;
     if (!imageInputAvailable(mode, capabilities)) return images.length === 0;
@@ -1580,6 +1879,7 @@ export function createBrowserApp({
       : null;
     const exactAgentRecovery = legacyUpdateRecovery ? legacyAgentRecovery : agentRecovery;
     if (state.imagePreparing) cancelImagePreparation();
+    cancelVoiceInput();
     state.viewEpoch += 1;
     state.streamAbort?.abort();
     clearConversation();
@@ -1593,6 +1893,7 @@ export function createBrowserApp({
     state.capabilityReleaseRefreshPending = false;
     state.agent = null;
     state.chat = null;
+    state.speech = null;
     state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
     state.chatCapabilities = FAIL_CLOSED_CHAT_CAPABILITIES;
     state.agentThreads = [];
@@ -1912,6 +2213,7 @@ export function createBrowserApp({
 
   function interactionLocked() {
     return state.busy || state.logoutPending || state.chatFinalization !== null
+      || voiceOperationActive()
       || (claimedUpdateHandoff !== null && !state.updateHandoffConsumed)
       || state.chatHistoryRestoration !== null
       || state.authRecoveryGeneration !== null
@@ -1977,7 +2279,7 @@ export function createBrowserApp({
     const input = state.chatCapabilities.visionInput === true ? "text + up to four images" : "text only";
     const availability = state.capabilities.enabled === true ? "switch to Agent for tools" : "Agent unavailable";
     elements.capability_note.textContent =
-      `Chat · LocalLLM ${input} · no tools, file creation, or web search · ${availability}.`
+      `Chat · LocalLLM ${input}${voiceRuntimeAvailable() ? " + local voice transcription" : ""} · no tools, file creation, or web search · ${availability}.`
       + stagedImageNotice;
   }
 
@@ -2029,6 +2331,21 @@ export function createBrowserApp({
         || selectedSearchLimit > searchCapability.maximumSources);
     const searchChoiceReady = agentSearchRecoveryChoiceReady();
     const preservingAuthenticationDraft = state.authRecoveryPending && state.selectedImages.length > 0;
+    const voiceAvailable = state.session.authenticated && state.speech !== null && voiceRuntimeAvailable();
+    const voiceRecording = state.voiceCapture !== null;
+    if (elements.voice_input !== null) {
+      elements.voice_input.hidden = !voiceAvailable && !voiceOperationActive();
+      elements.voice_input.textContent = state.voiceStarting ? "Wait"
+        : state.voiceTranscribing ? "Text…" : voiceRecording ? "Stop" : "Mic";
+      elements.voice_input.setAttribute("aria-label", state.voiceStarting ? "Opening microphone"
+        : state.voiceTranscribing ? "Transcribing voice locally"
+        : voiceRecording ? "Stop and transcribe voice" : "Record voice");
+      elements.voice_input.setAttribute("aria-pressed", voiceRecording ? "true" : "false");
+      elements.voice_input.title = voiceRecording ? "Stop and transcribe voice" : "Record voice";
+      elements.voice_input.disabled = !voiceAvailable || state.voiceStarting || state.voiceTranscribing
+        || (!voiceRecording && (locked || releaseRefreshPending || pendingChatSend
+          || pendingChatDeletion || pendingAgentDeletion));
+    }
     elements.add_image.hidden = !available;
     elements.add_image.textContent = state.imagePreparing ? "Preparing images…" : "Images";
     elements.add_image.setAttribute(
@@ -2403,6 +2720,7 @@ export function createBrowserApp({
   }
 
   function clearConversation() {
+    stopAssistantSpeech();
     resetAttachmentRestorations();
     state.imageRenderEpoch += 1;
     revokeRenderedAttachmentUrls();
@@ -2568,6 +2886,51 @@ export function createBrowserApp({
     }
   }
 
+  function stopAssistantSpeech() {
+    assistantSpeech.cancel();
+    if (state.speakingButton !== null) {
+      state.speakingButton.textContent = "Listen";
+      state.speakingButton.setAttribute("aria-pressed", "false");
+    }
+    state.speakingButton = null;
+  }
+
+  function assistantListenControl(body) {
+    if (!assistantSpeech.available) return null;
+    const button = makeButton(document, "Listen", () => {
+      if (state.speakingButton === button) {
+        stopAssistantSpeech();
+        return;
+      }
+      const text = String(body.textContent ?? "").trim();
+      if (!text) {
+        showToast("This response has no readable text yet.");
+        return;
+      }
+      stopAssistantSpeech();
+      try {
+        const started = assistantSpeech.speak(text, {
+          onEnd() {
+            if (state.speakingButton !== button) return;
+            button.textContent = "Listen";
+            button.setAttribute("aria-pressed", "false");
+            state.speakingButton = null;
+          },
+        });
+        if (!started) return;
+        state.speakingButton = button;
+        button.textContent = "Stop voice";
+        button.setAttribute("aria-pressed", "true");
+      } catch {
+        showToast("System voice playback is unavailable for this response.");
+      }
+    });
+    button.className = "message-listen";
+    button.setAttribute("aria-label", "Read assistant response aloud");
+    button.setAttribute("aria-pressed", "false");
+    return button;
+  }
+
   function messageNode(role, content, {
     runId, attachment, attachments, threadId, localAttachment, localAttachments, attachmentReadyTasks,
   } = {}) {
@@ -2670,6 +3033,10 @@ export function createBrowserApp({
     body.className = "message-content";
     renderer.renderMarkdown(body, content);
     article.appendChild(body);
+    if (role === "assistant") {
+      const listen = assistantListenControl(body);
+      if (listen !== null) article.appendChild(listen);
+    }
     if (role === "assistant" && runId && state.mode === "agent") {
       const artifacts = document.createElement("div");
       artifacts.className = "message-artifacts";
@@ -5432,6 +5799,7 @@ export function createBrowserApp({
     preserveLoginInput = false,
     clearPasswordOnAuthenticated = false,
   } = {}) {
+    cancelVoiceInput();
     const recoveringAuthenticationDraft = state.authRecoveryPending;
     const recoveryUsername = state.authRecoveryUsername;
     const recoveryWorkflow = state.authRecoveryWorkflow;
@@ -5455,7 +5823,11 @@ export function createBrowserApp({
     purgeAttachmentBlobCache();
     state.session = sessionEnvelope(session);
     state.capabilityReleaseRefreshPending = false;
-    if (!state.session.authenticated) { showLogin("", { preservePassword: preserveLoginInput }); return; }
+    if (!state.session.authenticated) {
+      state.speech = null;
+      showLogin("", { preservePassword: preserveLoginInput });
+      return;
+    }
     const discardedCrossAccountDraft = recoveringAuthenticationDraft
       && normalizedSessionUsername(state.session.username) !== recoveryUsername;
     if (discardedCrossAccountDraft) {
@@ -5579,6 +5951,7 @@ export function createBrowserApp({
       }
       state.agent = createAgentClient(state.session);
       state.chat = createChatClient(state.session);
+      state.speech = voiceRuntimeAvailable() ? createSpeechClient(state.session) : null;
       state.capabilityRefreshAt = Number.NEGATIVE_INFINITY;
       requiredMethod(state.agent, "capabilities", "agent client");
       requiredMethod(state.agent, "listThreads", "agent client");
@@ -5588,6 +5961,7 @@ export function createBrowserApp({
         "prepareThreadDeletion", "deleteThread", "retryDeleteThread", "listMessages", "getAttachment",
         "prepareRun", "startRun", "retryRun", "getRunStatus", "streamRunEvents", "prepareCancellation", "cancelRun",
       ]) requiredMethod(state.chat, method, "chat client");
+      if (state.speech !== null) requiredMethod(state.speech, "transcribe", "speech client");
       const authenticatedAgent = state.agent;
       const authenticatedChat = state.chat;
       const startupChatThreads = Object.freeze({
@@ -5917,6 +6291,8 @@ export function createBrowserApp({
     if (state.loginPending || state.logoutPending || elements.logout.disabled) return;
     state.logoutPending = true;
     if (state.imagePreparing) cancelImagePreparation();
+    cancelVoiceInput();
+    stopAssistantSpeech();
     elements.logout.disabled = true;
     elements.resume_run.disabled = true;
     updateImageControl();
@@ -5955,6 +6331,7 @@ export function createBrowserApp({
     clearChatFailureDiagnostic();
     state.agent = null;
     state.chat = null;
+    state.speech = null;
     state.capabilities = FAIL_CLOSED_AGENT_CAPABILITIES;
     state.agentThreads = [];
     state.chatThreadListEpoch += 1;
@@ -6512,6 +6889,7 @@ export function createBrowserApp({
 
   function updateHasUnsafeActivity() {
     return state.loginPending || state.logoutPending || state.busy || state.chatFinalization !== null
+      || voiceOperationActive()
       || (claimedUpdateHandoff !== null && !state.updateHandoffConsumed)
       || state.chatHistoryRestoration !== null
       || state.imagePreparing || state.chatPendingSend !== null || state.chatPendingDeletion !== null
@@ -7202,6 +7580,18 @@ export function createBrowserApp({
     return true;
   }
 
+  function composerDraftChanged() {
+    updateAgentTerminalActionLabel();
+    invalidatePreparedUpdateHandoff();
+    if (state.retainedUpdateRecoveryPending) {
+      invalidateRetainedUpdateRecoveryInstallation();
+      state.protectedComposerReplacementConfirmation = null;
+    }
+    if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+    state.updateSafetyTimer = null;
+    scheduleSafeUpdateReload();
+  }
+
   function bind() {
     if (state.bound) return;
     state.bound = true;
@@ -7215,6 +7605,7 @@ export function createBrowserApp({
     });
     elements.login_form.addEventListener("submit", (event) => { void login(event); });
     elements.composer.addEventListener("submit", (event) => { void submitMessage(event); });
+    elements.voice_input?.addEventListener("click", toggleVoiceInput);
     elements.add_image.addEventListener("click", () => elements.image_input.click?.());
     elements.image_input.addEventListener("change", () => { void selectImage(); });
     elements.remove_image.addEventListener("click", () => {
@@ -7274,6 +7665,8 @@ export function createBrowserApp({
     });
     window?.addEventListener?.("offline", () => { elements.offline_banner.hidden = false; connection("Offline", false); });
     window?.addEventListener?.("pagehide", (event) => {
+      cancelVoiceInput();
+      stopAssistantSpeech();
       if (event?.persisted !== true) purgeAttachmentMemory();
     });
     window?.addEventListener?.("pageshow", () => { void revalidateSessionOnResume(); });
@@ -7287,17 +7680,12 @@ export function createBrowserApp({
     });
     for (const input of [elements.username, elements.password, elements.message_input]) {
       input.addEventListener("input", () => {
-        if (input === elements.message_input) {
-          updateAgentTerminalActionLabel();
-          invalidatePreparedUpdateHandoff();
-          if (state.retainedUpdateRecoveryPending) {
-            invalidateRetainedUpdateRecoveryInstallation();
-            state.protectedComposerReplacementConfirmation = null;
-          }
+        if (input === elements.message_input) composerDraftChanged();
+        else {
+          if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
+          state.updateSafetyTimer = null;
+          scheduleSafeUpdateReload();
         }
-        if (state.updateSafetyTimer !== null) window?.clearTimeout?.(state.updateSafetyTimer);
-        state.updateSafetyTimer = null;
-        scheduleSafeUpdateReload();
       });
     }
   }

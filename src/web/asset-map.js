@@ -49,12 +49,14 @@ function codeUnitCompare(left, right) {
 
 const LOCAL_MODULES = Object.freeze({
   "/assets/browser-app.js": new URL("./browser-app.js", import.meta.url),
+  "/assets/assistant-speech.js": new URL("./assistant-speech.js", import.meta.url),
   "/assets/pwa-update-handoff-store.js": new URL("./pwa-update-handoff-store.js", import.meta.url),
   "/assets/cloud-session-client.js": new URL("./cloud-session-client.js", import.meta.url),
   "/assets/web-release.js": new URL("./web-release.js", import.meta.url),
   "/assets/direct-chat-client.js": new URL("./direct-chat-client.js", import.meta.url),
   "/assets/vision-image-client.js": new URL("./vision-image-client.js", import.meta.url),
   "/assets/vision-image-sanitizer.js": new URL("./vision-image-sanitizer.js", import.meta.url),
+  "/assets/speech-client.js": new URL("./speech-client.js", import.meta.url),
   "/assets/aginti-client.js": new URL("./aginti-client.js", import.meta.url),
   "/assets/aginti-protocol.js": new URL("./aginti-protocol.js", import.meta.url),
   "/assets/file-artifact-policy.js": new URL("./file-artifact-policy.js", import.meta.url),

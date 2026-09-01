@@ -571,6 +571,7 @@ ${modulePreloads}
         <label class="sr-only" for="message-input">Message</label>
         <textarea id="message-input" name="message" rows="1" maxlength="32000" placeholder="Message LocalLLM" required></textarea>
         <div class="composer-actions">
+          <button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" title="Record voice" hidden>Mic</button>
           <button id="resume-run" type="button" hidden>Resume</button>
           <button id="stop-run" type="button" hidden>Stop</button>
           <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
@@ -755,7 +756,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message-attachment { display: block; width: 100%; max-height: 520px; border-radius: 12px; object-fit: contain; }
 .message > .message-attachment { max-width: min(100%, 620px); margin-bottom: .65rem; }
 .message-attachment-status { padding: .35rem .5rem; border-color: transparent; background: transparent; text-align: left; }
+.message-listen { min-height: 40px; margin-top: .6rem; padding: .4rem .7rem; color: var(--accent-strong); }
+.message-listen[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
 .composer-actions { display: flex; gap: .4rem; }
+.voice-button { min-width: 48px; min-height: 48px; }
+.voice-button[aria-pressed="true"] { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
 .icon-button { display: none; }
 .sidebar-scrim { display: none; }
 .install-app { width: 100%; }
@@ -770,6 +775,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .sidebar-scrim { position: fixed; inset: 0; z-index: 3; display: block; border: 0; border-radius: 0; background: rgb(0 0 0 / 30%); }
   .icon-button { display: inline-grid; }
   #open-sidebar, #send-message { min-width: 48px; min-height: 48px; }
+  #voice-input { min-width: 48px; min-height: 48px; }
   .theme-label { display: none; }
   .topbar { gap: .35rem; padding: max(.2rem, env(safe-area-inset-top)) .5rem .2rem; }
   .connection-state { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }

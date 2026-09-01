@@ -175,7 +175,7 @@ const APP_IDS = [
   "welcome-eyebrow", "welcome-copy", "chat-scroll", "messages", "chat-bottom", "go-to-bottom",
   "activity-panel", "activity-disclosure", "run-state", "agent-plan",
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
-  "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
+  "stop-run", "voice-input", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
   "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
 ];
@@ -488,6 +488,7 @@ function updateControllerHarness({
   locationHref,
   agent,
   chat,
+  speech,
   renderer,
   canonicalizeImage,
   createObjectUrl,
@@ -495,6 +496,9 @@ function updateControllerHarness({
   updateHandoffStore,
   confirmThreadDeletion,
   wait,
+  mediaRecorderConstructor,
+  getUserMedia,
+  voiceMaximumDurationMs,
 } = {}) {
   const document = appDocument({ basePath, releaseId });
   const shared = environment ?? updateEnvironment({ waiting, controlled, onUpdate, registerPromise });
@@ -546,6 +550,7 @@ function updateControllerHarness({
         ...chat,
       };
     },
+    ...(speech === undefined ? {} : { createSpeechClient() { return speech; } }),
     renderer: renderer ?? {
       renderMarkdown(target, value) { target.textContent = value; },
       renderArtifact() { return false; },
@@ -558,6 +563,9 @@ function updateControllerHarness({
     ...(updateHandoffStore === undefined ? {} : { updateHandoffStore }),
     ...(confirmThreadDeletion === undefined ? {} : { confirmThreadDeletion }),
     ...(wait === undefined ? {} : { wait }),
+    ...(mediaRecorderConstructor === undefined ? {} : { mediaRecorderConstructor }),
+    ...(getUserMedia === undefined ? {} : { getUserMedia }),
+    ...(voiceMaximumDurationMs === undefined ? {} : { voiceMaximumDurationMs }),
   });
   return {
     app,
@@ -1156,6 +1164,130 @@ test("mobile sidebar and send controls expose comfortable touch targets", () => 
   assert.match(touchTargetRule[1], /min-height:\s*48px;/u);
   assert.match(BRIGHT_APP_CSS, /\.topbar-info > summary \{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px;/u);
   assert.match(BRIGHT_APP_CSS, /\.mode-switch button \{[^}]*min-height:\s*44px;/u);
+  assert.match(mobileCss, /#voice-input \{[^}]*min-width:\s*48px;[^}]*min-height:\s*48px;/u);
+});
+
+test("iPhone voice capture stops cleanly, transcribes locally, and inserts editable text without sending", async () => {
+  const clients = idleAuthenticatedPwaClients();
+  const speechCalls = [];
+  const stoppedTracks = [];
+  const streams = [];
+
+  class FakeMediaRecorder {
+    static instances = [];
+    static isTypeSupported(mediaType) { return mediaType.startsWith("audio/mp4"); }
+    constructor(stream, options = {}) {
+      this.stream = stream;
+      this.mimeType = options.mimeType ?? "audio/mp4";
+      this.state = "inactive";
+      this.listeners = new Map();
+      FakeMediaRecorder.instances.push(this);
+    }
+    addEventListener(name, listener) {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+    emit(name, event = {}) {
+      for (const listener of this.listeners.get(name) ?? []) listener(event);
+    }
+    start(milliseconds) {
+      assert.equal(milliseconds, 1_000);
+      this.state = "recording";
+    }
+    stop() {
+      if (this.state === "inactive") return;
+      this.emit("dataavailable", {
+        data: new Blob([new Uint8Array([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4])], {
+          type: this.mimeType,
+        }),
+      });
+      this.state = "inactive";
+      this.emit("stop");
+    }
+  }
+
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent: clients.agent,
+    chat: clients.chat,
+    speech: {
+      async transcribe(recording, options) {
+        speechCalls.push({ recording, options });
+        return {
+          text: "Voice input works.",
+          language: "en",
+          languageProbability: 0.99,
+          durationSeconds: 1,
+          audioRetained: false,
+        };
+      },
+    },
+    mediaRecorderConstructor: FakeMediaRecorder,
+    async getUserMedia(constraints) {
+      assert.deepEqual(constraints, {
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      const stream = {
+        getTracks() {
+          return [{ stop() { stoppedTracks.push(stream); } }];
+        },
+      };
+      streams.push(stream);
+      return stream;
+    },
+    voiceMaximumDurationMs: 5_000,
+  });
+  await harness.app.initialize();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const button = harness.document.getElementById("voice-input");
+  const input = harness.document.getElementById("message-input");
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, "Mic");
+  input.value = "Existing draft";
+  input.selectionStart = input.value.length;
+  input.selectionEnd = input.value.length;
+
+  button.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(FakeMediaRecorder.instances.length, 1);
+  assert.equal(FakeMediaRecorder.instances[0].state, "recording");
+  assert.equal(button.textContent, "Stop");
+  assert.equal(button.disabled, false);
+  assert.equal(button.getAttribute("aria-pressed"), "true");
+  assert.equal(input.disabled, true);
+
+  button.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(speechCalls.length, 1);
+  assert.equal(speechCalls[0].recording instanceof Blob, true);
+  assert.equal(speechCalls[0].recording.type, "audio/mp4;codecs=mp4a.40.2");
+  assert.equal(speechCalls[0].options.language, "auto");
+  assert.equal(speechCalls[0].options.signal instanceof AbortSignal, true);
+  assert.equal(input.value, "Existing draft Voice input works.");
+  assert.equal(input.disabled, false);
+  assert.equal(button.textContent, "Mic");
+  assert.equal(button.getAttribute("aria-pressed"), "false");
+  assert.equal(stoppedTracks.filter((stream) => stream === streams[0]).length, 1);
+  assert.equal(harness.document.getElementById("messages").children.length, 0);
+
+  button.dispatch("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(FakeMediaRecorder.instances.length, 2);
+  harness.window.dispatch("pagehide", { persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(speechCalls.length, 1);
+  assert.equal(stoppedTracks.filter((stream) => stream === streams[1]).length, 1);
+  assert.equal(input.value, "Existing draft Voice input works.");
 });
 
 test("Agent plots keep the workspace track and use readable desktop and iPhone geometry", () => {

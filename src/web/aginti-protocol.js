@@ -62,6 +62,8 @@ export const AGINTI_RUN_STATUSES = Object.freeze([
 ]);
 
 export const AGINTI_SEARCH_MODES = Object.freeze(["web", "papers", "both"]);
+export const AGINTI_DEEP_RESEARCH_DEPTHS = Object.freeze(["quick", "standard", "deep"]);
+export const AGINTI_DEEP_RESEARCH_TASK_PROTOCOL = "localllm/research-task/v2";
 
 export const FAIL_CLOSED_AGENT_CAPABILITIES = Object.freeze({
   schemaVersion: AGINTI_SCHEMA_VERSION,
@@ -1023,7 +1025,9 @@ export function validateAgentCapabilities(value) {
   );
   const search = response.search === undefined
     ? { enabled: false, modes: [], maximumSources: 0 }
-    : exact(response.search, ["enabled", "modes", "maximumSources"], "agent capabilities search");
+    : exact(response.search, ["enabled", "modes", "maximumSources", "research"], "agent capabilities search", [
+        "enabled", "modes", "maximumSources",
+      ]);
   const roles = response.roles === undefined ? undefined : validateAgentRoles(response.roles);
   const artifacts = exact(response.artifacts, ["kinds", "schemaVersion"], "agent capabilities artifacts");
   if (agent.kind !== "aginti" || agent.label !== "AgInTi Agent") invalid("agent authority must be AgInTi");
@@ -1076,6 +1080,33 @@ export function validateAgentCapabilities(value) {
     invalid("agent search capabilities are invalid");
   }
   if (search.enabled && !response.enabled) invalid("disabled capabilities may not advertise search");
+  let researchCapability;
+  if (search.research !== undefined) {
+    const research = exact(
+      search.research,
+      ["enabled", "depths", "taskProtocol", "activation"],
+      "agent capabilities deep research",
+    );
+    denseDataArray(research.depths, "agent capabilities deep research depths", {
+      minimum: AGINTI_DEEP_RESEARCH_DEPTHS.length,
+      maximum: AGINTI_DEEP_RESEARCH_DEPTHS.length,
+    });
+    if (
+      research.enabled !== true ||
+      !search.enabled ||
+      canonicalJson(research.depths) !== canonicalJson(AGINTI_DEEP_RESEARCH_DEPTHS) ||
+      research.taskProtocol !== AGINTI_DEEP_RESEARCH_TASK_PROTOCOL ||
+      research.activation !== "explicit-prompt"
+    ) {
+      invalid("agent deep research capabilities are invalid");
+    }
+    researchCapability = Object.freeze({
+      enabled: true,
+      depths: AGINTI_DEEP_RESEARCH_DEPTHS,
+      taskProtocol: AGINTI_DEEP_RESEARCH_TASK_PROTOCOL,
+      activation: "explicit-prompt",
+    });
+  }
   const legacyArtifactKinds = search.enabled
     ? ["plot", "table", "markdown", "sources"]
     : ["plot", "table", "markdown"];
@@ -1099,7 +1130,12 @@ export function validateAgentCapabilities(value) {
     actions: Object.freeze({ cancel: actions.cancel, resume: actions.resume, retry: actions.retry }),
     attachments: attachmentCapability,
     ...(search.enabled ? {
-      search: Object.freeze({ enabled: search.enabled, modes: Object.freeze(searchModes), maximumSources }),
+      search: Object.freeze({
+        enabled: search.enabled,
+        modes: Object.freeze(searchModes),
+        maximumSources,
+        ...(researchCapability === undefined ? {} : { research: researchCapability }),
+      }),
     } : {}),
     ...(roles === undefined ? {} : { roles }),
     artifacts: Object.freeze({ kinds: Object.freeze(artifactKinds), schemaVersion: AGINTI_SCHEMA_VERSION }),

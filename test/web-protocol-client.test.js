@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  AGINTI_DEEP_RESEARCH_DEPTHS,
+  AGINTI_DEEP_RESEARCH_TASK_PROTOCOL,
   AGINTI_IMAGE_ATTACHMENT_BYTES_LIMIT,
   AGINTI_IMAGE_ATTACHMENT_COUNT_LIMIT,
   AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES,
@@ -451,6 +453,24 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
     modes: ["web", "papers", "both"],
     maximumSources: 20,
   });
+  const deepResearchEnabled = {
+    ...searchEnabled,
+    search: {
+      ...searchEnabled.search,
+      research: {
+        enabled: true,
+        depths: [...AGINTI_DEEP_RESEARCH_DEPTHS],
+        taskProtocol: AGINTI_DEEP_RESEARCH_TASK_PROTOCOL,
+        activation: "explicit-prompt",
+      },
+    },
+  };
+  assert.deepEqual(validateAgentCapabilities(deepResearchEnabled).search.research, {
+    enabled: true,
+    depths: ["quick", "standard", "deep"],
+    taskProtocol: "localllm/research-task/v2",
+    activation: "explicit-prompt",
+  });
   const searchAndFiles = {
     ...searchEnabled,
     artifacts: { kinds: ["plot", "table", "markdown", "sources", "file"], schemaVersion: "1" },
@@ -474,6 +494,9 @@ test("capabilities default to Chat and enable Agent only for exact AgInTi + Loca
   for (const invalid of [
     { ...searchEnabled, search: { enabled: true, modes: ["web", "both", "papers"], maximumSources: 20 } },
     { ...searchEnabled, search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 21 } },
+    { ...searchEnabled, search: { ...searchEnabled.search, research: { enabled: true, depths: ["deep"], taskProtocol: AGINTI_DEEP_RESEARCH_TASK_PROTOCOL, activation: "explicit-prompt" } } },
+    { ...searchEnabled, search: { ...searchEnabled.search, research: { enabled: true, depths: [...AGINTI_DEEP_RESEARCH_DEPTHS], taskProtocol: "localllm/research-task/v1", activation: "explicit-prompt" } } },
+    { ...searchEnabled, search: { ...searchEnabled.search, research: { enabled: true, depths: [...AGINTI_DEEP_RESEARCH_DEPTHS], taskProtocol: AGINTI_DEEP_RESEARCH_TASK_PROTOCOL, activation: "automatic" } } },
     { ...searchEnabled, artifacts: { kinds: ["plot", "table", "markdown"], schemaVersion: "1" } },
     { ...capabilities(), search: { enabled: true, modes: [...AGINTI_SEARCH_MODES], maximumSources: 20 }, artifacts: { kinds: ["plot", "table", "markdown", "sources"], schemaVersion: "1" } },
   ]) assert.equal(failClosedCapabilities(invalid), FAIL_CLOSED_AGENT_CAPABILITIES);

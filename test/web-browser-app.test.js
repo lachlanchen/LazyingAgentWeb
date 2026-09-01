@@ -2344,7 +2344,7 @@ test("an ambiguous Agent thread create survives later rollout and release fences
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
 });
 
-test("an ambiguous Agent run followed by rollout remains fenced until read-only reopen confirms it", async () => {
+test("an ambiguous Agent run followed by rollout is recovered by automatic read-only reconciliation", async () => {
   const history = await verifiedEvents([
     ["output.delta", { text: "Confirmed without a new mutation key" }],
     ["run.completed", {}],
@@ -2386,17 +2386,20 @@ test("an ambiguous Agent run followed by rollout remains fenced until read-only 
   assert.deepEqual(waits, [250]);
   assert.equal(starts.length, 2);
   assert.equal(starts[0].options.idempotency, starts[1].options.idempotency);
-  assert.equal(browser.document.getElementById("run-state").textContent, "Interrupted");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.match(browser.document.getElementById("toast").textContent, /recovered without creating a duplicate/u);
+  assert.match(browser.document.getElementById("messages").textContent, /Confirmed without a new mutation key/u);
 
   await browser.app.submitMessage({ preventDefault() {} });
-  assert.equal(starts.length, 2, "the replay fence blocks a new mutation key before reconciliation");
+  assert.equal(starts.length, 2, "the cleared recovered composer cannot create a duplicate mutation");
   await browser.app.openThread(THREAD_ID, { mode: "agent" });
   assert.equal(starts.length, 2, "reopen performs only authoritative reads");
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
   assert.match(browser.document.getElementById("messages").textContent, /Confirmed without a new mutation key/u);
 });
 
-test("an ambiguous known-thread Agent run dominates a later release mismatch", async () => {
+test("an ambiguous known-thread Agent run dominates a later release mismatch and reconciles read-only", async () => {
   const history = await verifiedEvents([["run.completed", {}]]);
   let thread = agentThread();
   const starts = [];
@@ -2438,7 +2441,8 @@ test("an ambiguous known-thread Agent run dominates a later release mismatch", a
   assert.equal(starts.length, 2);
   assert.equal(starts[0].options.idempotency, starts[1].options.idempotency);
   assert.equal(reloads, 0);
-  assert.equal(browser.document.getElementById("run-state").textContent, "Interrupted");
+  assert.equal(browser.document.getElementById("run-state").textContent, "Completed");
+  assert.match(browser.document.getElementById("toast").textContent, /recovered without creating a duplicate/u);
   await browser.app.openThread(THREAD_ID, { mode: "agent" });
   assert.equal(starts.length, 2);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");

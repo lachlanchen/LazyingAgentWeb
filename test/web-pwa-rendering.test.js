@@ -7273,3 +7273,251 @@ test("an encrypted inner-v1 Chat handoff restores its PNG into the current four-
   assert.doesNotMatch(harness.window.location.href, /lazying-update-handoff/u,
     "successful restore consumes the one-time URL key");
 });
+
+test("an interrupted existing-Agent image send reconciles read-only and unlocks the exact composer automatically", async () => {
+  const threadId = "thr_f1111111-1111-4111-8111-111111111111";
+  const thread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Automatic ambiguity reconciliation",
+    instant: "2026-09-01T12:00:00.000Z",
+  });
+  const prompt = "Keep this exact two-image Agent prompt retryable";
+  const bytes = canonicalPngHeader();
+  const startOptions = [];
+  let exactReads = 0;
+  let canonicalized = 0;
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability({ imageInput: true }); },
+    async listThreads() { return { schemaVersion: "1", threads: [thread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      exactReads += 1;
+      return { schemaVersion: "1", thread };
+    },
+    async startRun(requestedThreadId, text, options) {
+      assert.equal(requestedThreadId, threadId);
+      assert.equal(text, prompt);
+      startOptions.push(options);
+      throw Object.assign(new Error("the Agent response was interrupted"), { retryable: true });
+    },
+    async *streamRunEvents() { throw new Error("an empty authoritative thread has no run to replay"); },
+  };
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    async canonicalizeImage() {
+      canonicalized += 1;
+      return Object.freeze({
+        attachmentId: `image_auto_reconcile_000${canonicalized}`,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 1,
+        height: 1,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: () => "blob:auto-reconcile-preview",
+    revokeObjectUrl() {},
+  });
+  await harness.app.initialize();
+  harness.document.getElementById("agent-mode").dispatch("click");
+  await settlePwaActions();
+  const row = [...harness.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.ok(row);
+  threadOpenControl(row).dispatch("click");
+  await settlePwaActions();
+  assert.equal(exactReads, 1);
+
+  const imageInput = harness.document.getElementById("image-input");
+  imageInput.files = [{ name: "one.png" }, { name: "two.png" }];
+  imageInput.dispatch("change");
+  await settlePwaActions();
+  assert.equal(canonicalized, 2);
+  assert.match(harness.document.getElementById("image-preview-label").textContent, /2 images/u);
+  harness.document.getElementById("message-input").value = prompt;
+  await harness.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(startOptions.length, 2, "one dispatch and one automatic confirmation use a bounded retry");
+  assert.strictEqual(startOptions[0], startOptions[1], "both attempts reuse the identical prepared Agent request");
+  assert.equal(startOptions[0].attachments.length, 2);
+  assert.equal(exactReads, 2, "the ambiguity fence is cleared only by one authoritative same-thread read");
+  assert.equal(harness.document.getElementById("messages").children.length, 0,
+    "an unaccepted ambiguous request creates no optimistic history");
+  assert.equal(harness.document.getElementById("message-input").value, prompt);
+  assert.equal(harness.document.getElementById("image-preview").hidden, false);
+  assert.match(harness.document.getElementById("image-preview-label").textContent, /2 images/u);
+  assert.equal(harness.document.getElementById("message-input").disabled, false);
+  assert.equal(harness.document.getElementById("send-message").disabled, false);
+  assert.equal(harness.document.getElementById("composer").getAttribute("aria-busy"), "false");
+  assert.equal(harness.document.getElementById("connection-state").textContent, "Connected");
+  assert.match(harness.document.getElementById("toast").textContent,
+    /Connection restored\. Your prompt and 2 images remain ready; retry now\./u);
+});
+
+test("automatic Agent reconciliation adopts an accepted image run instead of offering a duplicate retry", async () => {
+  const threadId = "thr_f2222222-2222-4222-8222-222222222222";
+  const runId = "run_f2222222-2222-4222-8222-222222222222";
+  const instant = "2026-09-01T12:30:00.000Z";
+  const prompt = "Accept this exact image request only once";
+  const emptyThread = emptyAgentPwaThread({
+    id: threadId,
+    title: "Accepted ambiguity reconciliation",
+    instant,
+  });
+  const terminalEnvelope = {
+    schemaVersion: "1",
+    id: `${runId}.1`,
+    seq: 1,
+    type: "run.completed",
+    threadId,
+    runId,
+    createdAt: instant,
+    payload: {},
+    previousHash: "0".repeat(64),
+  };
+  const terminalEvent = await verifyAgentEvent({
+    ...terminalEnvelope,
+    hash: createHash("sha256").update(canonicalJson(terminalEnvelope), "utf8").digest("hex"),
+  }, {
+    expectedRunId: runId,
+    expectedThreadId: threadId,
+    afterSeq: 0,
+    previousHash: "0".repeat(64),
+    digest: async (input) => createHash("sha256").update(input, "utf8").digest("hex"),
+  });
+  const acceptedRun = completedAgentRun({
+    id: runId,
+    threadId,
+    createdAt: instant,
+    lastHash: terminalEvent.hash,
+    output: "Accepted exactly once",
+  });
+  const acceptedThread = Object.freeze({
+    ...emptyThread,
+    status: "idle",
+    revision: 3,
+    lastRunId: runId,
+    authority: Object.freeze({
+      ...emptyThread.authority,
+      contextDigest: "e".repeat(64),
+    }),
+    messages: Object.freeze([
+      Object.freeze({
+        id: "msg_auto_accept_user_0001",
+        role: "user",
+        content: prompt,
+        runId,
+        createdAt: instant,
+        digest: "7".repeat(64),
+      }),
+      Object.freeze({
+        id: "msg_auto_accept_assistant_0001",
+        role: "assistant",
+        content: "Accepted exactly once",
+        runId,
+        createdAt: instant,
+        digest: "8".repeat(64),
+      }),
+    ]),
+  });
+  const bytes = canonicalPngHeader();
+  const startOptions = [];
+  let accepted = false;
+  let exactReads = 0;
+  let statusReads = 0;
+  let streamReads = 0;
+  const agent = {
+    async capabilities() { return enabledAgentPwaCapability({ imageInput: true }); },
+    async listThreads() { return { schemaVersion: "1", threads: [emptyThread], nextBefore: null }; },
+    async getThread(requested) {
+      assert.equal(requested, threadId);
+      exactReads += 1;
+      return { schemaVersion: "1", thread: accepted ? acceptedThread : emptyThread };
+    },
+    async startRun(requestedThreadId, text, options) {
+      assert.equal(requestedThreadId, threadId);
+      assert.equal(text, prompt);
+      startOptions.push(options);
+      accepted = true;
+      throw Object.assign(new Error("accepted Agent response was lost"), { retryable: true });
+    },
+    async runStatus(requestedRunId) {
+      assert.equal(requestedRunId, runId);
+      statusReads += 1;
+      return { schemaVersion: "1", run: acceptedRun };
+    },
+    async *streamRunEvents({ runId: requestedRunId }) {
+      assert.equal(requestedRunId, runId);
+      streamReads += 1;
+      yield { event: terminalEvent, cursor: { seq: 1, hash: terminalEvent.hash } };
+    },
+  };
+  let canonicalized = 0;
+  const harness = updateControllerHarness({
+    waiting: false,
+    restore: async () => ({
+      authenticated: true,
+      username: "account-user",
+      csrfToken: "csrf-token-value-long-enough",
+    }),
+    agent,
+    chat: idleAuthenticatedPwaClients().chat,
+    async canonicalizeImage() {
+      canonicalized += 1;
+      return Object.freeze({
+        attachmentId: "image_auto_accept_0001",
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        width: 1,
+        height: 1,
+        bytes,
+        previewBlob: new Blob([bytes], { type: "image/png" }),
+      });
+    },
+    createObjectUrl: () => "blob:auto-accept-preview",
+    revokeObjectUrl() {},
+  });
+  await harness.app.initialize();
+  harness.document.getElementById("agent-mode").dispatch("click");
+  await settlePwaActions();
+  const row = [...harness.document.getElementById("thread-list").children]
+    .find((entry) => entry.dataset.threadId === threadId);
+  assert.ok(row);
+  threadOpenControl(row).dispatch("click");
+  await settlePwaActions();
+  assert.equal(exactReads, 1);
+
+  const imageInput = harness.document.getElementById("image-input");
+  imageInput.files = [{ name: "accepted.png" }];
+  imageInput.dispatch("change");
+  await settlePwaActions();
+  assert.equal(canonicalized, 1);
+  harness.document.getElementById("message-input").value = prompt;
+  await harness.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(startOptions.length, 2, "the bounded transport confirmation reuses one mutation identity");
+  assert.strictEqual(startOptions[0], startOptions[1]);
+  assert.equal(startOptions[0].attachments.length, 1);
+  assert.equal(exactReads, 2, "one authoritative read discovers the accepted run");
+  assert.equal(statusReads, 1);
+  assert.equal(streamReads, 1);
+  assert.equal(harness.document.getElementById("messages").children.length, 2,
+    "only the authoritative accepted turn is rendered");
+  assert.equal(harness.document.getElementById("message-input").value, "");
+  assert.equal(harness.document.getElementById("image-preview").hidden, true);
+  assert.equal(harness.document.getElementById("message-input").disabled, false);
+  await harness.app.submitMessage({ preventDefault() {} });
+  assert.equal(startOptions.length, 2,
+    "submitting the empty recovered composer cannot dispatch again");
+  assert.equal(harness.document.getElementById("connection-state").textContent, "Connected");
+  assert.match(harness.document.getElementById("toast").textContent,
+    /recovered without creating a duplicate/u);
+});

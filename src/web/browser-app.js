@@ -5605,6 +5605,8 @@ export function createBrowserApp({
     const submissionSession = state.session;
     const submissionMode = state.mode;
     const submissionChat = state.chat;
+    const submissionEpoch = state.viewEpoch;
+    const submissionAgentRunId = submissionMode === "agent" ? state.runId : null;
     let agentSearch;
     if (submissionMode === "agent") {
       try { agentSearch = selectedAgentSearch(); }
@@ -5676,10 +5678,12 @@ export function createBrowserApp({
         });
       }
     } catch (error) {
-      const sameOwner = state.session === submissionSession
+      const stillSameOwner = () => state.session === submissionSession
         && state.session.authenticated
         && state.mode === submissionMode
+        && state.viewEpoch === submissionEpoch
         && (submissionMode !== "chat" || state.chat === submissionChat);
+      const sameOwner = stillSameOwner();
       if (!sameOwner) return;
       releaseRefreshTarget = clientReleaseMismatch(error);
       if (releaseRefreshTarget !== null) {
@@ -5795,10 +5799,40 @@ export function createBrowserApp({
           if (!definitivelyNotAccepted) {
             connection("Request interrupted", false);
             showToast(state.agentThreadId !== null
-              ? "AgInTi did not confirm this request. Your prompt is still ready; reopen this conversation to confirm server state before retrying."
+              ? "AgInTi did not confirm this request. Checking the conversation before retrying."
               : state.agentPendingThreadCreate !== null
                 ? "AgInTi did not confirm the new conversation. Your prompt is still ready; retry it to confirm the same exact conversation without creating a duplicate."
                 : "AgInTi rejected the new conversation. Your prompt is still ready; edit it or retry when the service is available.");
+            const reconcileThreadId = state.agentThreadId;
+            if (reconcileThreadId !== null) {
+              let reconciled = false;
+              try {
+                reconciled = await openAgentThread(reconcileThreadId, { expectedEpoch: submissionEpoch });
+              } catch (reconcileError) {
+                const refreshTarget = clientReleaseMismatch(reconcileError);
+                if (refreshTarget === null) throw reconcileError;
+                if (!stillSameOwner()) return;
+                releaseRefreshTarget = refreshTarget;
+                elements.message_input.value = draft;
+                connection("Refreshing browser app", false);
+                showToast("A newer app release is ready. Your unsent prompt and images are being protected before refresh.");
+              }
+              if (!stillSameOwner()) return;
+              if (reconciled) {
+                const accepted = state.runId !== submissionAgentRunId;
+                connection("Connected");
+                if (accepted) {
+                  elements.message_input.value = "";
+                  clearSelectedImage();
+                  showToast("The interrupted Agent request was recovered without creating a duplicate.");
+                } else {
+                  elements.message_input.value = draft;
+                  showToast(imageRestored
+                    ? `Connection restored. Your prompt and ${selected.length === 1 ? "image" : `${selected.length} images`} remain ready; retry now.`
+                    : "Connection restored. Your prompt is ready; retry now.");
+                }
+              }
+            }
           }
         } else if (state.chatPendingSend) {
           connection("Send confirmation pending", false);

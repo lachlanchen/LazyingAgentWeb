@@ -245,7 +245,8 @@ export function createSpeechConnector({
       new Blob([checked.audio], { type: checked.mediaType }),
       MEDIA_TYPES[checked.mediaType],
     );
-    const response = await request(`/transcriptions?language=${checked.language}`, {
+    form.append("language", checked.language);
+    const response = await request("/transcriptions", {
       method: "POST",
       body: form,
       signal: checked.signal,

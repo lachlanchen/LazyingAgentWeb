@@ -55,11 +55,12 @@ test('reads no-store status and transcribes multipart audio into a bounded publi
     async fetchImpl(url, init) {
       calls.push({ url, init });
       if (url.endsWith('/status')) return jsonResponse(statusEnvelope());
-      assert.equal(url, 'http://127.0.0.1:18023/api/speech/transcriptions?language=auto');
+      assert.equal(url, 'http://127.0.0.1:18023/api/speech/transcriptions');
       assert.equal(init.method, 'POST');
       assert.equal(init.body instanceof FormData, true);
       assert.equal(init.body.get('file') instanceof Blob, true);
       assert.equal(init.body.get('file').type, 'audio/mp4');
+      assert.equal(init.body.get('language'), 'auto');
       return jsonResponse({
         schema: 'localllm/speech-transcription/v1',
         text: 'Voice input works.',

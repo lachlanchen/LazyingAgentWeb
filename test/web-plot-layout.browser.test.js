@@ -195,7 +195,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Compiled paper</h3><div id="file-artifact"></div></article>
       </section>
     </article></section></div>
-    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><textarea id="message-input"></textarea><div class="composer-actions"><button id="run-agent">Run</button></div></form>
+    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><div class="composer-tools"><button id="add-image" class="image-button" type="button">Images</button><div id="search-controls" class="search-controls"><button id="search-toggle" type="button" aria-pressed="false">Search</button><div id="search-options" class="search-options" hidden><label>Sources<select><option>Web</option></select></label><label>Limit<input type="number" value="8"></label></div></div></div><textarea id="message-input"></textarea><div class="composer-actions"><button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" data-voice-state="idle"><svg class="voice-icon-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Zm6-3a6 6 0 0 1-12 0m6 6v3m-3 0h6"/></svg><span class="voice-icon-stop" aria-hidden="true"></span><span class="voice-icon-busy" aria-hidden="true"></span></button><button id="run-agent">Run Agent</button></div></form>
   </section>
 </div>
 <script type="module">
@@ -293,7 +293,23 @@ const GEOMETRY_EXPRESSION = `(() => {
   const assistantContent = document.querySelector('#assistant-message-content');
   const composer = rectangle(document.querySelector('#composer'));
   const messageInput = rectangle(document.querySelector('#message-input'));
+  const composerTools = rectangle(document.querySelector('.composer-tools'));
+  const addImageNode = document.querySelector('#add-image');
+  const searchToggleNode = document.querySelector('#search-toggle');
+  const voiceInputNode = document.querySelector('#voice-input');
+  const composerActions = rectangle(document.querySelector('.composer-actions'));
+  const lowerControls = [addImageNode, searchToggleNode, voiceInputNode, document.querySelector('#run-agent')];
   const runAgent = rectangle(document.querySelector('#run-agent'));
+  const searchOptionsNode = document.querySelector('#search-options');
+  const searchOptionsOpenedOnMobile = innerWidth <= 760;
+  let searchOptions = null;
+  let composerWithSearch = composer;
+  if (searchOptionsOpenedOnMobile) {
+    searchOptionsNode.hidden = false;
+    searchOptions = rectangle(searchOptionsNode);
+    composerWithSearch = rectangle(document.querySelector('#composer'));
+    searchOptionsNode.hidden = true;
+  }
   const activityPanel = document.querySelector('#activity-panel');
   const activityDisclosure = document.querySelector('#activity-disclosure');
   const activityDetails = document.querySelector('#activity-details');
@@ -346,6 +362,8 @@ const GEOMETRY_EXPRESSION = `(() => {
         && !assistantContent.textContent.includes('data:image'),
       composer,
       messageInput,
+      composerTools,
+      composerActions,
       runAgent,
       chatScrollInsideWorkspace: contains(workspace, chatScroll),
       composerInsideWorkspace: contains(workspace, composer),
@@ -353,6 +371,25 @@ const GEOMETRY_EXPRESSION = `(() => {
       actionInsideComposer: contains(composer, runAgent),
       actionBelowInput: runAgent.top >= messageInput.bottom - .5,
       inputUsesComposerWidth: messageInput.width >= composer.width - 26,
+      lowerControlsInsideComposer: lowerControls.every((node) => contains(composer, rectangle(node))),
+      lowerControlsOverlap: overlaps(lowerControls),
+      lowerControlsShareOneRow: lowerControls.every((node) => {
+        const control = node.getBoundingClientRect();
+        const center = (control.top + control.bottom) / 2;
+        const actionCenter = (runAgent.top + runAgent.bottom) / 2;
+        return Math.abs(center - actionCenter) <= 2;
+      }),
+      toolsAndActionsShareOneRow: Math.abs((composerTools.top + composerTools.bottom) / 2
+        - (composerActions.top + composerActions.bottom) / 2) <= 2,
+      searchOptionsOpenedOnMobile,
+      searchOptions,
+      searchDoesNotGrowComposer: composerWithSearch.height === composer.height,
+      searchInsideViewport: searchOptions === null
+        || (searchOptions.left >= -.5 && searchOptions.right <= innerWidth + .5),
+      searchAboveToggle: searchOptions === null
+        || searchOptions.bottom <= searchToggleNode.getBoundingClientRect().top + .5,
+      voiceAccessibleName: voiceInputNode.getAttribute('aria-label'),
+      voiceVisibleText: voiceInputNode.textContent.trim(),
       chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
       composerAtWorkspaceBottom: Math.abs(composer.bottom - workspace.bottom) <= .5,
     },
@@ -498,6 +535,15 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       `iPhone composer action did not move below its input: ${JSON.stringify(iphone.shell)}`);
     assert.equal(iphone.shell.inputUsesComposerWidth, true,
       `iPhone composer input is not full width: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.lowerControlsShareOneRow, true,
+      `iPhone composer controls do not share row two: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.toolsAndActionsShareOneRow, true,
+      `iPhone composer tool and action groups differ vertically: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.searchOptionsOpenedOnMobile, true);
+    assert.equal(iphone.shell.searchDoesNotGrowComposer, true,
+      `opening Search grew the iPhone composer: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.searchInsideViewport, true);
+    assert.equal(iphone.shell.searchAboveToggle, true);
     assert.equal(desktop.shell.actionBelowInput, false,
       `desktop composer unexpectedly stacked: ${JSON.stringify(desktop.shell)}`);
     const shellFailures = [];
@@ -505,6 +551,10 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       assert.equal(result.pageOverflow, false);
       assert.equal(result.shell.chatHasHorizontalOverflow, false);
       assert.equal(result.shell.inlineImageCompacted, true);
+      assert.equal(result.shell.lowerControlsInsideComposer, true);
+      assert.equal(result.shell.lowerControlsOverlap, false);
+      assert.equal(result.shell.voiceAccessibleName, "Record voice");
+      assert.equal(result.shell.voiceVisibleText, "");
       assert.equal(result.maskPreserved, true);
       assert.equal(result.file.actionsCount, 2);
       assert.equal(result.file.controlsInsideTarget, true);

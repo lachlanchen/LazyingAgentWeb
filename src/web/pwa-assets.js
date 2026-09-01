@@ -547,31 +547,37 @@ ${modulePreloads}
 
       <form id="composer" class="composer" autocomplete="off">
         <input id="image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" multiple hidden>
-        <button id="add-image" class="image-button" type="button" aria-label="Add images" aria-live="polite" hidden>Images</button>
+        <div class="composer-tools">
+          <button id="add-image" class="image-button" type="button" aria-label="Add images" aria-live="polite" hidden>Images</button>
+          <div id="search-controls" class="search-controls" hidden>
+            <button id="search-toggle" type="button" aria-pressed="false">Search</button>
+            <div id="search-options" class="search-options" hidden>
+              <label>Sources
+                <select id="search-mode" autocomplete="off">
+                  <option value="web" selected>Web</option>
+                  <option value="papers">Papers</option>
+                  <option value="both">Web + papers</option>
+                </select>
+              </label>
+              <label>Limit
+                <input id="search-limit" type="number" inputmode="numeric" min="1" max="20" value="8" required>
+              </label>
+            </div>
+          </div>
+        </div>
         <div id="image-preview" class="image-preview" hidden>
           <img id="image-preview-thumbnail" alt="First selected image preview">
           <span id="image-preview-label"></span>
           <button id="remove-image" type="button" aria-label="Remove all selected images">Remove</button>
         </div>
-        <div id="search-controls" class="search-controls" hidden>
-          <button id="search-toggle" type="button" aria-pressed="false">Search</button>
-          <div id="search-options" class="search-options" hidden>
-            <label>Sources
-              <select id="search-mode" autocomplete="off">
-                <option value="web" selected>Web</option>
-                <option value="papers">Papers</option>
-                <option value="both">Web + papers</option>
-              </select>
-            </label>
-            <label>Limit
-              <input id="search-limit" type="number" inputmode="numeric" min="1" max="20" value="8" required>
-            </label>
-          </div>
-        </div>
         <label class="sr-only" for="message-input">Message</label>
         <textarea id="message-input" name="message" rows="1" maxlength="32000" placeholder="Message LocalLLM" required></textarea>
         <div class="composer-actions">
-          <button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" title="Record voice" hidden>Mic</button>
+          <button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" data-voice-state="idle" title="Record voice" hidden>
+            <svg class="voice-icon-mic" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Zm6-3a6 6 0 0 1-12 0m6 6v3m-3 0h6"/></svg>
+            <span class="voice-icon-stop" aria-hidden="true"></span>
+            <span class="voice-icon-busy" aria-hidden="true"></span>
+          </button>
           <button id="resume-run" type="button" hidden>Resume</button>
           <button id="stop-run" type="button" hidden>Stop</button>
           <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
@@ -726,6 +732,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-rejected { color: var(--danger); }
 .composer { grid-area: composer; display: flex; gap: .75rem; align-items: end; padding: .8rem max(1rem, calc((100% - 850px) / 2)) max(.8rem, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--surface); }
 .composer textarea { min-height: 48px; max-height: 180px; flex: 1; resize: vertical; padding: .75rem; }
+.composer-tools { display: flex; min-width: 0; align-items: end; gap: .45rem; }
 .search-controls { display: flex; align-items: end; gap: .45rem; }
 .search-controls > button { min-height: 48px; }
 .search-controls > button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
@@ -759,8 +766,15 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message-listen { min-height: 40px; margin-top: .6rem; padding: .4rem .7rem; color: var(--accent-strong); }
 .message-listen[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
 .composer-actions { display: flex; gap: .4rem; }
-.voice-button { min-width: 48px; min-height: 48px; }
+.voice-button { position: relative; display: inline-grid; width: 48px; min-width: 48px; min-height: 48px; place-items: center; padding: .65rem; }
+.voice-icon-mic { width: 1.4rem; height: 1.4rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.voice-icon-stop, .voice-icon-busy { display: none; }
+.voice-icon-stop { width: .9rem; height: .9rem; border-radius: .18rem; background: currentColor; }
+.voice-icon-busy { width: 1.25rem; height: 1.25rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: voice-spin .8s linear infinite; }
+.voice-button[data-voice-state="recording"] .voice-icon-mic, .voice-button[data-voice-state="starting"] .voice-icon-mic, .voice-button[data-voice-state="transcribing"] .voice-icon-mic { display: none; }
+.voice-button[data-voice-state="recording"] .voice-icon-stop, .voice-button[data-voice-state="starting"] .voice-icon-busy, .voice-button[data-voice-state="transcribing"] .voice-icon-busy { display: block; }
 .voice-button[aria-pressed="true"] { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
+@keyframes voice-spin { to { transform: rotate(360deg); } }
 .icon-button { display: none; }
 .sidebar-scrim { display: none; }
 .install-app { width: 100%; }
@@ -782,11 +796,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .mode-switch button { padding-inline: .55rem; }
   .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .5rem; padding: .6rem .75rem max(.6rem, env(safe-area-inset-bottom)); }
   .composer textarea { grid-column: 1 / -1; grid-row: 1; width: 100%; }
-  .composer > .image-button { grid-column: 1; grid-row: 2; justify-self: start; }
+  .composer-tools { position: relative; grid-column: 1; grid-row: 2; align-self: end; justify-self: start; }
   .composer-actions { grid-column: 2; grid-row: 2; }
-  .composer > .image-preview, .composer > .search-controls { grid-column: 1 / -1; }
-  .search-controls { align-items: stretch; }
-  .search-options { flex: 1; }
+  .composer > .image-preview { grid-column: 1 / -1; grid-row: 3; }
+  .search-controls { position: static; align-items: stretch; }
+  .search-options { position: absolute; left: 0; bottom: calc(100% + .5rem); z-index: 2; width: min(19rem, calc(100vw - 1.5rem)); padding: .55rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
   .search-options label { flex: 1; }
   .search-options select, .search-options input { width: 100%; }
   .image-preview { max-width: 100%; }
@@ -804,7 +818,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .artifact-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); gap: .4rem .7rem; font-size: .92rem; }
   .activity-details { max-height: min(24dvh, 14rem); }
 }
-@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } .voice-icon-busy { animation: none; } }
 `;
 
 export function createBrowserRuntimeConfig({

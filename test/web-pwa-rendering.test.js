@@ -1131,9 +1131,24 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
   const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
   assert.match(mobileCss, /\.composer textarea \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 1;[^}]*width: 100%;/u);
-  assert.match(mobileCss, /\.composer > \.image-button \{[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*justify-self: start;/u);
+  assert.match(mobileCss, /\.composer-tools \{[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*justify-self: start;/u);
   assert.match(mobileCss, /\.composer-actions \{[^}]*grid-column: 2;[^}]*grid-row: 2;/u);
+  assert.match(mobileCss, /\.search-options \{[^}]*position: absolute;[^}]*bottom: calc\(100% \+ \.5rem\);/u);
   assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
+});
+
+test("the composer groups image and grounded-search tools beside an icon-only accessible microphone", async () => {
+  const map = await productionMap({ label: "compact-composer" });
+  const html = map.get("/").body;
+  const tools = /<div class="composer-tools">([\s\S]*?)<\/div>\s*<\/div>/u.exec(html);
+  assert.ok(tools);
+  assert.match(tools[1], /id="add-image"/u);
+  assert.match(tools[1], /id="search-controls"/u);
+  assert.match(
+    html,
+    /id="voice-input"[^>]*aria-label="Record voice"[^>]*data-voice-state="idle"[^>]*>[\s\S]*?<svg class="voice-icon-mic"/u,
+  );
+  assert.doesNotMatch(html, /id="voice-input"[^>]*>Mic<\/button>/u);
 });
 
 test("the iPhone multi-image composer and retained Agent gallery cannot overlap their controls", () => {
@@ -1153,7 +1168,7 @@ test("the iPhone multi-image composer and retained Agent gallery cannot overlap 
   const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
   const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
   const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
-  assert.match(mobileCss, /\.composer > \.image-preview, \.composer > \.search-controls \{ grid-column: 1 \/ -1; \}/u);
+  assert.match(mobileCss, /\.composer > \.image-preview \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 3;/u);
   assert.match(mobileCss, /\.image-preview \{ max-width: 100%; \}/u);
   assert.match(mobileCss, /\.message-attachments \{ grid-template-columns: minmax\(0, 1fr\); \}/u);
 });
@@ -1257,7 +1272,9 @@ test("iPhone voice capture stops cleanly, transcribes locally, and inserts edita
   const input = harness.document.getElementById("message-input");
   assert.equal(button.hidden, false);
   assert.equal(button.disabled, false);
-  assert.equal(button.textContent, "Mic");
+  assert.equal(button.textContent, "");
+  assert.equal(button.dataset.voiceState, "idle");
+  assert.equal(button.getAttribute("aria-label"), "Record voice");
   input.value = "Existing draft";
   input.selectionStart = input.value.length;
   input.selectionEnd = input.value.length;
@@ -1266,7 +1283,8 @@ test("iPhone voice capture stops cleanly, transcribes locally, and inserts edita
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(FakeMediaRecorder.instances.length, 1);
   assert.equal(FakeMediaRecorder.instances[0].state, "recording");
-  assert.equal(button.textContent, "Stop");
+  assert.equal(button.dataset.voiceState, "recording");
+  assert.equal(button.getAttribute("aria-label"), "Stop and transcribe voice");
   assert.equal(button.disabled, false);
   assert.equal(button.getAttribute("aria-pressed"), "true");
   assert.equal(input.disabled, true);
@@ -1281,7 +1299,9 @@ test("iPhone voice capture stops cleanly, transcribes locally, and inserts edita
   assert.equal(speechCalls[0].options.signal instanceof AbortSignal, true);
   assert.equal(input.value, "Existing draft Voice input works.");
   assert.equal(input.disabled, false);
-  assert.equal(button.textContent, "Mic");
+  assert.equal(button.textContent, "");
+  assert.equal(button.dataset.voiceState, "idle");
+  assert.equal(button.getAttribute("aria-label"), "Record voice");
   assert.equal(button.getAttribute("aria-pressed"), "false");
   assert.equal(stoppedTracks.filter((stream) => stream === streams[0]).length, 1);
   assert.equal(harness.document.getElementById("messages").children.length, 0);

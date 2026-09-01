@@ -2334,14 +2334,17 @@ export function createBrowserApp({
     const voiceAvailable = state.session.authenticated && state.speech !== null && voiceRuntimeAvailable();
     const voiceRecording = state.voiceCapture !== null;
     if (elements.voice_input !== null) {
-      elements.voice_input.hidden = !voiceAvailable && !voiceOperationActive();
-      elements.voice_input.textContent = state.voiceStarting ? "Wait"
-        : state.voiceTranscribing ? "Text…" : voiceRecording ? "Stop" : "Mic";
-      elements.voice_input.setAttribute("aria-label", state.voiceStarting ? "Opening microphone"
+      const voiceState = state.voiceStarting ? "starting"
+        : state.voiceTranscribing ? "transcribing" : voiceRecording ? "recording" : "idle";
+      const voiceLabel = state.voiceStarting ? "Opening microphone"
         : state.voiceTranscribing ? "Transcribing voice locally"
-        : voiceRecording ? "Stop and transcribe voice" : "Record voice");
+          : voiceRecording ? "Stop and transcribe voice" : "Record voice";
+      elements.voice_input.hidden = !voiceAvailable && !voiceOperationActive();
+      elements.voice_input.dataset.voiceState = voiceState;
+      elements.voice_input.setAttribute("aria-label", voiceLabel);
       elements.voice_input.setAttribute("aria-pressed", voiceRecording ? "true" : "false");
-      elements.voice_input.title = voiceRecording ? "Stop and transcribe voice" : "Record voice";
+      elements.voice_input.setAttribute("aria-busy", state.voiceStarting || state.voiceTranscribing ? "true" : "false");
+      elements.voice_input.title = voiceLabel;
       elements.voice_input.disabled = !voiceAvailable || state.voiceStarting || state.voiceTranscribing
         || (!voiceRecording && (locked || releaseRefreshPending || pendingChatSend
           || pendingChatDeletion || pendingAgentDeletion));

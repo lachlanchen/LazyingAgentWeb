@@ -85,7 +85,15 @@ function publicOriginFor(baseUrl) {
   return url.origin;
 }
 
-function testState(t, { connector, adapter, limits, visionEnabled = false, requestOutcomeObserver, clock } = {}) {
+function testState(t, {
+  connector,
+  speechConnector,
+  adapter,
+  limits,
+  visionEnabled = false,
+  requestOutcomeObserver,
+  clock
+} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-cloud-server-test-'));
   const controlStore = new CloudIndexStore({
     databasePath: join(root, 'control', 'index.sqlite'),
@@ -126,6 +134,7 @@ function testState(t, { connector, adapter, limits, visionEnabled = false, reque
     directChatStore,
     directChatContext,
     directChatConnector: connector,
+    speechConnector,
     visionEnabled,
     agintiAdapter: adapter,
     requestOutcomeObserver,
@@ -701,9 +710,65 @@ test('serves stable update metadata with HEAD parity and immutable caching only 
   assert.equal(CLOUD_HTTP_LIMITS.jobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.visionJobTimeoutMs, 600_000);
   assert.equal(CLOUD_HTTP_LIMITS.directChatJobs, 1);
+  assert.equal(CLOUD_HTTP_LIMITS.speechJobs, 1);
+  assert.equal(bodyLimitForRoute('/api/voice/transcribe'), CLOUD_HTTP_LIMITS.speechBodyBytes);
   assert.equal(bodyLimitForRoute('/api/transport/agent/v1/runs/start'), CLOUD_HTTP_LIMITS.agentVisionBodyBytes);
   assert.equal(bodyLimitForRoute('/api/transport/agent/v1/runs/resume'), CLOUD_HTTP_LIMITS.agentVisionBodyBytes);
   assert.equal(bodyLimitForRoute('/api/transport/agent/v1/capabilities'), CLOUD_HTTP_LIMITS.agentBodyBytes);
+});
+
+test('transcribes bounded authenticated voice without retaining audio and rejects unavailable speech early', async (t) => {
+  const calls = [];
+  const speechConnector = Object.freeze({
+    status: async () => ({ enabled: true, state: 'ready' }),
+    async transcribe(input) {
+      calls.push({ ...input, audio: input.audio.slice() });
+      return Object.freeze({
+        text: 'Voice input works.',
+        language: 'en',
+        languageProbability: 0.99,
+        durationSeconds: 1.25,
+        audioRetained: false
+      });
+    }
+  });
+  const state = testState(t, { speechConnector });
+  const { baseUrl } = await state.start();
+  const auth = await login(baseUrl);
+  const source = Buffer.from('RIFF bounded synthetic recording', 'utf8');
+  const response = await post(baseUrl, '/api/voice/transcribe', {
+    mediaType: 'audio/wav',
+    data: source.toString('base64'),
+    language: 'auto'
+  }, { cookie: auth.cookie, csrf: auth.csrf });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('permissions-policy'), 'camera=(), microphone=(self), geolocation=(), payment=(), usb=()');
+  assert.deepEqual(await response.json(), {
+    transcription: {
+      text: 'Voice input works.',
+      language: 'en',
+      languageProbability: 0.99,
+      durationSeconds: 1.25,
+      audioRetained: false
+    }
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].mediaType, 'audio/wav');
+  assert.equal(calls[0].language, 'auto');
+  assert.deepEqual(Buffer.from(calls[0].audio), source);
+  assert.equal(calls[0].signal instanceof AbortSignal, true);
+
+  const unavailable = testState(t);
+  const disabled = await unavailable.start();
+  const disabledAuth = await login(disabled.baseUrl);
+  const rejected = await post(disabled.baseUrl, '/api/voice/transcribe', {
+    mediaType: 'audio/wav',
+    data: source.toString('base64'),
+    language: 'auto'
+  }, { cookie: disabledAuth.cookie, csrf: disabledAuth.csrf });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).error.code, 'speech_unavailable');
 });
 
 test('outer request deadline covers the longest bounded body reader without relaxing connection limits', async (t) => {

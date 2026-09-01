@@ -26,7 +26,7 @@ export const STANDALONE_SHELL_SECURITY_HEADERS = Object.freeze({
   "x-content-type-options": "nosniff",
   "referrer-policy": "same-origin",
   "x-frame-options": "DENY",
-  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  "permissions-policy": "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
   "strict-transport-security": "max-age=31536000; includeSubDomains",
   "cross-origin-resource-policy": "same-origin",
   "cross-origin-opener-policy": "same-origin",

@@ -64,6 +64,12 @@ export {
   createLocalLlmConnector
 } from './localllm-connector.js';
 export {
+  SPEECH_CONNECTOR_AUDIO_LIMIT_BYTES,
+  SPEECH_CONNECTOR_MEDIA_TYPES,
+  SpeechConnectorError,
+  createSpeechConnector
+} from './speech-connector.js';
+export {
   CLOUD_AGENT_PUBLIC_ROUTES,
   createCloudRequestHandler,
   createCloudServer,

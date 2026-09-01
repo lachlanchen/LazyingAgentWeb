@@ -25,6 +25,7 @@ import {
   validateLoginBody,
   validatePublicOrigin,
   validateRequestIdempotencyKey,
+  validateSpeechTranscriptionRequest,
   validateTransportAgentRequest
 } from './http-contract.js';
 import { ControlPlaneError } from './errors.js';
@@ -43,6 +44,7 @@ import {
   validateEventEnvelope
 } from './web/aginti-protocol.js';
 import { fileArtifactMustDownload } from './web/file-artifact-policy.js';
+import { SpeechConnectorError } from './speech-connector.js';
 
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
@@ -110,7 +112,8 @@ function exactLimitOverrides(input = {}) {
     concurrentStreams: [1, 64],
     concurrentStreamsPerSession: [1, 8],
     loginAttemptsPerMinute: [1, 60],
-    directChatJobs: [1, 32]
+    directChatJobs: [1, 32],
+    speechJobs: [1, 4]
   });
   const result = { ...CLOUD_HTTP_LIMITS };
   for (const [name, value] of Object.entries(input)) {
@@ -172,7 +175,7 @@ function commonSecurityHeaders() {
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'same-origin',
     'x-frame-options': 'DENY',
-    'permissions-policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+    'permissions-policy': 'camera=(), microphone=(self), geolocation=(), payment=(), usb=()',
     'strict-transport-security': 'max-age=31536000; includeSubDomains',
     'cross-origin-resource-policy': 'same-origin',
     'cross-origin-opener-policy': 'same-origin'
@@ -235,6 +238,23 @@ function publicError(error) {
       [400, 401, 403, 404, 409, 429, 502, 503, 504].includes(status) ? status : 503,
       status === 429 ? 'agent_rate_limited' : 'agent_unavailable',
       status < 500 ? 'The Agent request was not accepted.' : 'AgInTi Agent is temporarily unavailable.'
+    );
+  }
+  if (error instanceof SpeechConnectorError) {
+    const mapping = {
+      SPEECH_BUSY: [429, 'speech_busy'],
+      SPEECH_RESPONSE_INVALID: [502, 'speech_response_invalid'],
+      SPEECH_TRANSPORT_INVALID: [502, 'speech_transport_invalid'],
+      SPEECH_CREDENTIAL_INVALID: [503, 'speech_unavailable'],
+      SPEECH_TRANSPORT_UNAVAILABLE: [503, 'speech_unavailable'],
+      SPEECH_UPSTREAM_REJECTED: [503, 'speech_unavailable']
+    };
+    const [status, code] = mapping[error.code] ?? [503, 'speech_unavailable'];
+    return new CloudHttpError(
+      status,
+      code,
+      status === 429 ? 'Speech transcription is busy. Retry shortly.' : 'Speech transcription is temporarily unavailable.',
+      status === 429 ? { retryAfter: 2 } : {}
     );
   }
   if (error?.name === 'AbortError') return new CloudHttpError(499, 'request_cancelled', 'The request was cancelled.');
@@ -1029,6 +1049,7 @@ export function createCloudRequestHandler({
   directChatStore,
   directChatContext,
   directChatConnector,
+  speechConnector,
   visionEnabled = false,
   visionModelAlias = VISION_MODEL_ALIAS,
   agintiAdapter,
@@ -1065,6 +1086,10 @@ export function createCloudRequestHandler({
   if (directChatConnector !== undefined && directChatConnector !== null && typeof directChatConnector.generate !== 'function') {
     throw new TypeError('directChatConnector must provide generate()');
   }
+  if (speechConnector !== undefined && speechConnector !== null
+      && (typeof speechConnector.status !== 'function' || typeof speechConnector.transcribe !== 'function')) {
+    throw new TypeError('speechConnector must provide status() and transcribe()');
+  }
   if (typeof visionEnabled !== 'boolean' || typeof visionModelAlias !== 'string'
       || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(visionModelAlias)) {
     throw new TypeError('Direct Chat vision configuration is invalid');
@@ -1096,6 +1121,7 @@ export function createCloudRequestHandler({
     maximumAttempts: limits.loginAttemptsPerMinute
   });
   const streamGate = new ConcurrencyGate(limits.concurrentStreams, limits.concurrentStreamsPerSession);
+  const speechGate = new ConcurrencyGate(limits.speechJobs, 1);
   const jobs = new Map();
   const ephemeralSessions = new Map();
   let ephemeralExpiryTimer = null;
@@ -1540,6 +1566,26 @@ export function createCloudRequestHandler({
       // Never imply that revoking a cloud cookie cancelled AgInTi-owned work.
       agentCancellationPending: agintiAdapter !== undefined && agintiAdapter !== null
     }, { 'set-cookie': clearedCookies() });
+  }
+
+  async function handleSpeech(req, res, body, requestSignal) {
+    if (speechConnector === undefined || speechConnector === null) {
+      throw new CloudHttpError(503, 'speech_unavailable', 'Speech transcription is not enabled.');
+    }
+    const input = validateSpeechTranscriptionRequest(body);
+    try {
+      const transcription = await withTimeout(
+        (signal) => speechConnector.transcribe({ ...input, signal }),
+        {
+          signal: requestSignal,
+          milliseconds: limits.jobTimeoutMs,
+          timeoutMessage: 'speech transcription timed out'
+        }
+      );
+      sendJson(req, res, 200, { transcription });
+    } finally {
+      input.audio.fill(0);
+    }
   }
 
   function closeGenerationJobs() {
@@ -2239,6 +2285,7 @@ export function createCloudRequestHandler({
     res[RESPONSE_RELEASE_ID] = assets.releaseId;
     let releaseBody = null;
     let releaseStream = null;
+    let releaseSpeech = null;
     let runAdmission = null;
     let outcomeRoute = 'unknown';
     let outcomeFetchMetadata = 'unchecked';
@@ -2251,11 +2298,12 @@ export function createCloudRequestHandler({
       const route = classifyRequestTarget(req.url, assets);
       outcomeRoute = route.kind === 'chat' ? 'chat'
         : (route.kind === 'agent' ? 'agent'
+          : (route.kind === 'speech' ? 'speech'
           : (route.kind === 'agent_artifact' ? 'agent_artifact'
           : (route.pathname === CLOUD_ROUTES.login ? 'login'
             : (route.pathname === CLOUD_ROUTES.session ? 'session'
               : (route.pathname === CLOUD_ROUTES.logout ? 'logout'
-                : (route.kind === 'asset' ? 'asset' : 'unknown'))))));
+                : (route.kind === 'asset' ? 'asset' : 'unknown')))))));
       if (route.kind === 'invalid' || route.kind === 'not_found') {
         if (req.method === 'POST' && hasRequestBodyFraming(req)) req.shouldKeepAlive = false;
         if (route.kind === 'invalid') throw new CloudHttpError(400, 'invalid_target', 'The request target is not normalized.');
@@ -2309,7 +2357,8 @@ export function createCloudRequestHandler({
       outcomeFetchMetadata = fetchMetadataState(req);
       if (outcomeFetchMetadata === 'invalid') rejectFetchMetadata();
       let metadataAuthenticated = null;
-      if (outcomeFetchMetadata !== 'complete' && (route.kind === 'chat' || route.kind === 'agent')) {
+      if (outcomeFetchMetadata !== 'complete'
+          && (route.kind === 'chat' || route.kind === 'agent' || route.kind === 'speech')) {
         try {
           metadataAuthenticated = await authenticate(req);
         } catch (error) {
@@ -2320,9 +2369,18 @@ export function createCloudRequestHandler({
       }
       outcomeRelease = clientReleaseState(req, assets.releaseId);
       if (outcomeRelease === 'mismatch') rejectClientRelease();
-      const preauthenticated = route.kind === 'chat' || route.kind === 'agent'
+      const preauthenticated = route.kind === 'chat' || route.kind === 'agent' || route.kind === 'speech'
         ? requireAuthentication(metadataAuthenticated ?? await authenticate(req))
         : null;
+      if (route.kind === 'speech') {
+        if (speechConnector === undefined || speechConnector === null) {
+          throw new CloudHttpError(503, 'speech_unavailable', 'Speech transcription is not enabled.');
+        }
+        releaseSpeech = speechGate.enter(preauthenticated.browserSession);
+        if (!releaseSpeech) {
+          throw new CloudHttpError(429, 'speech_busy', 'Speech transcription is busy. Retry shortly.', { retryAfter: 2 });
+        }
+      }
       const admissionKind = route.pathname === CLOUD_ROUTES.chatRunsStart
         ? 'direct-chat-start'
         : (route.kind === 'agent'
@@ -2352,7 +2410,7 @@ export function createCloudRequestHandler({
       const body = await readJsonBody(
         req,
         bodyLimitForRoute(route.pathname),
-        route.pathname === CLOUD_ROUTES.chatRunsStart
+        route.pathname === CLOUD_ROUTES.chatRunsStart || route.kind === 'speech'
             || (route.kind === 'agent'
               && [AGINTI_RPC_PATHS.runsStart, AGINTI_RPC_PATHS.runsResume].includes(route.nativeAgentPath))
           ? limits.visionBodyTimeoutMs
@@ -2382,6 +2440,10 @@ export function createCloudRequestHandler({
         await handleLogout(req, res);
         return;
       }
+      if (route.kind === 'speech') {
+        await handleSpeech(req, res, body, disconnect.controller.signal);
+        return;
+      }
       if (route.kind === 'chat') {
         await handleChat(
           req,
@@ -2406,6 +2468,7 @@ export function createCloudRequestHandler({
     } finally {
       releaseBody?.();
       releaseStream?.();
+      releaseSpeech?.();
       runAdmission?.release();
       disconnect.cleanup();
       if (requestOutcomeObserver !== undefined && req.method === 'POST') {

@@ -295,6 +295,19 @@ function localLlmBaseUrl(value) {
   return value;
 }
 
+function speechBaseUrl(value) {
+  if (typeof value !== 'string') throw new TypeError('localLlm.speech.baseUrl is invalid');
+  const url = new URL(value);
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1'
+      || !/^[1-9]\d{3,4}$/u.test(url.port) || Number(url.port) < 1_024
+      || Number(url.port) > 65_535 || url.pathname !== '/api/speech'
+      || url.username || url.password || url.search || url.hash
+      || url.toString().replace(/\/$/u, '') !== value) {
+    throw new TypeError('localLlm.speech.baseUrl must be an exact private 127.0.0.1 HTTP /api/speech endpoint');
+  }
+  return value;
+}
+
 function agintiBaseUrl(value) {
   if (typeof value !== 'string') throw new TypeError('aginti.baseUrl is invalid');
   const url = new URL(value);
@@ -395,7 +408,7 @@ function validateConfig(value) {
   const localLlm = plainObject(
     root.localLlm,
     ['baseUrl', 'allowedModelAliases', 'defaultModelAlias'],
-    ['vision'],
+    ['vision', 'speech'],
     'localLlm'
   );
   const aliases = modelAliases(localLlm.allowedModelAliases);
@@ -415,6 +428,12 @@ function validateConfig(value) {
   if (vision.enabled && defaultModelAlias === VISION_MODEL_ALIAS) {
     throw new TypeError('localLlm.defaultModelAlias must remain the text alias when vision is enabled');
   }
+  const speechInput = localLlm.speech ?? { enabled: false };
+  const speech = plainObject(speechInput, ['enabled'], ['baseUrl'], 'localLlm.speech');
+  if (typeof speech.enabled !== 'boolean') throw new TypeError('localLlm.speech.enabled must be boolean');
+  if (speech.enabled !== Object.hasOwn(speech, 'baseUrl')) {
+    throw new TypeError('localLlm.speech.baseUrl is required exactly when speech is enabled');
+  }
 
   const aginti = plainObject(root.aginti, ['enabled'], ['baseUrl'], 'aginti');
   if (typeof aginti.enabled !== 'boolean') throw new TypeError('aginti.enabled must be boolean');
@@ -425,7 +444,7 @@ function validateConfig(value) {
   const credentials = plainObject(
     root.credentials,
     ['passwordHash', 'localLlmToken'],
-    ['agintiToken'],
+    ['agintiToken', 'speechToken'],
     'credentials'
   );
   const passwordHash = credentialName(credentials.passwordHash, 'credentials.passwordHash');
@@ -433,11 +452,17 @@ function validateConfig(value) {
   const agintiToken = credentials.agintiToken === undefined
     ? undefined
     : credentialName(credentials.agintiToken, 'credentials.agintiToken');
+  const speechToken = credentials.speechToken === undefined
+    ? undefined
+    : credentialName(credentials.speechToken, 'credentials.speechToken');
   if (aginti.enabled !== (agintiToken !== undefined)) {
     throw new TypeError('credentials.agintiToken is required exactly when AgInTi is enabled');
   }
-  if (new Set([passwordHash, localLlmToken, agintiToken].filter(Boolean)).size
-      !== [passwordHash, localLlmToken, agintiToken].filter(Boolean).length) {
+  if (speech.enabled !== (speechToken !== undefined)) {
+    throw new TypeError('credentials.speechToken is required exactly when speech is enabled');
+  }
+  const credentialPurposes = [passwordHash, localLlmToken, agintiToken, speechToken].filter(Boolean);
+  if (new Set(credentialPurposes).size !== credentialPurposes.length) {
     throw new TypeError('credential purposes must use separate files');
   }
 
@@ -464,13 +489,22 @@ function validateConfig(value) {
       baseUrl: localLlmBaseUrl(localLlm.baseUrl),
       allowedModelAliases: aliases,
       defaultModelAlias,
-      vision: { enabled: vision.enabled, modelAlias: VISION_MODEL_ALIAS }
+      vision: { enabled: vision.enabled, modelAlias: VISION_MODEL_ALIAS },
+      speech: {
+        enabled: speech.enabled,
+        ...(speech.enabled ? { baseUrl: speechBaseUrl(speech.baseUrl) } : {})
+      }
     },
     aginti: {
       enabled: aginti.enabled,
       ...(aginti.enabled ? { baseUrl: agintiBaseUrl(aginti.baseUrl) } : {})
     },
-    credentials: { passwordHash, localLlmToken, ...(agintiToken === undefined ? {} : { agintiToken }) }
+    credentials: {
+      passwordHash,
+      localLlmToken,
+      ...(agintiToken === undefined ? {} : { agintiToken }),
+      ...(speechToken === undefined ? {} : { speechToken })
+    }
   });
 }
 
@@ -485,7 +519,8 @@ class LoadedServiceConfig {
   }
 
   readCredential(purpose) {
-    if (purpose !== 'passwordHash' && purpose !== 'localLlmToken' && purpose !== 'agintiToken') {
+    if (purpose !== 'passwordHash' && purpose !== 'localLlmToken'
+        && purpose !== 'agintiToken' && purpose !== 'speechToken') {
       throw new TypeError('credential purpose is unsupported');
     }
     if (!Object.hasOwn(this.config.credentials, purpose)) throw new TypeError('credential purpose is not configured');
@@ -504,7 +539,7 @@ class LoadedServiceConfig {
   }
 
   createCredentialProvider(purpose) {
-    if (purpose !== 'localLlmToken' && purpose !== 'agintiToken') {
+    if (purpose !== 'localLlmToken' && purpose !== 'agintiToken' && purpose !== 'speechToken') {
       throw new TypeError('only transport tokens support rotating credential providers');
     }
     if (!Object.hasOwn(this.config.credentials, purpose)) throw new TypeError('credential purpose is not configured');

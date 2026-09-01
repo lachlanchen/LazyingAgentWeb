@@ -31,6 +31,7 @@ import { verifyStandaloneAssetMap } from '../src/web/asset-map.js';
 const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJaN-PM0aUzMtLvhFdDx1N8hFXxjq516BA_8qqt8ZvPCFPrAO-5S8bx0vVTiFV-6f3T9LPL5YPBEUJ6yTR2Q';
 const LOCAL_TOKEN = 'service-local-token-0000000000001';
 const AGINTI_TOKEN = 'service-aginti-token-0000000000001';
+const SPEECH_TOKEN = 'service-speech-token-0000000000001';
 
 function fileSha256(filename) {
   return createHash('sha256').update(readFileSync(filename)).digest('hex');
@@ -40,7 +41,7 @@ function databaseDirectoryInventory(filename) {
   return readdirSync(dirname(filename)).sort();
 }
 
-function serviceFixture(t) {
+function serviceFixture(t, { speechEnabled = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'lazying-service-test-'));
   const credentialsDirectory = join(root, 'credentials');
   const configPath = join(root, 'service.json');
@@ -50,6 +51,7 @@ function serviceFixture(t) {
   writeFileSync(join(credentialsDirectory, 'login-password-hash'), PASSWORD_RECORD, { mode: 0o400 });
   writeFileSync(join(credentialsDirectory, 'localllm-token'), LOCAL_TOKEN, { mode: 0o400 });
   writeFileSync(join(credentialsDirectory, 'aginti-token'), AGINTI_TOKEN, { mode: 0o400 });
+  writeFileSync(join(credentialsDirectory, 'speech-token'), SPEECH_TOKEN, { mode: 0o400 });
   const config = {
     schema: 'lazying-agent-service/v1',
     listen: { host: '127.0.0.1', port: 18_544 },
@@ -69,7 +71,10 @@ function serviceFixture(t) {
     localLlm: {
       baseUrl: 'http://127.0.0.1:18008/v1',
       allowedModelAliases: ['localllm-test'],
-      defaultModelAlias: 'localllm-test'
+      defaultModelAlias: 'localllm-test',
+      ...(speechEnabled ? {
+        speech: { enabled: true, baseUrl: 'http://127.0.0.1:18023/api/speech' }
+      } : {})
     },
     aginti: {
       enabled: true,
@@ -78,7 +83,8 @@ function serviceFixture(t) {
     credentials: {
       passwordHash: 'login-password-hash',
       localLlmToken: 'localllm-token',
-      agintiToken: 'aginti-token'
+      agintiToken: 'aginti-token',
+      ...(speechEnabled ? { speechToken: 'speech-token' } : {})
     }
   };
   writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
@@ -144,6 +150,22 @@ function serviceHarness(config) {
         attachments: { enabled: false },
         artifacts: { kinds: ['plot', 'table', 'markdown'], schemaVersion: '1' }
       }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'http://127.0.0.1:18023/api/speech/status') {
+      return new Response(JSON.stringify({
+        schema: 'localllm/speech-status/v1',
+        enabled: true,
+        state: 'cold',
+        model_loaded: false,
+        accepted_media_types: ['audio/mp4', 'audio/webm'],
+        maximum_audio_bytes: 8 * 1024 * 1024,
+        maximum_duration_seconds: 180,
+        persistence: 'transient-until-transcribed',
+        fault: null
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+      });
     }
     return new Response(JSON.stringify({
       object: 'list',
@@ -258,7 +280,6 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
     fetchImpl: harness.fetchImpl,
     serverFactory: harness.serverFactory
   });
-  t.after(async () => { await service.shutdown(); });
 
   const options = harness.captured.serverOptions;
   assert.equal(options.agintiAdapter, service.agintiAdapter);
@@ -269,6 +290,7 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   assert.equal(options.directChatStore, service.directChatStore);
   assert.equal(options.directChatContext, service.directChatContext);
   assert.equal(options.directChatConnector, service.directChatConnector);
+  assert.equal(options.speechConnector, null);
   assert.equal(service.directChatSummarizer.locality, 'local');
   assert.equal(options.controlStore, service.controlStore);
   assert.equal(options.sessionStore, service.controlStore);
@@ -312,6 +334,25 @@ test('constructs decoupled stores, LocalLLM, context, PWA, and an exact loopback
   await service.shutdown();
   await service.shutdown();
   assert.equal(harness.fakeServer.shutdownCalls, 1);
+});
+
+test('constructs speech only from its dedicated loopback route and rotating credential', async (t) => {
+  const state = serviceFixture(t, { speechEnabled: true });
+  const harness = serviceHarness(state.config);
+  const service = await createStandaloneService({
+    loadedConfig: state.loadedConfig,
+    fetchImpl: harness.fetchImpl,
+    serverFactory: harness.serverFactory
+  });
+  const connector = harness.captured.serverOptions.speechConnector;
+  assert.ok(connector);
+  const status = await connector.status({ signal: new AbortController().signal });
+  assert.equal(status.enabled, true);
+  assert.equal(status.state, 'cold');
+  assert.equal(harness.captured.requests.at(-1).url, 'http://127.0.0.1:18023/api/speech/status');
+  assert.equal(harness.captured.requests.at(-1).init.headers.authorization, `Bearer ${SPEECH_TOKEN}`);
+  assert.notEqual(harness.captured.serverOptions.directChatConnector, connector);
+  await service.shutdown();
 });
 
 test('shutdown while admission control starts prevents a later HTTP listen', async (t) => {

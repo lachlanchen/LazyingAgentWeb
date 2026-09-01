@@ -27,6 +27,12 @@ const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
 const UNSAFE_MESSAGE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const ENCODED_PATH_PATTERN = /%(?:2e|2f|5c)/iu;
 const ARTIFACT_CONTENT_TARGET_PATTERN = /^\/api\/agent\/artifacts\/(art_[A-Za-z0-9_-]{32,86})\/content(?:\?v=([A-Za-z0-9][A-Za-z0-9._~-]{0,95})(?:&download=(1))?)?$/u;
+const SPEECH_MEDIA_TYPES = new Set([
+  'audio/mp4', 'audio/x-m4a', 'audio/webm', 'audio/ogg', 'audio/wav', 'audio/x-wav', 'audio/mpeg'
+]);
+const SPEECH_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const MAX_SPEECH_AUDIO_BYTES = 8 * 1024 * 1024;
+const MAX_SPEECH_BASE64_BYTES = Math.ceil(MAX_SPEECH_AUDIO_BYTES / 3) * 4;
 
 export const CLOUD_HTTP_LIMITS = Object.freeze({
   requestTargetBytes: 2_048,
@@ -37,6 +43,7 @@ export const CLOUD_HTTP_LIMITS = Object.freeze({
   visionChatBodyBytes: 24 * 1024 * 1024,
   agentBodyBytes: 64 * 1024,
   agentVisionBodyBytes: 24 * 1024 * 1024,
+  speechBodyBytes: MAX_SPEECH_BASE64_BYTES + 16 * 1024,
   responseJsonBytes: 512 * 1024,
   connectorDeltaBytes: 16 * 1024,
   connectorOutputBytes: 64 * 1024,
@@ -55,7 +62,8 @@ export const CLOUD_HTTP_LIMITS = Object.freeze({
   concurrentStreams: 8,
   concurrentStreamsPerSession: 2,
   loginAttemptsPerMinute: 6,
-  directChatJobs: 1
+  directChatJobs: 1,
+  speechJobs: 1
 });
 
 export const SESSION_COOKIE_NAME = '__Host-lazying_session';
@@ -73,6 +81,7 @@ export const CLOUD_ROUTES = Object.freeze({
   login: '/api/login',
   session: '/api/session',
   logout: '/api/logout',
+  speechTranscribe: '/api/voice/transcribe',
   chatCapabilities: '/api/chat/capabilities',
   chatThreadsList: '/api/chat/threads/list',
   chatThreadsCreate: '/api/chat/threads/create',
@@ -117,6 +126,7 @@ const DYNAMIC_POST_ROUTES = new Set([
   CLOUD_ROUTES.login,
   CLOUD_ROUTES.session,
   CLOUD_ROUTES.logout,
+  CLOUD_ROUTES.speechTranscribe,
   ...CHAT_POST_ROUTES,
   ...Object.keys(AGENT_ROUTE_MAP)
 ]);
@@ -412,7 +422,11 @@ export function classifyRequestTarget(rawTarget, assets) {
   }
   if (DYNAMIC_POST_ROUTES.has(rawTarget)) {
     return Object.freeze({
-      kind: Object.hasOwn(AGENT_ROUTE_MAP, rawTarget) ? 'agent' : (rawTarget.startsWith('/api/chat/') ? 'chat' : 'session'),
+      kind: Object.hasOwn(AGENT_ROUTE_MAP, rawTarget)
+        ? 'agent'
+        : (rawTarget.startsWith('/api/chat/')
+          ? 'chat'
+          : (rawTarget === CLOUD_ROUTES.speechTranscribe ? 'speech' : 'session')),
       pathname: rawTarget,
       nativeAgentPath: AGENT_ROUTE_MAP[rawTarget]
     });
@@ -423,6 +437,7 @@ export function classifyRequestTarget(rawTarget, assets) {
 export function bodyLimitForRoute(pathname) {
   if (pathname === CLOUD_ROUTES.login) return CLOUD_HTTP_LIMITS.loginBodyBytes;
   if (pathname === CLOUD_ROUTES.session || pathname === CLOUD_ROUTES.logout) return CLOUD_HTTP_LIMITS.sessionBodyBytes;
+  if (pathname === CLOUD_ROUTES.speechTranscribe) return CLOUD_HTTP_LIMITS.speechBodyBytes;
   if (pathname === CLOUD_ROUTES.chatRunsStart) return CLOUD_HTTP_LIMITS.visionChatBodyBytes;
   if (pathname.startsWith('/api/chat/')) return CLOUD_HTTP_LIMITS.chatBodyBytes;
   if (pathname === `${AGENT_TRANSPORT_PREFIX}${AGINTI_RPC_PATHS.runsStart}`
@@ -463,6 +478,31 @@ export function validateLoginBody(value) {
 export function validateEmptyBody(value, name = 'request') {
   exactObject(value, [], [], name);
   return Object.freeze({});
+}
+
+export function validateSpeechTranscriptionRequest(value) {
+  const body = exactObject(value, ['mediaType', 'data', 'language'], [], 'speech transcription');
+  if (typeof body.mediaType !== 'string' || !SPEECH_MEDIA_TYPES.has(body.mediaType)) {
+    invalid('speech mediaType is invalid.');
+  }
+  if (typeof body.language !== 'string' || !/^(?:auto|[a-z]{2,3})$/u.test(body.language)) {
+    invalid('speech language is invalid.');
+  }
+  if (typeof body.data !== 'string' || body.data.length < 4
+      || body.data.length > MAX_SPEECH_BASE64_BYTES || !SPEECH_BASE64_PATTERN.test(body.data)) {
+    invalid('speech data is invalid.');
+  }
+  const audio = Buffer.from(body.data, 'base64');
+  if (audio.byteLength < 1 || audio.byteLength > MAX_SPEECH_AUDIO_BYTES
+      || audio.toString('base64') !== body.data) {
+    audio.fill(0);
+    invalid('speech data is invalid.');
+  }
+  return Object.freeze({
+    mediaType: body.mediaType,
+    audio: new Uint8Array(audio),
+    language: body.language
+  });
 }
 
 export function validateChatRequest(pathname, value) {

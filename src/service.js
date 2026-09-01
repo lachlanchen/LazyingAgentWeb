@@ -16,6 +16,7 @@ import { DirectChatStore } from './chat-store.js';
 import { createCloudServer } from './cloud-server.js';
 import { createDeterministicContextSummarizer } from './deterministic-context-summarizer.js';
 import { createLocalLlmConnector } from './localllm-connector.js';
+import { createSpeechConnector } from './speech-connector.js';
 import { LATEST_SCHEMA_VERSION, SQLITE_APPLICATION_ID } from './migrations.js';
 import {
   DEFAULT_ROLLOUT_ADMISSION_SOCKET,
@@ -104,6 +105,14 @@ async function materializeInputs(loadedConfig, { createVerifier = true } = {}) {
       agintiCredential = null;
     }
   }
+  if (loaded.config.localLlm.speech.enabled) {
+    let speechCredential = loaded.readCredential('speechToken');
+    try {
+      validateTransportCredential(speechCredential, 'Speech');
+    } finally {
+      speechCredential = null;
+    }
+  }
   const assetMap = await buildAssetMap(loaded.config);
   return Object.freeze({
     loaded,
@@ -112,6 +121,9 @@ async function materializeInputs(loadedConfig, { createVerifier = true } = {}) {
     localLlmCredentialProvider: loaded.createCredentialProvider('localLlmToken'),
     ...(loaded.config.aginti.enabled
       ? { agintiCredentialProvider: loaded.createCredentialProvider('agintiToken') }
+      : {}),
+    ...(loaded.config.localLlm.speech.enabled
+      ? { speechCredentialProvider: loaded.createCredentialProvider('speechToken') }
       : {})
   });
 }
@@ -331,6 +343,13 @@ export async function createStandaloneService({
           ...(fetchImpl === undefined ? {} : { fetchImpl })
         })
       : null;
+    const speechConnector = config.localLlm.speech.enabled
+      ? createSpeechConnector({
+          baseUrl: config.localLlm.speech.baseUrl,
+          credentialProvider: materialized.speechCredentialProvider,
+          ...(fetchImpl === undefined ? {} : { fetchImpl })
+        })
+      : null;
     server = serverFactory({
       releaseId: materialized.assetMap.releaseVersion,
       assetMap: materialized.assetMap,
@@ -346,6 +365,7 @@ export async function createStandaloneService({
       directChatContext,
       directChatSummarizer,
       directChatConnector,
+      speechConnector,
       visionEnabled: config.localLlm.vision.enabled,
       visionModelAlias: config.localLlm.vision.modelAlias,
       agintiAdapter,

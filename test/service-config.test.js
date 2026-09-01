@@ -25,6 +25,7 @@ const PASSWORD_RECORD = 'scrypt$v=1$n=131072,r=8,p=1$ABEiM0RVZneImaq7zN3u_w$ODwJ
 const TOKEN_ONE = 'local-token-one-0000000000000001';
 const TOKEN_TWO = 'local-token-two-0000000000000002';
 const AGINTI_TOKEN = 'aginti-token-one-0000000000000001';
+const SPEECH_TOKEN = 'speech-token-one-0000000000000001';
 
 function configValue(root, overrides = {}) {
   const value = {
@@ -72,6 +73,7 @@ function fixture(t, overrides = {}) {
   writeFileSync(join(credentialsDirectory, 'login-password-hash'), `${PASSWORD_RECORD}\n`, { mode: 0o600 });
   writeFileSync(join(credentialsDirectory, 'localllm-token'), TOKEN_ONE, { mode: 0o400 });
   writeFileSync(join(credentialsDirectory, 'aginti-token'), AGINTI_TOKEN, { mode: 0o400 });
+  writeFileSync(join(credentialsDirectory, 'speech-token'), SPEECH_TOKEN, { mode: 0o400 });
   writeFileSync(configPath, JSON.stringify(configValue(root, overrides)), { mode: 0o600 });
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return { root, credentialsDirectory, configPath };
@@ -203,6 +205,73 @@ test('keeps vision fail-closed by default and enables only the fixed LocalLLM vi
     }
   });
   assert.throws(() => loadServiceConfig(visionAsText), /must remain the text alias/u);
+});
+
+test('keeps speech disabled by default and requires a separate private route credential when enabled', async (t) => {
+  const disabled = loadServiceConfig(fixture(t));
+  assert.deepEqual(disabled.config.localLlm.speech, { enabled: false });
+  assert.throws(() => disabled.readCredential('speechToken'), /not configured/u);
+
+  const enabled = loadServiceConfig(fixture(t, {
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-test'],
+      defaultModelAlias: 'localllm-test',
+      speech: { enabled: true, baseUrl: 'http://127.0.0.1:18023/api/speech' }
+    },
+    credentials: {
+      passwordHash: 'login-password-hash',
+      localLlmToken: 'localllm-token',
+      agintiToken: 'aginti-token',
+      speechToken: 'speech-token'
+    }
+  }));
+  assert.deepEqual(enabled.config.localLlm.speech, {
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:18023/api/speech'
+  });
+  assert.equal(enabled.readCredential('speechToken'), SPEECH_TOKEN);
+  assert.equal(await enabled.createCredentialProvider('speechToken')(), SPEECH_TOKEN);
+
+  for (const speech of [
+    { enabled: true },
+    { enabled: false, baseUrl: 'http://127.0.0.1:18023/api/speech' },
+    { enabled: true, baseUrl: 'https://127.0.0.1:18023/api/speech' },
+    { enabled: true, baseUrl: 'http://localhost:18023/api/speech' },
+    { enabled: true, baseUrl: 'http://127.0.0.1:18023/api/speech/' }
+  ]) {
+    const state = fixture(t, {
+      localLlm: {
+        baseUrl: 'http://127.0.0.1:18008/v1',
+        allowedModelAliases: ['localllm-test'],
+        defaultModelAlias: 'localllm-test',
+        speech
+      },
+      credentials: {
+        passwordHash: 'login-password-hash',
+        localLlmToken: 'localllm-token',
+        agintiToken: 'aginti-token',
+        ...(speech.enabled ? { speechToken: 'speech-token' } : {})
+      }
+    });
+    assert.throws(() => loadServiceConfig(state), TypeError);
+  }
+
+  const reused = fixture(t, {
+    localLlm: {
+      baseUrl: 'http://127.0.0.1:18008/v1',
+      allowedModelAliases: ['localllm-test'],
+      defaultModelAlias: 'localllm-test',
+      speech: { enabled: true, baseUrl: 'http://127.0.0.1:18023/api/speech' }
+    },
+    credentials: {
+      passwordHash: 'login-password-hash',
+      localLlmToken: 'localllm-token',
+      agintiToken: 'aginti-token',
+      speechToken: 'localllm-token'
+    }
+  });
+  assert.throws(() => loadServiceConfig(reused), /separate files/u);
 });
 
 test('rejects public binds, non-private LocalLLM, shared databases, and secret config fields', (t) => {

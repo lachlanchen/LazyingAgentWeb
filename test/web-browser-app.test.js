@@ -8217,15 +8217,17 @@ test("PWA submit blocks and invalidates an image preparation race without consum
   assert.equal(send.disabled, true, "Send is disabled before canonicalization yields");
   const imageAction = browser.document.getElementById("add-image");
   assert.equal(imageAction.disabled, true);
-  assert.equal(imageAction.textContent, "Preparing images…");
+  assert.equal(imageAction.dataset.imageState, "preparing");
   assert.equal(imageAction.getAttribute("aria-label"), "Preparing images…");
+  assert.equal(imageAction.title, "Preparing images…");
 
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(preparedRun, null, "a programmatic form submission cannot bypass the pending guard");
   assert.equal(message.value, "Keep this text-only prompt", "the blocked submission preserves typed text");
   assert.equal(send.disabled, false, "cancelling the pending selection releases the composer");
-  assert.equal(imageAction.textContent, "Images");
+  assert.equal(imageAction.dataset.imageState, "idle");
   assert.equal(imageAction.getAttribute("aria-label"), "Add images");
+  assert.equal(imageAction.title, "Add images");
 
   pending.resolve(Object.freeze({
     attachmentId: "image_0000000000000002",
@@ -8298,14 +8300,14 @@ test("slow image preparation is visible and cancellation or failure preserves th
 
   input.files = [{ name: "slow-second.heic" }];
   input.dispatch("change");
-  assert.equal(imageAction.textContent, "Preparing images…");
+  assert.equal(imageAction.dataset.imageState, "preparing");
   assert.equal(imageAction.getAttribute("aria-label"), "Preparing images…");
   assert.equal(preview.hidden, false, "the already-prepared image stays visible during another decode");
   await browser.app.submitMessage({ preventDefault() {} });
   assert.equal(secondSignal.aborted, true);
   assert.equal(message.value, "Keep this exact draft and first image");
   assert.equal(preview.hidden, false);
-  assert.equal(imageAction.textContent, "Images");
+  assert.equal(imageAction.dataset.imageState, "idle");
 
   pending.resolve(prepared("stale-second"));
   await new Promise((resolve) => setImmediate(resolve));
@@ -8318,7 +8320,7 @@ test("slow image preparation is visible and cancellation or failure preserves th
   assert.equal(message.value, "Keep this exact draft and first image");
   assert.equal(preview.hidden, false, "a later preparation failure does not discard the prior image");
   assert.equal(objectUrls, 1);
-  assert.equal(imageAction.textContent, "Images");
+  assert.equal(imageAction.dataset.imageState, "idle");
   assert.match(browser.document.getElementById("toast").textContent, /could not be prepared safely/u);
 });
 

@@ -195,7 +195,7 @@ const BROWSER_FIXTURE = `<!doctype html>
         <article class="artifact"><h3>Compiled paper</h3><div id="file-artifact"></div></article>
       </section>
     </article></section></div>
-    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><div class="composer-tools"><button id="add-image" class="image-button" type="button">Images</button><div id="search-controls" class="search-controls"><button id="search-toggle" type="button" aria-pressed="false">Search</button><div id="search-options" class="search-options" hidden><label>Sources<select><option>Web</option></select></label><label>Limit<input type="number" value="8"></label></div></div></div><textarea id="message-input"></textarea><div class="composer-actions"><button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" data-voice-state="idle"><svg class="voice-icon-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Zm6-3a6 6 0 0 1-12 0m6 6v3m-3 0h6"/></svg><span class="voice-icon-stop" aria-hidden="true"></span><span class="voice-icon-busy" aria-hidden="true"></span></button><button id="run-agent">Run Agent</button></div></form>
+    <aside id="activity-panel" class="activity-panel" aria-label="AgInTi run activity"><details id="activity-disclosure" class="activity-disclosure"><summary><strong>Agent activity</strong><span>Completed</span></summary><div id="activity-details" class="activity-details"><ol>${Array.from({ length: 48 }, (unused, index) => `<li>Bounded activity ${index + 1} — Completed</li>`).join("")}</ol></div></details></aside><form id="composer" class="composer"><div class="composer-tools"><button id="add-image" class="composer-icon-button image-button" type="button" aria-label="Add images"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/></svg></button><div id="search-controls" class="search-controls"><button id="search-toggle" class="composer-icon-button" type="button" aria-label="Search settings" aria-pressed="false"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/></svg></button><div id="search-options" class="search-options" hidden><label>Sources<select><option>Web</option></select></label><label>Limit<input type="number" value="8"></label></div></div></div><textarea id="message-input"></textarea><div class="composer-actions"><button id="voice-input" class="voice-button" type="button" aria-label="Record voice" aria-pressed="false" data-voice-state="idle"><svg class="voice-icon-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Zm6-3a6 6 0 0 1-12 0m6 6v3m-3 0h6"/></svg><span class="voice-icon-stop" aria-hidden="true"></span><span class="voice-icon-busy" aria-hidden="true"></span></button><button id="stop-run" class="composer-icon-button stop-button" aria-label="Stop running task" hidden><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12"/></svg></button><button id="send-message">Run Agent</button></div></form>
   </section>
 </div>
 <script type="module">
@@ -298,8 +298,16 @@ const GEOMETRY_EXPRESSION = `(() => {
   const searchToggleNode = document.querySelector('#search-toggle');
   const voiceInputNode = document.querySelector('#voice-input');
   const composerActions = rectangle(document.querySelector('.composer-actions'));
-  const lowerControls = [addImageNode, searchToggleNode, voiceInputNode, document.querySelector('#run-agent')];
-  const runAgent = rectangle(document.querySelector('#run-agent'));
+  const lowerControls = [addImageNode, searchToggleNode, voiceInputNode, document.querySelector('#send-message')];
+  const runAgent = rectangle(document.querySelector('#send-message'));
+  const stopRunNode = document.querySelector('#stop-run');
+  stopRunNode.hidden = false;
+  const runningStop = rectangle(stopRunNode);
+  const runningSendDisplay = getComputedStyle(document.querySelector('#send-message')).display;
+  const runningControls = [addImageNode, searchToggleNode, voiceInputNode, stopRunNode].filter(visible);
+  const runningControlsInsideComposer = runningControls.every((node) => contains(rectangle(document.querySelector('#composer')), rectangle(node)));
+  const runningControlsOverlap = overlaps(runningControls);
+  stopRunNode.hidden = true;
   const searchOptionsNode = document.querySelector('#search-options');
   const searchOptionsOpenedOnMobile = innerWidth <= 760;
   let searchOptions = null;
@@ -381,6 +389,10 @@ const GEOMETRY_EXPRESSION = `(() => {
       }),
       toolsAndActionsShareOneRow: Math.abs((composerTools.top + composerTools.bottom) / 2
         - (composerActions.top + composerActions.bottom) / 2) <= 2,
+      runningSendHidden: runningSendDisplay === 'none',
+      runningStop,
+      runningControlsInsideComposer,
+      runningControlsOverlap,
       searchOptionsOpenedOnMobile,
       searchOptions,
       searchDoesNotGrowComposer: composerWithSearch.height === composer.height,
@@ -541,6 +553,14 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
       `iPhone composer controls do not share row two: ${JSON.stringify(iphone.shell)}`);
     assert.equal(iphone.shell.toolsAndActionsShareOneRow, true,
       `iPhone composer tool and action groups differ vertically: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.runningSendHidden, true,
+      `the disabled send action remained visible beside Stop: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.runningControlsInsideComposer, true,
+      `running controls escaped the iPhone composer: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.runningControlsOverlap, false,
+      `running controls overlap on iPhone: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.runningStop.width, 48);
+    assert.ok(iphone.shell.runningStop.height >= 48);
     assert.equal(iphone.shell.searchOptionsOpenedOnMobile, true);
     assert.equal(iphone.shell.searchDoesNotGrowComposer, true,
       `opening Search grew the iPhone composer: ${JSON.stringify(iphone.shell)}`);

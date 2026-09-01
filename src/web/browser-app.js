@@ -2361,11 +2361,10 @@ export function createBrowserApp({
           || pendingChatDeletion || pendingAgentDeletion));
     }
     elements.add_image.hidden = !available;
-    elements.add_image.textContent = state.imagePreparing ? "Preparing images…" : "Images";
-    elements.add_image.setAttribute(
-      "aria-label",
-      state.imagePreparing ? "Preparing images…" : "Add images",
-    );
+    const imageActionLabel = state.imagePreparing ? "Preparing images…" : "Add images";
+    elements.add_image.dataset.imageState = state.imagePreparing ? "preparing" : "idle";
+    elements.add_image.setAttribute("aria-label", imageActionLabel);
+    elements.add_image.title = imageActionLabel;
     elements.add_image.disabled = !available || locked || releaseRefreshPending
       || state.imagePreparing || pendingChatSend || pendingChatDeletion
       || pendingAgentDeletion || agentDispatchFenced

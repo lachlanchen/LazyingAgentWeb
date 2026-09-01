@@ -1138,20 +1138,24 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
 });
 
-test("the composer groups image and grounded-search tools beside an icon-only accessible microphone", async () => {
+test("the composer uses accessible icons for images, Search, voice, and Stop", async () => {
   const map = await productionMap({ label: "compact-composer" });
   const html = map.get("/").body;
   const tools = /<div class="composer-tools">([\s\S]*?)<\/div>\s*<\/div>/u.exec(html);
   assert.ok(tools);
-  assert.match(tools[1], /id="add-image"/u);
+  assert.match(tools[1], /id="add-image"[^>]*aria-label="Add images"[^>]*>[\s\S]*?<svg class="image-icon"/u);
   assert.match(tools[1], /id="search-controls"/u);
-  assert.match(html, /id="search-toggle"[^>]*aria-expanded="false"[^>]*aria-controls="search-options"/u);
+  assert.match(html, /id="search-toggle"[^>]*aria-label="Search settings"[^>]*aria-expanded="false"[^>]*aria-controls="search-options"[^>]*><svg/u);
   assert.match(html, /id="search-options-close"[^>]*aria-label="Close Search settings"[^>]*>Done<\/button>/u);
   assert.match(
     html,
     /id="voice-input"[^>]*aria-label="Record voice"[^>]*data-voice-state="idle"[^>]*>[\s\S]*?<svg class="voice-icon-mic"/u,
   );
   assert.doesNotMatch(html, /id="voice-input"[^>]*>Mic<\/button>/u);
+  assert.match(html, /id="stop-run"[^>]*aria-label="Stop running task"[^>]*><svg/u);
+  assert.doesNotMatch(html, /id="(?:add-image|search-toggle|stop-run)"[^>]*>(?:Images|Search|Stop)<\/button>/u);
+  assert.match(BRIGHT_APP_CSS, /\.composer-icon-button \{[^}]*width: 48px;[^}]*min-width: 48px;[^}]*flex: 0 0 48px;/u);
+  assert.match(BRIGHT_APP_CSS, /\.composer-actions:has\(#stop-run:not\(\[hidden\]\)\) #send-message \{ display: none; \}/u);
 });
 
 test("the iPhone multi-image composer and retained Agent gallery cannot overlap their controls", () => {
@@ -3095,11 +3099,11 @@ test("a successor controller aborts slow image preparation and fences its stale 
   const input = harness.document.getElementById("image-input");
   input.files = [{ name: "slow-release-photo.heic" }];
   input.dispatch("change");
-  assert.equal(harness.document.getElementById("add-image").textContent, "Preparing images…");
+  assert.equal(harness.document.getElementById("add-image").dataset.imageState, "preparing");
 
   environment.transitionController(NEXT_RELEASE);
   assert.equal(preparationSignal.aborted, true);
-  assert.equal(harness.document.getElementById("add-image").textContent, "Images");
+  assert.equal(harness.document.getElementById("add-image").dataset.imageState, "idle");
   pending.resolve(Object.freeze({
     attachmentId: "image_stale_release_xxxxxxxxx",
     mediaType: "image/png",

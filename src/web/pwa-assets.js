@@ -548,9 +548,12 @@ ${modulePreloads}
       <form id="composer" class="composer" autocomplete="off">
         <input id="image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" multiple hidden>
         <div class="composer-tools">
-          <button id="add-image" class="image-button" type="button" aria-label="Add images" aria-live="polite" hidden>Images</button>
+          <button id="add-image" class="composer-icon-button image-button" type="button" aria-label="Add images" aria-live="polite" title="Add images" data-image-state="idle" hidden>
+            <svg class="image-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m4 17 5-4 3 2.5 3-3 5 4.5"/></svg>
+            <span class="composer-icon-busy" aria-hidden="true"></span>
+          </button>
           <div id="search-controls" class="search-controls" hidden>
-            <button id="search-toggle" type="button" aria-pressed="false" aria-expanded="false" aria-controls="search-options">Search</button>
+            <button id="search-toggle" class="composer-icon-button" type="button" aria-label="Search settings" title="Search settings" aria-pressed="false" aria-expanded="false" aria-controls="search-options"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg></button>
             <div id="search-options" class="search-options" role="group" aria-label="Search settings" hidden>
               <label>Sources
                 <select id="search-mode" autocomplete="off">
@@ -580,7 +583,7 @@ ${modulePreloads}
             <span class="voice-icon-busy" aria-hidden="true"></span>
           </button>
           <button id="resume-run" type="button" hidden>Resume</button>
-          <button id="stop-run" type="button" hidden>Stop</button>
+          <button id="stop-run" class="composer-icon-button stop-button" type="button" aria-label="Stop running task" title="Stop running task" hidden><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg></button>
           <button id="send-message" class="primary" type="submit" aria-label="Send Chat">Send Chat</button>
         </div>
       </form>
@@ -754,7 +757,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .artifact-file-action:hover { border-color: var(--accent); background: var(--accent-soft); }
 .artifact-file-download { background: var(--accent); color: white; }
 .artifact-file-privacy { margin: .55rem 0 0; color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
-.image-button { min-height: 48px; }
+.composer-icon-button { position: relative; display: inline-grid; width: 48px; min-width: 48px; min-height: 48px; flex: 0 0 48px; place-items: center; padding: .65rem; }
+.composer-icon-button svg { width: 1.4rem; height: 1.4rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.composer-icon-busy { display: none; width: 1.25rem; height: 1.25rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: voice-spin .8s linear infinite; }
+.image-button[data-image-state="preparing"] .image-icon { display: none; }
+.image-button[data-image-state="preparing"] .composer-icon-busy { display: block; }
+.stop-button { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); color: var(--danger); }
+.composer-actions:has(#stop-run:not([hidden])) #send-message { display: none; }
 .image-preview { min-width: 0; display: flex; max-width: 190px; align-items: center; gap: .45rem; padding: .35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .image-preview img { width: 44px; height: 44px; flex: 0 0 auto; border-radius: 8px; object-fit: cover; }
 .image-preview span { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -767,7 +776,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message-attachment-status { padding: .35rem .5rem; border-color: transparent; background: transparent; text-align: left; }
 .message-listen { min-height: 40px; margin-top: .6rem; padding: .4rem .7rem; color: var(--accent-strong); }
 .message-listen[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.composer-actions { display: flex; gap: .4rem; }
+.composer-actions { display: flex; min-width: 0; gap: .4rem; }
 .voice-button { position: relative; display: inline-grid; width: 48px; min-width: 48px; min-height: 48px; place-items: center; padding: .65rem; }
 .voice-icon-mic { width: 1.4rem; height: 1.4rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .voice-icon-stop, .voice-icon-busy { display: none; }
@@ -820,7 +829,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .artifact-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); gap: .4rem .7rem; font-size: .92rem; }
   .activity-details { max-height: min(24dvh, 14rem); }
 }
-@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } .voice-icon-busy { animation: none; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } .voice-icon-busy, .composer-icon-busy { animation: none; } }
 `;
 
 export function createBrowserRuntimeConfig({

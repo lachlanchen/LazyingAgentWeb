@@ -1074,7 +1074,7 @@ function elementMap(document) {
     "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
     "stop-run", "voice-input", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
     "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-    "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
+    "search-controls", "search-toggle", "search-options", "search-options-close", "search-mode", "search-limit", "capability-note",
   ];
   const progressiveIds = new Set(["voice-input"]);
   return Object.freeze(Object.fromEntries(ids.map((id) => {
@@ -1318,6 +1318,7 @@ export function createBrowserApp({
     agentPendingResume: null,
     agentPendingThreadCreate: null,
     agentSearchSelected: false,
+    agentSearchOptionsOpen: false,
     agentSearchRecoveryChoicePending: false,
     legacyUpdateRecoveryPending: false,
     legacyUpdateRecoveryDestinationChosen: false,
@@ -2237,9 +2238,11 @@ export function createBrowserApp({
         elements.search_limit.value = String(Math.min(8, maximum));
       }
     }
+    if (!available || !state.agentSearchSelected) state.agentSearchOptionsOpen = false;
     elements.search_controls.hidden = !available && !unavailableSelection;
     elements.search_toggle.setAttribute("aria-pressed", state.agentSearchSelected ? "true" : "false");
-    elements.search_options.hidden = !available || !state.agentSearchSelected;
+    elements.search_toggle.setAttribute("aria-expanded", state.agentSearchOptionsOpen ? "true" : "false");
+    elements.search_options.hidden = !available || !state.agentSearchSelected || !state.agentSearchOptionsOpen;
     elements.search_limit.max = String(maximum);
     const disabled = (!available && !unavailableSelection) || interactionLocked()
       || state.capabilityReleaseRefreshPending
@@ -2247,6 +2250,14 @@ export function createBrowserApp({
     elements.search_toggle.disabled = disabled;
     elements.search_mode.disabled = disabled || !state.agentSearchSelected;
     elements.search_limit.disabled = disabled || !state.agentSearchSelected;
+  }
+
+  function closeSearchOptions({ focusComposer = false } = {}) {
+    if (!state.agentSearchOptionsOpen) return false;
+    state.agentSearchOptionsOpen = false;
+    updateSearchControl();
+    if (focusComposer) focusSoon(() => elements.message_input.focus?.());
+    return true;
   }
 
   function updateCapabilityNote() {
@@ -7642,10 +7653,14 @@ export function createBrowserApp({
     elements.search_toggle.addEventListener("click", () => {
       if (elements.search_toggle.disabled || elements.search_controls.hidden) return;
       state.agentSearchSelected = !state.agentSearchSelected;
+      state.agentSearchOptionsOpen = state.agentSearchSelected;
       updateSearchControl();
       if (state.agentSearchSelected && agentSearchRecoveryChoiceReady()) {
         confirmAgentSearchRecoveryChoice();
       }
+    });
+    elements.search_options_close.addEventListener("click", () => {
+      closeSearchOptions({ focusComposer: true });
     });
     elements.agent_mode.addEventListener("click", () => setMode("agent"));
     elements.chat_mode.addEventListener("click", () => setMode("chat"));
@@ -7688,6 +7703,23 @@ export function createBrowserApp({
     window?.addEventListener?.("pageshow", () => { void revalidateSessionOnResume(); });
     document?.addEventListener?.("visibilitychange", () => {
       if (document?.visibilityState !== "hidden") void revalidateSessionOnResume();
+    });
+    document?.addEventListener?.("pointerdown", (event) => {
+      if (!state.agentSearchOptionsOpen) return;
+      const target = event?.target;
+      const inside = target === elements.search_controls
+        || target === elements.search_toggle
+        || target === elements.search_options
+        || target === elements.search_mode
+        || target === elements.search_limit
+        || target === elements.search_options_close
+        || (typeof elements.search_controls.contains === "function" && elements.search_controls.contains(target));
+      if (!inside) closeSearchOptions();
+    });
+    document?.addEventListener?.("keydown", (event) => {
+      if (event?.key !== "Escape" || !state.agentSearchOptionsOpen) return;
+      event.preventDefault?.();
+      closeSearchOptions({ focusComposer: true });
     });
     window?.addEventListener?.("beforeinstallprompt", (event) => {
       event.preventDefault?.();

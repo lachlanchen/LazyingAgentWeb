@@ -133,7 +133,7 @@ const IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
+  "search-controls", "search-toggle", "search-options", "search-options-close", "search-mode", "search-limit", "capability-note",
 ];
 
 class Document {
@@ -1880,7 +1880,19 @@ test("negotiated Agent Search binds one immutable selection to one start mutatio
   assert.equal(limit.max, "12");
   toggle.dispatch("click");
   assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
   assert.equal(options.hidden, false);
+  browser.document.getElementById("search-options-close").dispatch("click");
+  assert.equal(toggle.getAttribute("aria-pressed"), "true", "closing settings keeps Search enabled");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(options.hidden, true);
+  toggle.dispatch("click");
+  assert.equal(toggle.getAttribute("aria-pressed"), "false", "the next Search tap disables it");
+  toggle.dispatch("click");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  browser.document.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(toggle.getAttribute("aria-pressed"), "true", "Escape closes settings without losing Search");
+  assert.equal(options.hidden, true);
   mode.value = "both";
   limit.value = "7";
   browser.document.getElementById("message-input").value = "Compare current evidence";

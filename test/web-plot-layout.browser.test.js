@@ -386,6 +386,8 @@ const GEOMETRY_EXPRESSION = `(() => {
       searchDoesNotGrowComposer: composerWithSearch.height === composer.height,
       searchInsideViewport: searchOptions === null
         || (searchOptions.left >= -.5 && searchOptions.right <= innerWidth + .5),
+      searchDoesNotCoverComposer: searchOptions === null
+        || searchOptions.bottom <= composer.top + .5,
       searchAboveToggle: searchOptions === null
         || searchOptions.bottom <= searchToggleNode.getBoundingClientRect().top + .5,
       voiceAccessibleName: voiceInputNode.getAttribute('aria-label'),
@@ -543,6 +545,8 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     assert.equal(iphone.shell.searchDoesNotGrowComposer, true,
       `opening Search grew the iPhone composer: ${JSON.stringify(iphone.shell)}`);
     assert.equal(iphone.shell.searchInsideViewport, true);
+    assert.equal(iphone.shell.searchDoesNotCoverComposer, true,
+      `iPhone Search settings covered the composer: ${JSON.stringify(iphone.shell)}`);
     assert.equal(iphone.shell.searchAboveToggle, true);
     assert.equal(desktop.shell.actionBelowInput, false,
       `desktop composer unexpectedly stacked: ${JSON.stringify(desktop.shell)}`);

@@ -550,8 +550,8 @@ ${modulePreloads}
         <div class="composer-tools">
           <button id="add-image" class="image-button" type="button" aria-label="Add images" aria-live="polite" hidden>Images</button>
           <div id="search-controls" class="search-controls" hidden>
-            <button id="search-toggle" type="button" aria-pressed="false">Search</button>
-            <div id="search-options" class="search-options" hidden>
+            <button id="search-toggle" type="button" aria-pressed="false" aria-expanded="false" aria-controls="search-options">Search</button>
+            <div id="search-options" class="search-options" role="group" aria-label="Search settings" hidden>
               <label>Sources
                 <select id="search-mode" autocomplete="off">
                   <option value="web" selected>Web</option>
@@ -562,6 +562,7 @@ ${modulePreloads}
               <label>Limit
                 <input id="search-limit" type="number" inputmode="numeric" min="1" max="20" value="8" required>
               </label>
+              <button id="search-options-close" class="search-options-close" type="button" aria-label="Close Search settings">Done</button>
             </div>
           </div>
         </div>
@@ -740,6 +741,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .search-options label { display: grid; gap: .2rem; color: var(--muted); font-size: .72rem; }
 .search-options select, .search-options input { min-height: 32px; padding: .35rem; }
 .search-options input { width: 4.5rem; }
+.search-options-close { align-self: end; min-height: 36px; padding: .4rem .55rem; }
 .artifact-sources { display: grid; gap: .65rem; padding: 0; list-style: none; }
 .artifact-source-card { padding: .75rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .artifact-source-title { margin: 0; font-size: 1rem; }
@@ -794,13 +796,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .topbar { gap: .35rem; padding: max(.2rem, env(safe-area-inset-top)) .5rem .2rem; }
   .connection-state { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .mode-switch button { padding-inline: .55rem; }
-  .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .5rem; padding: .6rem .75rem max(.6rem, env(safe-area-inset-bottom)); }
+  .composer { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .5rem; padding: .6rem .75rem max(.6rem, env(safe-area-inset-bottom)); }
   .composer textarea { grid-column: 1 / -1; grid-row: 1; width: 100%; }
-  .composer-tools { position: relative; grid-column: 1; grid-row: 2; align-self: end; justify-self: start; }
+  .composer-tools { position: static; grid-column: 1; grid-row: 2; align-self: end; justify-self: start; }
   .composer-actions { grid-column: 2; grid-row: 2; }
   .composer > .image-preview { grid-column: 1 / -1; grid-row: 3; }
   .search-controls { position: static; align-items: stretch; }
-  .search-options { position: absolute; left: 0; bottom: calc(100% + .5rem); z-index: 2; width: min(19rem, calc(100vw - 1.5rem)); padding: .55rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+  .search-options { position: absolute; left: .75rem; bottom: calc(100% + .5rem); z-index: 2; width: min(19rem, calc(100vw - 1.5rem)); padding: .55rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
   .search-options label { flex: 1; }
   .search-options select, .search-options input { width: 100%; }
   .image-preview { max-width: 100%; }

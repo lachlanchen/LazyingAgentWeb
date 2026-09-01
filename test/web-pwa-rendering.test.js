@@ -177,7 +177,7 @@ const APP_IDS = [
   "agent-timeline", "agent-artifacts", "composer", "message-input", "send-message", "resume-run",
   "stop-run", "voice-input", "image-input", "add-image", "image-preview", "image-preview-thumbnail",
   "image-preview-label", "remove-image", "install-app", "toast", "sidebar", "sidebar-scrim", "open-sidebar",
-  "search-controls", "search-toggle", "search-options", "search-mode", "search-limit", "capability-note",
+  "search-controls", "search-toggle", "search-options", "search-options-close", "search-mode", "search-limit", "capability-note",
 ];
 
 function appDocument({ basePath = "/", releaseId = CURRENT_RELEASE } = {}) {
@@ -1131,9 +1131,10 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
   const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
   const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
   assert.match(mobileCss, /\.composer textarea \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 1;[^}]*width: 100%;/u);
-  assert.match(mobileCss, /\.composer-tools \{[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*justify-self: start;/u);
+  assert.match(mobileCss, /\.composer \{[^}]*position: relative;[^}]*display: grid;/u);
+  assert.match(mobileCss, /\.composer-tools \{[^}]*position: static;[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*justify-self: start;/u);
   assert.match(mobileCss, /\.composer-actions \{[^}]*grid-column: 2;[^}]*grid-row: 2;/u);
-  assert.match(mobileCss, /\.search-options \{[^}]*position: absolute;[^}]*bottom: calc\(100% \+ \.5rem\);/u);
+  assert.match(mobileCss, /\.search-options \{[^}]*position: absolute;[^}]*left: \.75rem;[^}]*bottom: calc\(100% \+ \.5rem\);/u);
   assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
 });
 
@@ -1144,6 +1145,8 @@ test("the composer groups image and grounded-search tools beside an icon-only ac
   assert.ok(tools);
   assert.match(tools[1], /id="add-image"/u);
   assert.match(tools[1], /id="search-controls"/u);
+  assert.match(html, /id="search-toggle"[^>]*aria-expanded="false"[^>]*aria-controls="search-options"/u);
+  assert.match(html, /id="search-options-close"[^>]*aria-label="Close Search settings"[^>]*>Done<\/button>/u);
   assert.match(
     html,
     /id="voice-input"[^>]*aria-label="Record voice"[^>]*data-voice-state="idle"[^>]*>[\s\S]*?<svg class="voice-icon-mic"/u,

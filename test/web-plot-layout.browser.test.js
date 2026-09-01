@@ -351,6 +351,8 @@ const GEOMETRY_EXPRESSION = `(() => {
       composerInsideWorkspace: contains(workspace, composer),
       inputInsideComposer: contains(composer, messageInput),
       actionInsideComposer: contains(composer, runAgent),
+      actionBelowInput: runAgent.top >= messageInput.bottom - .5,
+      inputUsesComposerWidth: messageInput.width >= composer.width - 26,
       chatScrollAboveComposer: chatScroll.bottom <= composer.top + .5,
       composerAtWorkspaceBottom: Math.abs(composer.bottom - workspace.bottom) <= .5,
     },
@@ -492,6 +494,12 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     const iphone = results.get("iphone");
     assert.deepEqual(desktop.viewport, { width: 1_280, height: 900 });
     assert.deepEqual(iphone.viewport, { width: 390, height: 844 });
+    assert.equal(iphone.shell.actionBelowInput, true,
+      `iPhone composer action did not move below its input: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(iphone.shell.inputUsesComposerWidth, true,
+      `iPhone composer input is not full width: ${JSON.stringify(iphone.shell)}`);
+    assert.equal(desktop.shell.actionBelowInput, false,
+      `desktop composer unexpectedly stacked: ${JSON.stringify(desktop.shell)}`);
     const shellFailures = [];
     for (const [label, result] of [["desktop", desktop], ["iphone", iphone]]) {
       assert.equal(result.pageOverflow, false);

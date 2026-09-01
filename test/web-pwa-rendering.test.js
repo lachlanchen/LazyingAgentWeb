@@ -1127,6 +1127,12 @@ test("the mobile workspace keeps the image action inside the dynamic viewport", 
     BRIGHT_APP_CSS,
     /@media \(max-width: 760px\) \{[\s\S]*\.composer \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) auto;[^}]*padding:[^;}]*max\(\.6rem, env\(safe-area-inset-bottom\)\);/u,
   );
+  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
+  const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
+  assert.match(mobileCss, /\.composer textarea \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 1;[^}]*width: 100%;/u);
+  assert.match(mobileCss, /\.composer > \.image-button \{[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*justify-self: start;/u);
+  assert.match(mobileCss, /\.composer-actions \{[^}]*grid-column: 2;[^}]*grid-row: 2;/u);
   assert.doesNotMatch(BRIGHT_APP_CSS, /grid-area:\s*footer;/u);
 });
 
@@ -1147,7 +1153,7 @@ test("the iPhone multi-image composer and retained Agent gallery cannot overlap 
   const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
   const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
   const mobileCss = BRIGHT_APP_CSS.slice(mobileStart, mobileEnd);
-  assert.match(mobileCss, /\.composer > \.image-button, \.composer > \.image-preview, \.composer > \.search-controls \{ grid-column: 1 \/ -1; \}/u);
+  assert.match(mobileCss, /\.composer > \.image-preview, \.composer > \.search-controls \{ grid-column: 1 \/ -1; \}/u);
   assert.match(mobileCss, /\.image-preview \{ max-width: 100%; \}/u);
   assert.match(mobileCss, /\.message-attachments \{ grid-template-columns: minmax\(0, 1fr\); \}/u);
 });

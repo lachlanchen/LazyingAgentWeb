@@ -781,9 +781,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .connection-state { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .mode-switch button { padding-inline: .55rem; }
   .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .5rem; padding: .6rem .75rem max(.6rem, env(safe-area-inset-bottom)); }
-  .composer > .image-button, .composer > .image-preview, .composer > .search-controls { grid-column: 1 / -1; }
-  .composer textarea { grid-column: 1; width: 100%; }
-  .composer-actions { grid-column: 2; }
+  .composer textarea { grid-column: 1 / -1; grid-row: 1; width: 100%; }
+  .composer > .image-button { grid-column: 1; grid-row: 2; justify-self: start; }
+  .composer-actions { grid-column: 2; grid-row: 2; }
+  .composer > .image-preview, .composer > .search-controls { grid-column: 1 / -1; }
   .search-controls { align-items: stretch; }
   .search-options { flex: 1; }
   .search-options label { flex: 1; }

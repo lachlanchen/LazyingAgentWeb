@@ -411,9 +411,10 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
   skip: CHROME === null ? "Chrome is unavailable" : false,
   timeout: 75_000,
 }, async () => {
-  const [safeRendering, protocol, webRelease] = await Promise.all([
+  const [safeRendering, protocol, fileArtifactPolicy, webRelease] = await Promise.all([
     readFile(new URL("../src/web/safe-rendering.js", import.meta.url)),
     readFile(new URL("../src/web/aginti-protocol.js", import.meta.url)),
+    readFile(new URL("../src/web/file-artifact-policy.js", import.meta.url)),
     readFile(new URL("../src/web/web-release.js", import.meta.url)),
   ]);
   const server = http.createServer((request, response) => {
@@ -427,6 +428,9 @@ test("real Chrome keeps adversarial Agent plot ticks readable and contained at d
     } else if (pathname === "/aginti-protocol.js") {
       response.setHeader("content-type", "text/javascript; charset=utf-8");
       response.end(protocol);
+    } else if (pathname === "/file-artifact-policy.js") {
+      response.setHeader("content-type", "text/javascript; charset=utf-8");
+      response.end(fileArtifactPolicy);
     } else if (pathname === "/web-release.js") {
       response.setHeader("content-type", "text/javascript; charset=utf-8");
       response.end(webRelease);

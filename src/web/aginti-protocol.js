@@ -7,6 +7,11 @@
  * never silently become part of the cloud UI contract.
  */
 
+import {
+  fileArtifactExtensionMatches,
+  fileArtifactMimeIsSupported,
+} from "./file-artifact-policy.js";
+
 export const AGINTI_SCHEMA_VERSION = "1";
 export const AGINTI_MAX_FILE_ARTIFACT_BYTES = 16 * 1024 * 1024;
 export const AGINTI_IMAGE_ATTACHMENT_MEDIA_TYPES = Object.freeze(["image/png", "image/jpeg"]);
@@ -86,7 +91,6 @@ const RUN_ID = /^run_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 const ARTIFACT_ID = /^art_[A-Za-z0-9_-]{32,86}$/u;
 const ATTACHMENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const DIGEST = /^[a-f0-9]{64}$/u;
-const FILE_ARTIFACT_MIMES = new Set(["application/pdf", "application/x-tex", "text/x-tex"]);
 const PRIVATE_PATH = /(?:^|[\s("'`])\/(?:workspace|home|users|root|etc|usr|var|opt|srv|run|tmp|proc|sys|dev|mnt|media|aginti-(?:home|cache|env))(?:\/|\b)|(?:^|[\s("'`])[A-Za-z]:\\/iu;
 const UNSAFE_PRESENTATION = /[<>]|(?:javascript\s*:|(?:https?|data|file)\s*:\/\/)/iu;
 const CONTROL = /\u0000|[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
@@ -727,14 +731,10 @@ export function validateFileSpec(value) {
       || filename.includes("/") || filename.includes("\\")) {
     invalid("file filename must be a safe single basename");
   }
-  if (typeof spec.mime !== "string" || !FILE_ARTIFACT_MIMES.has(spec.mime)) {
+  if (!fileArtifactMimeIsSupported(spec.mime)) {
     invalid("file mime is unsupported");
   }
-  const extension = filename.toLowerCase().endsWith(".pdf")
-    ? "pdf"
-    : (filename.toLowerCase().endsWith(".tex") ? "tex" : null);
-  if ((spec.mime === "application/pdf" && extension !== "pdf")
-      || (spec.mime !== "application/pdf" && extension !== "tex")) {
+  if (!fileArtifactExtensionMatches(spec.mime, filename)) {
     invalid("file filename extension does not match its mime");
   }
   const bytes = boundedInteger(spec.bytes, "file bytes", { minimum: 1, maximum: AGINTI_MAX_FILE_ARTIFACT_BYTES });

@@ -31,6 +31,7 @@ export const AGENT_WEB_MODULE_ROUTES = Object.freeze([
   "/assets/vision-image-sanitizer.js",
   "/assets/aginti-client.js",
   "/assets/aginti-protocol.js",
+  "/assets/file-artifact-policy.js",
   "/assets/presentation-state.js",
   "/assets/pwa-assets.js",
   "/assets/safe-rendering.js",

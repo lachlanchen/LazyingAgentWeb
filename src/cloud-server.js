@@ -42,6 +42,7 @@ import {
   validateAgentResponse,
   validateEventEnvelope
 } from './web/aginti-protocol.js';
+import { fileArtifactMustDownload } from './web/file-artifact-policy.js';
 
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
@@ -2207,7 +2208,10 @@ export function createCloudRequestHandler({
       expires: '0',
       'content-type': result.mime,
       'content-length': String(result.selectedBytes),
-      'content-disposition': artifactContentDisposition(result.filename, route.download),
+      'content-disposition': artifactContentDisposition(
+        result.filename,
+        route.download || fileArtifactMustDownload(result.mime)
+      ),
       etag: `"${result.sha256}"`,
       'x-artifact-content-length': String(result.selectedBytes),
       'content-security-policy': "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",

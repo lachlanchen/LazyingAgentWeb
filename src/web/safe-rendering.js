@@ -1,4 +1,5 @@
 import { validateArtifact } from "./aginti-protocol.js";
+import { fileArtifactMustDownload } from "./file-artifact-policy.js";
 import { optionalWebRelease } from "./web-release.js";
 
 const MAX_MARKDOWN = 32_000;
@@ -888,17 +889,23 @@ function renderFile(runtime, target, artifact) {
     throw new TypeError('file artifact URL is not same-origin');
   }
   const metadata = createNode(document, 'p', 'artifact-file-metadata');
-  appendText(document, metadata, `${artifact.spec.filename} · ${formatFileBytes(artifact.spec.bytes)}`);
+  appendText(
+    document,
+    metadata,
+    `${artifact.spec.filename} · ${formatFileBytes(artifact.spec.bytes)} · ${artifact.spec.mime}`
+  );
   target.appendChild(metadata);
   const controls = createNode(document, 'div', 'artifact-file-controls');
-  const open = createNode(document, 'a', 'artifact-file-action artifact-file-open');
-  open.setAttribute('href', openHref.href);
-  // Keep protected artifacts in the current PWA browsing context. On iOS a
-  // new top-level window can leave the installed app's authenticated cookie
-  // store and turn a valid local artifact into a misleading sign-in failure.
-  open.setAttribute('aria-label', `Open ${artifact.spec.filename}`);
-  appendText(document, open, 'Open');
-  controls.appendChild(open);
+  if (!fileArtifactMustDownload(artifact.spec.mime)) {
+    const open = createNode(document, 'a', 'artifact-file-action artifact-file-open');
+    open.setAttribute('href', openHref.href);
+    // Keep protected artifacts in the current PWA browsing context. On iOS a
+    // new top-level window can leave the installed app's authenticated cookie
+    // store and turn a valid local artifact into a misleading sign-in failure.
+    open.setAttribute('aria-label', `Open ${artifact.spec.filename}`);
+    appendText(document, open, 'Open');
+    controls.appendChild(open);
+  }
   const download = createNode(document, 'a', 'artifact-file-action artifact-file-download');
   download.setAttribute('href', downloadHref.href);
   download.setAttribute('download', artifact.spec.filename);

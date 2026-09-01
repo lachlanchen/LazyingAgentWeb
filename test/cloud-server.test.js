@@ -2068,8 +2068,11 @@ test('uses its own AgInTi adapter contract over application-neutral LazyEdge tra
 test('streams owner-bound local Agent files through authenticated no-cache GET, HEAD, and ranges', async (t) => {
   const artifactId = `art_${'a'.repeat(64)}`;
   const goneArtifactId = `art_${'b'.repeat(64)}`;
+  const activeArtifactId = `art_${'c'.repeat(64)}`;
   const content = Buffer.from('%PDF-1.7\nlocal artifact\n', 'utf8');
   const sha256 = createHash('sha256').update(content).digest('hex');
+  const activeContent = Buffer.from('<!doctype html><script>top.location="https://invalid.example"</script>', 'utf8');
+  const activeSha256 = createHash('sha256').update(activeContent).digest('hex');
   const calls = [];
   let ownerSession = null;
   const adapter = {
@@ -2080,18 +2083,22 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
       if (ownerSession === null) ownerSession = context.browserSession;
       if (context.browserSession !== ownerSession) return Object.freeze({ status: 404 });
       if (input.artifactId === goneArtifactId) return Object.freeze({ status: 410 });
+      const active = input.artifactId === activeArtifactId;
+      const artifactBytes = active ? activeContent : content;
       let start = input.range?.start ?? 0;
-      let end = input.range?.end === undefined ? content.byteLength - 1 : Math.min(input.range.end, content.byteLength - 1);
-      if (start >= content.byteLength) return Object.freeze({ status: 416 });
-      const selected = content.subarray(start, end + 1);
+      let end = input.range?.end === undefined
+        ? artifactBytes.byteLength - 1
+        : Math.min(input.range.end, artifactBytes.byteLength - 1);
+      if (start >= artifactBytes.byteLength) return Object.freeze({ status: 416 });
+      const selected = artifactBytes.subarray(start, end + 1);
       return Object.freeze({
         status: input.range === undefined ? 200 : 206,
-        filename: 'résumé.pdf',
-        mime: 'application/pdf',
-        totalBytes: content.byteLength,
+        filename: active ? 'page.html' : 'résumé.pdf',
+        mime: active ? 'text/html' : 'application/pdf',
+        totalBytes: artifactBytes.byteLength,
         selectedBytes: selected.byteLength,
-        sha256,
-        range: input.range === undefined ? null : Object.freeze({ start, end, total: content.byteLength }),
+        sha256: active ? activeSha256 : sha256,
+        range: input.range === undefined ? null : Object.freeze({ start, end, total: artifactBytes.byteLength }),
         body: input.metadataOnly === true ? null : new Response(selected).body
       });
     }
@@ -2127,6 +2134,19 @@ test('streams owner-bound local Agent files through authenticated no-cache GET, 
   assert.equal(download.status, 200);
   assert.deepEqual(Buffer.from(await download.arrayBuffer()), content);
   assert.match(download.headers.get('content-disposition'), /^attachment; filename="resume\.pdf"; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf$/u);
+
+  const active = await artifactRequest(baseUrl, activeArtifactId, {
+    cookie: first.cookie,
+    release: RELEASE_ID
+  });
+  assert.equal(active.status, 200);
+  assert.deepEqual(Buffer.from(await active.arrayBuffer()), activeContent);
+  assert.equal(active.headers.get('content-type'), 'text/html');
+  assert.equal(
+    active.headers.get('content-disposition'),
+    "attachment; filename=\"page.html\"; filename*=UTF-8''page.html",
+    'same-origin active content must never render inline'
+  );
 
   const mobileHead = await artifactRequest(baseUrl, artifactId, {
     method: 'HEAD',

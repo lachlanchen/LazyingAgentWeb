@@ -6854,8 +6854,22 @@ test("plot, table, Markdown, and source artifacts render declaratively while act
   assert.equal(fileLinks[1].textContent, "Download");
   assert.equal(fileLinks[1].getAttribute("download"), "paper.pdf");
   assert.match(fileTarget.textContent, /paper\.pdf · 2\.4 MB/u);
+  assert.match(fileTarget.textContent, /application\/pdf/u);
   assert.match(fileTarget.textContent, /Not stored or cached by the web edge/u);
   assert.equal(fileNodes.some((node) => ["img", "iframe", "script", "object", "embed"].includes(node.tagName)), false);
+
+  const activeFileTarget = document.createElement("section");
+  assert.equal(fileRenderer.renderArtifact(activeFileTarget, artifact("file", {
+    schemaVersion: "1",
+    filename: "page.html",
+    mime: "text/html",
+    bytes: 512,
+    sha256: "b".repeat(64),
+  })), true);
+  const activeFileLinks = activeFileTarget.walk().filter((node) => node.tagName === "a");
+  assert.equal(activeFileLinks.length, 1);
+  assert.equal(activeFileLinks[0].textContent, "Download");
+  assert.equal(activeFileLinks[0].getAttribute("download"), "page.html");
 
   const unpinnedFileTarget = document.createElement("section");
   assert.equal(createSafeRenderer({

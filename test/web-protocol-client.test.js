@@ -569,7 +569,7 @@ test("sources artifacts are exact, bounded, credential-free HTTPS presentation d
   assert.throws(() => validateArtifact(oversized), /48 KiB/u);
 });
 
-test("file artifacts expose only bounded PDF or TeX metadata and never local bytes or paths", () => {
+test("file artifacts expose only bounded allowlisted metadata and never local bytes or paths", () => {
   const file = {
     id: ARTIFACT_ID,
     title: "Compiled paper",
@@ -603,6 +603,22 @@ test("file artifacts expose only bounded PDF or TeX metadata and never local byt
     ...file,
     spec: { ...file.spec, filename: "source.tex", mime: "application/x-tex" },
   }).spec.mime, "application/x-tex");
+  for (const [filename, mime] of [
+    ["results.csv", "text/csv"],
+    ["notes.md", "text/markdown"],
+    ["chart.png", "image/png"],
+    ["page.html", "text/html"],
+    ["workbook.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  ]) {
+    assert.equal(validateArtifact({
+      ...file,
+      spec: { ...file.spec, filename, mime },
+    }).spec.mime, mime);
+  }
+  assert.throws(() => validateArtifact({
+    ...file,
+    spec: { ...file.spec, filename: "page.svg", mime: "text/html" },
+  }), /extension/u);
 });
 
 test("public responses and artifacts reject private state, active content, URLs, and oversized data", () => {

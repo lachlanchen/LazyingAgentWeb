@@ -1708,6 +1708,12 @@ test("Agent streaming follows only a reader already near bottom and the control 
   const sending = browser.app.submitMessage({ preventDefault() {} });
   await firstApplied.promise;
   assert.equal(scroll.scrollTop, 1_000, "a reader at the newest message follows the first delta");
+  const composer = browser.document.getElementById("message-input");
+  const send = browser.document.getElementById("send-message");
+  assert.equal(composer.disabled, false, "an accepted Agent run leaves its next-draft field writable");
+  assert.equal(send.disabled, true, "an active Agent run cannot dispatch a parallel follow-up");
+  composer.value = "Draft the next Agent follow-up while this run continues";
+  composer.dispatch("input");
 
   scroll.scrollHeight = 1_500;
   scroll.scrollTop = 180;
@@ -1715,6 +1721,10 @@ test("Agent streaming follows only a reader already near bottom and the control 
   assert.equal(browser.document.getElementById("go-to-bottom").hidden, false);
   continueStream.resolve();
   await sending;
+  assert.equal(composer.value, "Draft the next Agent follow-up while this run continues",
+    "the next Agent draft survives settlement of the active run");
+  assert.equal(composer.disabled, false);
+  assert.equal(send.disabled, false);
   assert.equal(scroll.scrollTop, 180, "later deltas do not yank a reader who scrolled up");
   assert.equal(browser.document.getElementById("go-to-bottom").hidden, false);
 

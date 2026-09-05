@@ -2212,14 +2212,26 @@ export function createBrowserApp({
     return true;
   }
 
-  function interactionLocked() {
-    return state.busy || state.logoutPending || state.chatFinalization !== null
+  function interactionLockedWithoutBusy() {
+    return state.logoutPending || state.chatFinalization !== null
       || voiceOperationActive()
       || (claimedUpdateHandoff !== null && !state.updateHandoffConsumed)
       || state.chatHistoryRestoration !== null
       || state.authRecoveryGeneration !== null
       || state.agentHistoryRestoring || state.agentReplayValidating || state.agentCancelPending
       || state.agentPendingResume !== null;
+  }
+
+  function interactionLocked() {
+    return state.busy || interactionLockedWithoutBusy();
+  }
+
+  function activeAgentDraftingAllowed() {
+    return state.mode === "agent" && state.busy
+      && typeof state.runId === "string" && state.runId.length > 0
+      && state.presentation !== null
+      && typeof state.agentRunStatus === "string" && !TERMINAL.has(state.agentRunStatus)
+      && !interactionLockedWithoutBusy();
   }
 
   function updateSearchControl() {
@@ -2328,6 +2340,7 @@ export function createBrowserApp({
     const pendingAgentDeletion = state.mode === "agent" && state.agentPendingDeletion !== null;
     const locked = interactionLocked();
     const pendingAgentResume = state.mode === "agent" && state.agentPendingResume !== null;
+    const acceptedAgentDraft = activeAgentDraftingAllowed();
     const agentDispatchFenced = state.mode === "agent" && state.agentReplayFailed;
     const agentCapabilityUnavailable = state.mode === "agent" && state.capabilities.enabled !== true;
     const releaseRefreshPending = state.capabilityReleaseRefreshPending;
@@ -2373,7 +2386,7 @@ export function createBrowserApp({
       || pendingChatSend || pendingChatDeletion || pendingAgentDeletion
       || (state.selectedImages.length === 0 && !state.imagePreparing);
     elements.message_input.disabled = !state.session.authenticated || releaseRefreshPending
-      || (locked && !pendingAgentResume)
+      || (locked && !pendingAgentResume && !acceptedAgentDraft)
       || state.imagePreparing || pendingChatSend
       || pendingChatDeletion || pendingAgentDeletion
       || preservingAuthenticationDraft || state.retainedUpdateRecoveryPending
@@ -3316,6 +3329,7 @@ export function createBrowserApp({
     elements.run_state.textContent = replayTerminal ? "Restoring" : cancelPending ? "Cancelling" : statusLabel(initialStatus);
     elements.stop_run.hidden = replayTerminal || cancelPending || !state.capabilities.actions.cancel;
     elements.resume_run.hidden = true;
+    updateImageControl();
     if (replayTerminal) connection("Restoring verified Agent history", false);
     let recoveries = 0;
     let terminalDrainAttempted = false;
@@ -5821,7 +5835,7 @@ export function createBrowserApp({
                 const accepted = state.runId !== submissionAgentRunId;
                 connection("Connected");
                 if (accepted) {
-                  elements.message_input.value = "";
+                  if (elements.message_input.value === draft) elements.message_input.value = "";
                   clearSelectedImage();
                   showToast("The interrupted Agent request was recovered without creating a duplicate.");
                 } else {

@@ -1,6 +1,6 @@
 {
   "name": "@lazyingart/agent-web",
-  "version": "0.1.75",
+  "version": "0.1.76",
   "description": "Cloud presentation and delivery-index foundation for the LazyingArt agent web application",
   "repository": {
     "type": "git",

@@ -1126,7 +1126,10 @@ export function createBrowserApp({
   voiceMaximumDurationMs = BROWSER_SPEECH_LIMITS.durationSeconds * 1_000,
   now = Date.now,
   maxStreamBackoffSteps = 5,
-  maxAutomaticAgentReconnects = 3,
+  // Native event streams rotate even while a healthy long Agent run is still
+  // computing. Keep a generous finite read-only reconnect window so cold-model
+  // and document jobs do not surface a misleading manual "Interrupted" step.
+  maxAutomaticAgentReconnects = 20,
   wait = (milliseconds, signal) => new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, milliseconds);
     signal?.addEventListener("abort", () => {

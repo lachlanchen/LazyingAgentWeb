@@ -360,7 +360,7 @@ function harness({
   cursorStore,
   wait = async () => {},
   maxStreamBackoffSteps = 5,
-  maxAutomaticAgentReconnects = 3,
+  maxAutomaticAgentReconnects = 20,
   requestAnimationFrame = (callback) => callback(),
 } = {}) {
   const document = new Document({ ...(decodeImage === undefined ? {} : { decodeImage }) });
@@ -8858,6 +8858,36 @@ test("bounded native stream rotations keep reconnecting until AgInTi is terminal
   assert.equal(starts, 1);
   assert.deepEqual(waits, [250, 500, 1_000, 1_000, 1_000, 1_000, 1_000]);
   assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+});
+
+test("default Agent reconnect window covers long healthy native stream rotation", async () => {
+  const terminal = await verifiedEvent({ seq: 1, type: "run.completed", payload: {}, previousHash: ZERO_HASH });
+  let streams = 0;
+  let statuses = 0;
+  const waits = [];
+  const agent = {
+    ...baseAgent(capabilities({ enabled: true, actions: { cancel: true, resume: true, retry: false } })),
+    async createThread() { return { thread: { id: THREAD_ID, title: "Cold document run" } }; },
+    async startRun() { return { run: run() }; },
+    async runStatus() { statuses += 1; return { run: run() }; },
+    async *streamRunEvents() {
+      streams += 1;
+      if (streams === 9) yield { event: terminal, cursor: { seq: terminal.seq, hash: terminal.hash } };
+    },
+  };
+  const browser = harness({
+    agent,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  await browser.app.initialize();
+  browser.document.getElementById("message-input").value = "Run a cold document task";
+  await browser.app.submitMessage({ preventDefault() {} });
+
+  assert.equal(streams, 9);
+  assert.equal(statuses, 8);
+  assert.equal(waits.length, 8);
+  assert.equal(browser.document.getElementById("workspace").dataset.status, "completed");
+  assert.equal(browser.document.getElementById("resume-run").hidden, true);
 });
 
 test("retryable outage recovers through status probe and cursor replay without start/resume duplication", async () => {

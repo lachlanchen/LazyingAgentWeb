@@ -164,21 +164,40 @@ const iconCache = new Map();
 export function createPwaIcon(size) {
   if (![192, 512].includes(size)) throw new TypeError("PWA icon size must be 192 or 512");
   if (iconCache.has(size)) return iconCache.get(size).slice();
-  const rowBytes = Math.ceil(size / 8);
+  // An indexed, dependency-free aurora emblem. Keep the central mark inside
+  // the maskable safe zone; the full-bleed background survives any OS crop.
+  const rowBytes = size;
   const scanlines = new Uint8Array((rowBytes + 1) * size);
-  const scale = size / 512;
-  const bars = [[166, 235, 202, 336], [223, 165, 259, 336], [280, 201, 316, 336]];
-  for (let y = 0; y < size; y += 1) {
-    const py = y / scale;
-    const row = y * (rowBytes + 1);
-    for (let x = 0; x < size; x += 1) {
-      const px = x / scale;
-      const foreground = bars.some(([left, top, right, bottom]) => px >= left && px <= right && py >= top && py <= bottom);
-      if (foreground) scanlines[row + 1 + (x >>> 3)] |= 1 << (7 - (x & 7));
+  const palette = new Uint8Array(256 * 3);
+  const mix = (a, b, t) => Math.round(a + (b - a) * t);
+  for (let index = 0; index < 128; index += 1) {
+    const t = index / 127;
+    for (let channel = 0; channel < 3; channel += 1) {
+      palette[index * 3 + channel] = mix([13, 20, 42][channel], [51, 79, 97][channel], t);
+      palette[(index + 128) * 3 + channel] = t < .5
+        ? mix([110, 243, 208][channel], [230, 255, 240][channel], t * 2)
+        : mix([230, 255, 240][channel], [188, 160, 255][channel], (t - .5) * 2);
     }
   }
-  const ihdr = concatenate([uint32(size), uint32(size), Uint8Array.of(1, 3, 0, 0, 0)]);
-  const palette = Uint8Array.of(20, 125, 117, 225, 255, 249);
+  for (let y = 0; y < size; y += 1) {
+    const row = y * (rowBytes + 1);
+    for (let x = 0; x < size; x += 1) {
+      const px = (x + .5) / size - .5;
+      const py = (y + .5) / size - .5;
+      const u = px * .951 + py * .309;
+      const v = -px * .309 + py * .951;
+      const spark = Math.pow(Math.abs(u) / .29, .66) + Math.pow(Math.abs(v) / .34, .66) <= 1;
+      const satellite = Math.pow(Math.abs(px - .235) / .047, .72)
+        + Math.pow(Math.abs(py + .225) / .047, .72) <= 1;
+      const glow = Math.exp(-((px + .17) ** 2 + (py + .22) ** 2) * 8) * .63
+        + Math.exp(-((px - .25) ** 2 + (py - .20) ** 2) * 12) * .32;
+      const color = spark || satellite
+        ? 128 + Math.round(Math.max(0, Math.min(1, .5 + u * 1.35 + v * .55)) * 127)
+        : Math.round(Math.min(1, glow) * 127);
+      scanlines[row + 1 + x] = color;
+    }
+  }
+  const ihdr = concatenate([uint32(size), uint32(size), Uint8Array.of(8, 3, 0, 0, 0)]);
   const png = concatenate([
     Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
     pngChunk("IHDR", ihdr),
@@ -464,19 +483,27 @@ export function createAppShellHtml({
   <meta name="lazying-agent-base-path" content="${scope}">
   <meta name="lazying-agent-service-worker" content="${base}/sw.js">
   <link rel="manifest" href="${base}/manifest.webmanifest${build}">
+  <link rel="icon" type="image/png" href="${base}${versionedAgentWebAsset("/assets/icon-192.png", version)}">
+  <link rel="apple-touch-icon" href="${base}${versionedAgentWebAsset("/assets/icon-192.png", version)}">
   <link rel="stylesheet" href="${base}${versionedAgentWebAsset("/assets/app.css", version)}">
 ${modulePreloads}
 </head>
 <body>
   <div id="update-banner" class="notice update-notice" role="status" hidden>A safe app update is ready. <button id="apply-update" type="button">Update</button> <button id="defer-update" type="button">Later</button></div>
   <main id="login-view" class="login-view" aria-labelledby="login-title">
+    <div class="login-atmosphere" aria-hidden="true"><span></span><span></span><span></span></div>
+    <section class="login-story" aria-labelledby="login-story-title">
+      <div class="login-brand"><img src="${base}${versionedAgentWebAsset("/assets/icon-192.png", version)}" width="52" height="52" alt=""><span>LazyingArt<span class="login-brand-caption">YOUR SPACE TO THINK</span></span></div>
+      <div class="login-story-copy"><p class="login-kicker">A little spark. A world of possibility.</p><h2 id="login-story-title">Let curiosity<br>take <em>flight.</em></h2><p>Think out loud. Explore an idea.<br>Make something wonderful.</p></div>
+      <div class="login-story-footer"><span class="login-spark-dot" aria-hidden="true"></span> A quieter space for your next big idea.</div>
+    </section>
     <form id="login-form" class="login-card" method="post" action="${safeLoginPath}" autocomplete="on" aria-busy="true">
-      <p class="eyebrow">Private cloud workspace</p>
-      <h1 id="login-title">${safeTitle}</h1>
-      <p class="muted">Sign in to resume your server-held session. The app does not save your password.</p>
-      <label>Username<input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="128"></label>
-      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+      <img class="login-emblem" src="${base}${versionedAgentWebAsset("/assets/icon-192.png", version)}" width="64" height="64" alt="LazyingArt">
+      <div class="login-heading"><p class="eyebrow">${safeTitle}</p><h1 id="login-title">Welcome back.</h1><p class="muted">Your ideas are right where you left them.</p></div>
+      <label>Username<input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="128" placeholder="Your username"></label>
+      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="Your password"></label>
       <label class="remember"><input id="remember-session" name="remember" type="checkbox" checked> Keep this device signed in</label>
+      <p class="login-session-note">Remembered for 180 days. Sign out whenever you like.</p>
       <p id="login-error" class="form-error" role="alert" hidden></p>
       <button id="login-submit" type="submit" class="primary" disabled>Preparing secure sign-in…</button>
       <p class="privacy-note">Password saving is handled only by your browser or password manager.</p>
@@ -485,7 +512,7 @@ ${modulePreloads}
 
   <div id="app-view" class="app-view" hidden>
     <aside id="sidebar" class="sidebar" aria-label="Conversations">
-      <header class="brand"><span class="brand-mark" aria-hidden="true">LA</span><strong>${safeTitle}</strong></header>
+      <header class="brand"><img class="brand-mark" src="${base}${versionedAgentWebAsset("/assets/icon-192.png", version)}" width="38" height="38" alt=""><strong>${safeTitle}</strong></header>
       <button id="new-thread" class="primary" type="button">New conversation</button>
       <nav id="thread-list" class="thread-list" aria-label="Saved conversations"></nav>
       <footer>
@@ -641,11 +668,50 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 button:disabled { cursor: not-allowed; opacity: .55; }
 .primary { border-color: var(--accent); background: var(--accent); color: white; font-weight: 650; }
 .primary:hover { background: var(--accent-strong); }
-.login-view { min-height: 100dvh; display: grid; place-items: center; padding: 1.25rem; }
-.login-card { width: min(100%, 430px); display: grid; gap: 1rem; padding: clamp(1.5rem, 4vw, 2.5rem); background: var(--surface); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); }
+.login-view { position: relative; isolation: isolate; min-height: 100vh; min-height: 100dvh; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); align-items: center; gap: clamp(2rem, 6vw, 7rem); padding: clamp(2rem, 6vw, 6rem) max(2rem, calc((100vw - 1180px) / 2)); overflow: hidden; color: #f6f8ff; background: #10182c; }
+.login-atmosphere { position: absolute; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; background: radial-gradient(ellipse at 5% 0%, #284445 0%, transparent 55%), radial-gradient(ellipse at 88% 100%, #342b57 0%, transparent 60%); }
+.login-atmosphere span { position: absolute; width: 38rem; height: 38rem; border: 1px solid rgb(165 223 204 / 11%); border-radius: 50%; top: 10%; left: -15rem; transform: rotate(-20deg) scaleX(1.5); }
+.login-atmosphere span:nth-child(2) { width: 48rem; height: 48rem; top: 0; left: -20rem; }
+.login-atmosphere span:nth-child(3) { width: 58rem; height: 58rem; top: -10%; left: -25rem; }
+.login-story { min-width: 0; align-self: stretch; display: flex; flex-direction: column; justify-content: space-between; gap: 4rem; padding-block: .5rem; }
+.login-brand { display: flex; align-items: center; gap: .9rem; font-size: 1.2rem; font-weight: 650; letter-spacing: -.025em; }
+.login-brand img { border-radius: 16px; box-shadow: 0 8px 30px rgb(0 0 0 / 18%); }
+.login-brand-caption { display: block; margin-top: .3rem; font-size: .58rem; font-weight: 500; letter-spacing: .19em; color: #b1c7c7; }
+.login-kicker { color: #9ee2cd; font-size: .81rem; letter-spacing: .02em; }
+.login-story h2 { font-weight: 500; font-size: clamp(3rem, 5.7vw, 5.2rem); line-height: 1.06; letter-spacing: -.065em; margin: 1.2rem 0 1.5rem; }
+.login-story h2 em { font-style: normal; color: #b8eed9; background: linear-gradient(100deg, #a9f4d2, #e4e2ff 90%); background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.login-story-copy > p:last-child { font-size: 1.05rem; line-height: 1.8; color: #b6c5d2; }
+.login-story-footer { display: flex; align-items: center; gap: .65rem; color: #b6c5d2; font-size: .76rem; }
+.login-spark-dot { width: 7px; height: 7px; border-radius: 50%; background: #a5eccb; box-shadow: 0 0 15px #a5eccb; animation: login-glow 5s ease-in-out 2; }
+@keyframes login-glow { 50% { opacity: .55; box-shadow: 0 0 24px #a5eccb; } }
+.login-card { --surface: #fcfdfb; --line: #dce5df; --muted: #60706b; --accent: #147d75; --accent-strong: #0d625c; --danger: #a63838; color-scheme: light; color: #1b302b; width: 100%; max-width: 440px; justify-self: end; display: grid; gap: 1.15rem; padding: clamp(1.7rem, 3.2vw, 2.8rem); background: var(--surface); border: 1px solid rgb(255 255 255 / 65%); border-radius: 28px; box-shadow: 0 32px 100px rgb(0 0 0 / 22%), inset 0 1px 0 #fff; }
+.login-emblem { border-radius: 19px; box-shadow: 0 8px 22px rgb(28 46 51 / 15%); }
+.login-heading { margin: .35rem 0 .25rem; }
+.login-heading .eyebrow { color: #437c68; font-size: .66rem; letter-spacing: .12em; margin-bottom: .7rem; }
+.login-heading h1 { font-size: clamp(1.8rem, 3vw, 2.2rem); font-weight: 600; line-height: 1.18; }
+.login-heading .muted { margin: .7rem 0 0; font-size: .87rem; line-height: 1.6; }
 .login-card h1, .welcome h1 { margin: 0; letter-spacing: -.035em; }
-.login-card label:not(.remember) { display: grid; gap: .4rem; font-weight: 600; }
-.login-card input { min-height: 46px; padding: .7rem .8rem; }
+.login-card label:not(.remember) { display: grid; gap: .5rem; font-size: .8rem; font-weight: 600; }
+.login-card input:not([type="checkbox"]) { width: 100%; min-width: 0; min-height: 50px; padding: .8rem .95rem; border-radius: 12px; background: #f4f7f3; font-size: 1rem; transition: border-color .2s, box-shadow .2s; }
+.login-card input::placeholder { color: #7b8c85; }
+.login-card input:focus-visible { border-color: #348e78; outline: 2px solid rgb(52 142 120 / 22%); outline-offset: 2px; }
+.login-card .remember { min-height: 28px; font-size: .78rem; color: #455d52; }
+.login-card .remember input { accent-color: #147d75; flex-shrink: 0; }
+.login-session-note { color: #60706b; font-size: .71rem; line-height: 1.5; margin: -.9rem 0 0 1.65rem; }
+.login-card .primary { min-height: 52px; border: 0; border-radius: 12px; background: linear-gradient(115deg, #147d75, #216744); color: #fff; box-shadow: 0 5px 16px rgb(20 125 117 / 16%); transition: box-shadow .2s, transform .2s; }
+.login-card .primary:hover:not(:disabled) { box-shadow: 0 7px 22px rgb(20 125 117 / 25%); transform: translateY(-1px); }
+.login-card .privacy-note { margin: 0; text-align: center; font-size: .68rem; line-height: 1.6; color: #697a72; }
+@media (max-width: 760px) {
+  .login-view { grid-template-columns: minmax(0, 1fr); gap: 1.65rem; align-content: center; padding: max(1.65rem, env(safe-area-inset-top)) 1.1rem max(1.65rem, env(safe-area-inset-bottom)); }
+  .login-story { align-self: auto; padding: 0; gap: 0; }
+  .login-brand { justify-content: center; font-size: 1.15rem; }
+  .login-brand img { width: 44px; height: 44px; border-radius: 14px; }
+  .login-story-copy, .login-story-footer { display: none; }
+  .login-card { justify-self: center; padding: 1.8rem; gap: 1rem; border-radius: 24px; }
+  .login-emblem { width: 52px; height: 52px; border-radius: 16px; }
+  .login-heading .eyebrow { font-size: .61rem; }
+}
+@media (max-width: 360px) { .login-card { padding: 1.3rem; } }
 .remember { display: flex; align-items: center; gap: .55rem; color: var(--muted); }
 .remember input { width: 1.05rem; height: 1.05rem; }
 .muted, .privacy-note, .capability-note { color: var(--muted); }
@@ -829,7 +895,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .artifact-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); gap: .4rem .7rem; font-size: .92rem; }
   .activity-details { max-height: min(24dvh, 14rem); }
 }
-@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } .voice-icon-busy, .composer-icon-busy { animation: none; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } .voice-icon-busy, .composer-icon-busy, .login-spark-dot { animation: none; } }
 `;
 
 export function createBrowserRuntimeConfig({

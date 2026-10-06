@@ -235,7 +235,7 @@ test('sends the latest private canonical image only to the fixed vision alias as
       }
     ]
   });
-  assert.doesNotMatch(JSON.stringify(value), new RegExp(bytes.toString('base64'), 'u'));
+  assert.equal(JSON.stringify(value).includes(bytes.toString('base64')), false);
 
   await assert.rejects(
     value.generate(generationInput({ modelAlias: 'localllm-fast', visionAttachment })),

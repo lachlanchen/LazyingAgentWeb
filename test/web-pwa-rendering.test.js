@@ -17,6 +17,7 @@ import {
   applyTheme,
   createBrowserRuntimeConfig,
   createAppShellHtml,
+  createPwaIcon,
   createPwaManifest,
   normalizeAgentWebBasePath,
   offerPasswordManagerSave,
@@ -1030,6 +1031,27 @@ test("the compact topbar is one row with an ellipsized title and collapsed capab
   assert.match(noteRule[1], /white-space:\s*normal;/u);
 });
 
+test("the aurora login shares versioned install icons, remembered-session copy, and reduced-motion support", () => {
+  const html = createAppShellHtml({ version: CURRENT_RELEASE });
+  const iconPath = versionedAgentWebAsset("/assets/icon-192.png", CURRENT_RELEASE);
+  assert.ok(html.includes(`<link rel="apple-touch-icon" href="${iconPath}">`));
+  assert.ok(html.includes(`<link rel="icon" type="image/png" href="${iconPath}">`));
+  assert.match(html, /name="remember" type="checkbox" checked/u);
+  assert.match(html, /Remembered for 180 days/u);
+  assert.match(BRIGHT_APP_CSS, /prefers-reduced-motion: reduce[\s\S]*\.login-spark-dot \{ animation: none; \}/u);
+  for (const size of [192, 512]) {
+    const png = Buffer.from(createPwaIcon(size));
+    assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+    assert.equal(png.readUInt32BE(16), size);
+    assert.equal(png.readUInt32BE(20), size);
+    assert.equal(png[24], 8, 'indexed color supports the full aurora palette');
+    assert.equal(png[25], 3);
+    assert.ok(png.length < 300_000, 'installation icons remain bounded');
+    png.fill(0);
+    assert.equal(createPwaIcon(size)[0], 137, 'callers cannot corrupt the cached icon');
+  }
+});
+
 test("toasts never block controls and move below the one-row mobile header", () => {
   const toastRule = /(?:^|\n)\.toast \{([^}]*)\}/u.exec(BRIGHT_APP_CSS);
   assert.ok(toastRule);
@@ -1040,7 +1062,7 @@ test("toasts never block controls and move below the one-row mobile header", () 
   assert.match(toastRule[1], /pointer-events:\s*none;/u);
   assert.match(toastRule[1], /white-space:\s*normal;/u);
 
-  const mobileStart = BRIGHT_APP_CSS.indexOf("@media (max-width: 760px)");
+  const mobileStart = BRIGHT_APP_CSS.lastIndexOf("@media (max-width: 760px)");
   const mobileEnd = BRIGHT_APP_CSS.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
   assert.ok(mobileStart >= 0);
   assert.ok(mobileEnd > mobileStart);

@@ -303,11 +303,11 @@ function cookiePair(value) {
   return value.split(';', 1)[0];
 }
 
-async function login(baseUrl, { password = PASSWORD, clientAddress, fetchMetadataPresent = true, sessionMode } = {}) {
+async function login(baseUrl, { password = PASSWORD, clientAddress, fetchMetadataPresent = true, sessionMode, remember = sessionMode === undefined } = {}) {
   const response = await post(baseUrl, '/api/login', {
     username: USERNAME,
     password,
-    remember: sessionMode === undefined,
+    remember,
     ...(sessionMode === undefined ? {} : { sessionMode })
   }, {
     clientAddress,
@@ -949,6 +949,43 @@ test('uses secure browser cookies, session-bound CSRF, generic failures, and own
     csrf: auth.csrf
   });
   assert.equal(foreign.status, 404);
+});
+
+test('remembered login lasts 180 days across a disk-backed restart, while logout and short sessions retain their limits', async (t) => {
+  const issuedAt = Date.parse('2026-10-06T00:00:00.000Z');
+  const day = 86_400_000;
+  let now = issuedAt;
+  const clock = () => new Date(now);
+  const state = testState(t, { clock });
+  let started = await state.start();
+  const remembered = await login(started.baseUrl);
+  const revocable = await login(started.baseUrl);
+  const short = await login(started.baseUrl, { remember: false });
+  for (const auth of [remembered, revocable, short]) assert.equal(auth.response.status, 200);
+  assert.ok(remembered.setCookies.every((cookie) => /; Max-Age=15552000(?:;|$)/u.test(cookie)));
+  assert.ok(short.setCookies.every((cookie) => /; Max-Age=43200(?:;|$)/u.test(cookie)));
+  const restore = async (auth) => {
+    const response = await post(started.baseUrl, '/api/session', {}, { cookie: auth.cookie, csrf: auth.csrf });
+    assert.equal(response.status, 200);
+    return (await response.json()).authenticated;
+  };
+  assert.equal(await restore(short), true);
+  await state.stop(started.server);
+  const reopened = state.registerStore(new CloudIndexStore({
+    databasePath: join(state.root, 'control', 'index.sqlite'), clock
+  }));
+  started = await state.start({ sessionStore: reopened, controlStore: reopened });
+  now = issuedAt + 31 * day;
+  assert.equal(await restore(remembered), true, 'remembered login survives the previous 30-day limit and server reconstruction');
+  assert.equal(await restore(short), false, 'unchecking remember does not grant a long-lived login');
+  const logout = await post(started.baseUrl, '/api/logout', {}, { cookie: revocable.cookie, csrf: revocable.csrf });
+  assert.equal(logout.status, 200);
+  assert.equal(await restore(revocable), false, 'explicit sign-out still revokes the session');
+  assert.equal(await restore(remembered), true, 'sign-out does not revoke another device');
+  now = issuedAt + 180 * day - 1;
+  assert.equal(await restore(remembered), true);
+  now += 1;
+  assert.equal(await restore(remembered), false, 'the remembered session has a bounded expiry');
 });
 
 test('iOS/PWA requests with missing or partial Fetch Metadata stay exact-origin, session-bound, release-compatible, and observable', async (t) => {
@@ -1905,7 +1942,7 @@ test('does not let an expired login reach stable Agent authority', async (t) => 
   const state = testState(t, { adapter, clock });
   const { baseUrl } = await state.start();
   const auth = await login(baseUrl);
-  now += 31 * 24 * 60 * 60 * 1_000;
+  now += 181 * 24 * 60 * 60 * 1_000;
   const expired = await post(baseUrl, '/api/transport/agent/v1/capabilities', {}, {
     cookie: auth.cookie,
     csrf: auth.csrf
@@ -2880,7 +2917,7 @@ test('validates, stores, dispatches, and previews one private image through the 
   const startedBody = await started.json();
   assertNoOwnerIdentity(startedBody);
   assert.equal(startedBody.generation.modelAlias, 'localllm-vision');
-  assert.doesNotMatch(JSON.stringify(startedBody), new RegExp(imageBase64, 'u'));
+  assert.equal(JSON.stringify(startedBody).includes(imageBase64), false);
   await waitFor(() => state.directChatStore.getGeneration({
     accountId: PRINCIPAL_ID,
     threadId: 'chat-vision',
@@ -2899,7 +2936,7 @@ test('validates, stores, dispatches, and previews one private image through the 
   assert.equal(messagesBody.messages[0].attachment.byteLength, image.byteLength);
   assert.equal(Object.hasOwn(messagesBody.messages[0].attachment, 'data'), false);
   assert.equal(Object.hasOwn(messagesBody.messages[0].attachment, 'content'), false);
-  assert.doesNotMatch(JSON.stringify(messagesBody), new RegExp(imageBase64, 'u'));
+  assert.equal(JSON.stringify(messagesBody).includes(imageBase64), false);
 
   const preview = await post(baseUrl, '/api/chat/attachments/get', {
     threadId: 'chat-vision', attachmentId: attachment.attachmentId

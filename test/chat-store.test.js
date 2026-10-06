@@ -636,7 +636,7 @@ test('atomically stores private canonical image bytes while exposing only a hash
     threadId: thread.threadId
   });
   assert.deepEqual(publicLedger, [committed.message]);
-  assert.doesNotMatch(JSON.stringify(publicLedger), new RegExp(attachment.content.toString('base64'), 'u'));
+  assert.equal(JSON.stringify(publicLedger).includes(attachment.content.toString('base64')), false);
 
   const privateAttachment = store.getVisionAttachment({
     accountId: thread.accountId,
